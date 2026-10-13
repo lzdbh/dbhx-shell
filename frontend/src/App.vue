@@ -138,13 +138,14 @@ async function restoreAll(): Promise<void> {
 }
 
 onMounted(async () => {
-  // 先接事件再拉列表：拉列表期间到达的 term-data 否则会没人认领
-  stopBridge = await startEventBridge()
+  // 快捷键先装：它是纯 DOM 的事，万一事件桥那边出问题也不该把键盘一起带走
   stopShortcuts = installShortcuts(document, () => shortcuts, () => splitActive.value)
+  // 再先接事件后拉列表：拉列表期间到达的 term-data 否则会没人认领
+  stopBridge = await startEventBridge()
   await Promise.all([sessions.refresh(), transfers.refresh(), hosts.refresh()])
   // 恢复**不自动拨号**：无人值守地往生产机连不是启动该做的事。
   // 只在「后端确实没有会话」时给一条提示，由用户决定重开哪些。
-  restoreOpen.value = sessions.tabs.length === 0 && restoreList.value.length > 0
+  restoreOpen.value = sessions.tabs.length === 0 && restorableCount.value > 0
 })
 
 onBeforeUnmount(() => {
