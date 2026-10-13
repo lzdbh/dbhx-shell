@@ -4,16 +4,24 @@ import { message } from 'ant-design-vue'
 
 import type { FileEntry } from '@/lib/ipc/bindings'
 import { HOLD_TEXT, useFilesStore } from '@/stores/files'
+import { useLayoutStore } from '@/stores/layout'
 import { useSessionsStore } from '@/stores/sessions'
 import { useTransfersStore } from '@/stores/transfers'
 import { formatSize, formatTime, parentPath } from '@/lib/format'
 
 const files = useFilesStore()
 const sessions = useSessionsStore()
+const layout = useLayoutStore()
 const transfers = useTransfersStore()
 const [messageApi, holder] = message.useMessage()
 
-const panel = computed(() => files.panelForSession(sessions.activeId))
+/**
+ * 面板跟着**有焦点的那一格**走，而不是跟着选中的 tab。
+ *
+ * 分屏时两个会话都活着，`sessions.activeId` 只说明哪个 tab 被点过，说明不了用户在
+ * 哪个格子里敲 `cd`。文件面板要显示的是「我刚敲命令那台机的目录」。
+ */
+const panel = computed(() => files.panelForSession(layout.focusTarget(sessions.activeId)))
 const conn = computed(() => panel.value?.connection ?? null)
 
 const columns = [

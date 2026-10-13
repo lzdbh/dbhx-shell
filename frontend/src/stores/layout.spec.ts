@@ -69,3 +69,43 @@ describe('分屏布局', () => {
     expect(layout.pinned).toBe(6)
   })
 })
+
+describe('分屏里的焦点格', () => {
+  it('没有焦点格时回落到当前 tab', () => {
+    const layout = useLayoutStore()
+    expect(layout.focusTarget(4)).toBe(4)
+    layout.setFocused(9)
+    // 焦点一旦确立就压过 tab：分屏时用户在右格打字，切 tab 不代表切了格子
+    expect(layout.focusTarget(4)).toBe(9)
+    layout.setFocused(null)
+    expect(layout.focusTarget(null)).toBeNull()
+  })
+
+  it('取消钉住时焦点正落在那格上就一起清掉', () => {
+    const layout = useLayoutStore()
+    layout.pin(3)
+    layout.setFocused(3)
+    layout.unpin()
+    expect(layout.focused).toBeNull()
+    expect(layout.focusTarget(8)).toBe(8)
+  })
+
+  it('换钉住的会话时，旧会话的焦点不能悬空', () => {
+    const layout = useLayoutStore()
+    layout.pin(3)
+    layout.setFocused(3)
+    layout.pin(4)
+    // 3 已经从右格消失，焦点留着它 Ctrl+W 就打在看不见的会话上
+    expect(layout.focused).toBeNull()
+    expect(layout.focusTarget(8)).toBe(8)
+  })
+
+  it('焦点所在的会话被关掉时一起收回', () => {
+    const layout = useLayoutStore()
+    layout.pin(3)
+    layout.setFocused(3)
+    layout.prune([1, 2])
+    expect(layout.pinned).toBeNull()
+    expect(layout.focused).toBeNull()
+  })
+})

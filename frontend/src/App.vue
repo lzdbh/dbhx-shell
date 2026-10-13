@@ -29,8 +29,6 @@ const themeStore = useThemeStore()
 const transfers = useTransfersStore()
 
 const drawerOpen = ref(false)
-/** 两格里当前吃键盘的那一格；只在分屏时有意义 */
-const activePane = ref<'main' | 'pinned'>('main')
 
 let stopBridge: (() => void) | null = null
 let stopShortcuts: (() => void) | null = null
@@ -49,6 +47,8 @@ const antTheme = computed(() => ({
 const splitActive = computed(() => layout.pinned !== null && layout.pinned !== sessions.activeId)
 const mainSession = computed(() => sessions.activeId)
 const pinnedSession = computed(() => (splitActive.value ? layout.pinned : null))
+/** 空格子时（关会话、文件面板跟谁）动的就是它：焦点格优先，没焦点才跟着 tab 走 */
+const focusedSession = computed(() => layout.focusTarget(sessions.activeId))
 
 const restoreList = computed(() => resolve(savedSessions(), hosts.hosts))
 /** 要等主机列表拉回来才知道哪些能自动重开，所以初值一律 false */
@@ -59,11 +59,7 @@ const restorableCount = computed(() => restoreList.value.filter(entry => entry.k
 const unrestorableCount = computed(() => restoreList.value.length - restorableCount.value)
 
 function pickPane(pane: 'main' | 'pinned'): void {
-  activePane.value = pane
-}
-
-function focusCurrentPane(): void {
-  focusTerminal(paneSession(activePane.value))
+  layout.setFocused(paneSession(pane))
 }
 
 function paneSession(pane: 'main' | 'pinned'): number | null {
@@ -73,8 +69,9 @@ function paneSession(pane: 'main' | 'pinned'): number | null {
 /** 两格之间跳：不分屏时按 tab 顺序循环，等于 Ctrl+Tab 的左手替代。 */
 function cycleFocus(): void {
   if (splitActive.value) {
-    activePane.value = activePane.value === 'main' ? 'pinned' : 'main'
-    focusCurrentPane()
+    const next = focusedSession.value === pinnedSession.value ? mainSession.value : pinnedSession.value
+    layout.setFocused(next)
+    focusTerminal(next)
     return
   }
   const ids = sessions.tabs.map(t => t.id)
@@ -105,13 +102,14 @@ function toggleSplit(): void {
     return
   }
   layout.pin(current)
-  activePane.value = 'main'
+  // 新钉住的格子只是「给我看」，键盘还是留在主格
+  layout.setFocused(current)
 }
 
 const shortcuts: ShortcutHandlers = {
   newLocal: () => { void sessions.openLocal('本机终端') },
   closeActive: () => {
-    const target = paneSession(activePane.value)
+    const target = focusedSession.value
     if (target !== null) void sessions.close(target)
   },
   nextTab: () => { nextTab(1) },
@@ -209,15 +207,19 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
             </a-button>
           </div>
           <div class="terminal-area" :class="{ split: splitActive }">
+            <!-- 焦点格高亮不用 :focus-within：用户点了文件面板之后焦点离开了终端，
+                 但键盘下一条输入仍然属于这一格 -->
             <TerminalPane
               :session="mainSession"
               class="pane-main"
+              :class="{ focused: splitActive && focusedSession === mainSession }"
               @click="pickPane('main')"
             />
             <TerminalPane
               v-if="splitActive"
               :session="pinnedSession"
               class="pane-pinned"
+              :class="{ focused: focusedSession === pinnedSession }"
               @click="pickPane('pinned')"
             />
             <a-empty
@@ -301,8 +303,8 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
 }
 
 /* 当前吃键盘的那格给一圈高亮，否则两格长一样，用户不知道键去了哪 */
-.terminal-area.split .pane-main:focus-within,
-.terminal-area.split .pane-pinned:focus-within {
+.terminal-area.split .pane-main.focused,
+.terminal-area.split .pane-pinned.focused {
   border-color: rgba(128, 128, 128, 0.35);
 }
 
