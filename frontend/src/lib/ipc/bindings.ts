@@ -37,6 +37,10 @@ export type ErrorCode =
 "unreachable" | 
 /**  超时 */
 "timeout" | "not_found" | "permission_denied" | 
+/**  用户给的路径/文件名不合法，重试不会变合法 */
+"invalid_input" | 
+/**  目标位置已经有东西（SFTP 的 rename/create 语义是覆盖还是报错，服务端说了算） */
+"already_exists" | 
 /**  断点续传时源文件指纹不匹配 */
 "resume_mismatch" | 
 /**  超出并发或体积预算 */

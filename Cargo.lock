@@ -931,7 +931,6 @@ version = "0.1.0"
 dependencies = [
  "dbhx-model",
  "dbhx-ssh",
- "russh",
  "russh-sftp",
  "thiserror 2.0.21",
  "tokio",

@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod session;
+pub mod sftp;
 pub mod time;
 pub mod vault;
 
@@ -15,6 +16,7 @@ pub use session::{
     SessionStatus, TerminalEncoding,
 };
 pub use time::now_ms;
+pub use sftp::{DirListing, FileEntry, FileKind, TransferKind, TransferProgress, TransferState};
 pub use vault::{
     AuthMode, GroupMode, HostId, HostInfo, HostKeyDecision, HostRecord, IdentityId, IdentityRecord,
     KnownHost, KnownHostSource, SecretId,

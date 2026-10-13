@@ -9,6 +9,8 @@ const HINTS: Partial<Record<ErrorCode, string>> = {
   unreachable: '无法连接到目标，请检查网络与地址。',
   timeout: '连接超时。',
   resume_mismatch: '远端文件已变化，断点续传不成立，需重新传输。',
+  invalid_input: '路径或文件名不合法，请修改后重试。',
+  already_exists: '目标位置已存在同名文件，请先重命名或删除。',
   channel_closed: '连接已关闭，可能被空闲回收或远端断开。',
   cancelled: '操作已取消。',
 }

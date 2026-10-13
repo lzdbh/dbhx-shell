@@ -490,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn split_leaves_input_on_the_handle_and_exit_on_the_stream() {
         // 会话管理器就是把两半分开持有的，这条测试守的是「分开之后两边都还活着」
-        let mut session = LocalSession::spawn(&shell_spec()).unwrap();
+        let session = LocalSession::spawn(&shell_spec()).unwrap();
         session.kill();
         let (handle, mut events) = session.split();
         loop {
