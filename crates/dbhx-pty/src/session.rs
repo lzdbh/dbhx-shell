@@ -81,11 +81,12 @@ enum OwnerCmd {
 }
 
 /// 一个运行中的本地终端。
+///
+/// 只是「控制端 + 事件流」的组合：控制逻辑全在 [`LocalHandle`]，
+/// 想要分开持有两半（会话管理器的做法）就用 `split`。
 pub struct LocalSession {
-    stdin_tx: SyncSender<Vec<u8>>,
-    cmd_tx: UnboundedSender<OwnerCmd>,
+    handle: LocalHandle,
     events_rx: UnboundedReceiver<PtyEvent>,
-    alive: Arc<AtomicBool>,
 }
 
 impl LocalSession {
@@ -122,10 +123,52 @@ impl LocalSession {
         spawn_writer(writer, stdin_rx, alive.clone());
         spawn_owner(master, child, killer, cmd_rx, events_tx, alive.clone());
 
-        Ok(Self { stdin_tx, cmd_tx, events_rx, alive })
+        Ok(Self { handle: LocalHandle { stdin_tx, cmd_tx, alive }, events_rx })
     }
 
     /// 送按键/粘贴的原始字节。不做任何换行翻译——xterm.js 发什么就转什么。
+    pub fn write(&self, bytes: &[u8]) -> Result<(), PtyError> {
+        self.handle.write(bytes)
+    }
+
+    /// 尺寸变化只投递，不等待：拖动分屏时每帧都会调一次，
+    /// 等 owner 应答会把 UI 卡住。命令队列不设上限，因为丢掉最后一条
+    /// 尺寸会让终端永远停在拖动过程中的某个值。
+    pub fn resize(&self, pty: &PtySize) -> Result<(), PtyError> {
+        self.handle.resize(pty)
+    }
+
+    /// 终止子进程。事件流会在退出后自然结束。
+    pub fn kill(&self) {
+        self.handle.kill();
+    }
+
+    /// 取下一条事件；`None` 表示输出结束且子进程已回收。
+    pub async fn next_event(&mut self) -> Option<PtyEvent> {
+        self.events_rx.recv().await
+    }
+
+    /// 拆成可共享的控制端与独占的事件流。
+    ///
+    /// 会话管理器需要「一个任务独占事件流做转发，别处还能继续按键/改尺寸」，
+    /// 而 `next_event` 要 `&mut self`——单个所有者的借用检查放不下。
+    /// 这与 `dbhx_ssh::Shell::into_split` 是同一个形状，不是巧合。
+    pub fn split(self) -> (LocalHandle, UnboundedReceiver<PtyEvent>) {
+        let Self { handle, events_rx } = self;
+        (handle, events_rx)
+    }
+}
+
+/// 本地终端的控制侧：按键、改尺寸、终止。可以复制、可以多处持有。
+#[derive(Clone)]
+pub struct LocalHandle {
+    stdin_tx: SyncSender<Vec<u8>>,
+    cmd_tx: UnboundedSender<OwnerCmd>,
+    alive: Arc<AtomicBool>,
+}
+
+impl LocalHandle {
+    /// 与 `LocalSession::write` 同义。
     pub fn write(&self, bytes: &[u8]) -> Result<(), PtyError> {
         // 先查存活标志：子进程已经没了的时候，往一条死管道里塞字节只会让
         // 第一次写「成功」、之后才报错，上层没法据此判断该不该停发。
@@ -138,21 +181,17 @@ impl LocalSession {
         })
     }
 
-    /// 尺寸变化只投递，不等待：拖动分屏时每帧都会调一次，
-    /// 等 owner 应答会把 UI 卡住。命令队列不设上限，因为丢掉最后一条
-    /// 尺寸会让终端永远停在拖动过程中的某个值。
     pub fn resize(&self, pty: &PtySize) -> Result<(), PtyError> {
         self.cmd_tx.send(OwnerCmd::Resize(to_wire_size(pty))).map_err(|_| PtyError::Closed)
     }
 
-    /// 终止子进程。事件流会在退出后自然结束。
     pub fn kill(&self) {
         let _ = self.cmd_tx.send(OwnerCmd::Stop);
     }
 
-    /// 取下一条事件；`None` 表示输出结束且子进程已回收。
-    pub async fn next_event(&mut self) -> Option<PtyEvent> {
-        self.events_rx.recv().await
+    /// 子进程是否还在。退出探测与这里是异步的，只用于「尽早拒绝按键」，不是精确信号。
+    pub fn alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
@@ -446,6 +485,24 @@ mod tests {
         drain(&mut session).await;
         assert!(matches!(session.write(b"x"), Err(PtyError::Closed)));
         assert!(matches!(session.resize(&PtySize::default()), Err(PtyError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn split_leaves_input_on_the_handle_and_exit_on_the_stream() {
+        // 会话管理器就是把两半分开持有的，这条测试守的是「分开之后两边都还活着」
+        let mut session = LocalSession::spawn(&shell_spec()).unwrap();
+        session.kill();
+        let (handle, mut events) = session.split();
+        loop {
+            match timeout(BUDGET, events.recv()).await {
+                Err(_elapsed) => panic!("{BUDGET:?} 内事件流没有结束"),
+                Ok(None) | Ok(Some(PtyEvent::Exited(_))) => break,
+                Ok(Some(PtyEvent::Data(_))) => {}
+            }
+        }
+        // owner 是「先落存活标志、再发退出事件」，所以流结束之后此处必须是确定的
+        assert!(!handle.alive(), "kill 之后存活标志要立刻可见");
+        assert!(matches!(handle.write(b"x"), Err(PtyError::Closed)));
     }
 
     #[tokio::test]

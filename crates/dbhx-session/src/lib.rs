@@ -20,13 +20,19 @@
 //! 暂停时钟的单测里几毫秒跑完。
 
 pub mod conn;
+pub mod cwd;
 pub mod error;
 pub mod key;
+pub mod manager;
 pub mod plan;
 pub mod pool;
+pub mod shell;
 
 pub use conn::{BoxFuture, Dialer, PooledConnection, SharedConnection, SshConnection, ssh_dialer};
+pub use cwd::CwdTracker;
 pub use error::SessionError;
 pub use key::TransportKey;
+pub use manager::{SessionEvent, SessionManager, SessionRecord};
 pub use plan::{DialPlan, PlanSource};
 pub use pool::{Lease, LeaseKind, PoolOptions, TransportPool};
+pub use shell::{ExitInfo, ShellEvent, ShellSession};

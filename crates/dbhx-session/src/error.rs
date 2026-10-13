@@ -1,15 +1,20 @@
 //! 会话层错误。
 //!
-//! 只放「池与凭据来源」这一层的错。SSH 协议层的错误原样透传 `SshError`，
-//! 因为它已经按「UI 能做什么」分过类了，在这里再分一次只会分错。
+//! 只放「池与凭据来源」这一层的错。SSH 协议层与本地 PTY 的错误原样透传，
+//! 因为它们已经按「UI 能做什么」分过类了，在这里再分一次只会分错。
 
 use dbhx_model::{ErrorCode, IpcError};
+use dbhx_pty::PtyError;
 use dbhx_ssh::SshError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(transparent)]
     Ssh(#[from] SshError),
+
+    /// 本地终端的错。与 SSH 一样，分类已经在 `dbhx-pty` 里做过，这里只透传。
+    #[error(transparent)]
+    Pty(#[from] PtyError),
 
     /// 身份键指向的主机在 vault 里不存在（记录被删了，但还有 tab 拿着旧 id）。
     #[error("找不到主机记录: {0}")]
@@ -23,6 +28,10 @@ pub enum SessionError {
     #[error("连接已关闭")]
     Closed,
 
+    /// 注册表里没有这个 id：tab 已关闭，或前端拿的是重启前的旧 id。
+    #[error("会话不存在: {0}")]
+    NoSuchSession(u32),
+
     /// 会话层自己的不变量被破坏，属于 bug。
     #[error("会话层内部错误: {0}")]
     Internal(String),
@@ -33,6 +42,7 @@ impl From<SessionError> for IpcError {
         match e {
             // 协议层的分类已经决定了 UI 该给什么按钮，不要在这里改写
             SessionError::Ssh(inner) => inner.into(),
+            SessionError::Pty(inner) => inner.into(),
             SessionError::UnknownHost(id) => IpcError::new(
                 ErrorCode::NotFound,
                 format!("主机记录已不存在（{id}），请重新选择主机"),
@@ -46,6 +56,11 @@ impl From<SessionError> for IpcError {
             SessionError::Closed => {
                 IpcError::new(ErrorCode::ChannelClosed, "连接已关闭，请重新连接", true)
             }
+            SessionError::NoSuchSession(id) => IpcError::new(
+                ErrorCode::NotFound,
+                format!("会话 {id} 已不存在，标签页可能已经关闭"),
+                false,
+            ),
             SessionError::Internal(_) => IpcError::internal("会话层内部错误"),
         }
     }

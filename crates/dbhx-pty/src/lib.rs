@@ -16,5 +16,5 @@ pub mod session;
 pub mod spec;
 
 pub use error::PtyError;
-pub use session::{LocalSession, PtyEvent, PtyExit};
+pub use session::{LocalHandle, LocalSession, PtyEvent, PtyExit};
 pub use spec::LocalSpec;
