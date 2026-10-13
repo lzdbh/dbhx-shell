@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { match, type KeyEvent } from './shortcuts'
+import { installShortcuts, match, type KeyEvent, type ShortcutHandlers } from './shortcuts'
 
 /** 造一次按键；只填判定真正用得上的字段。 */
 function key(over: Partial<KeyEvent>): KeyEvent {
@@ -82,5 +82,46 @@ describe('快捷键判定', () => {
 
   it('Alt 与 Ctrl 同时按下不抢：那是终端控制序列的写法', () => {
     expect(fired(key({ key: 't', altKey: true, ctrlKey: true }))).toBeNull()
+  })
+})
+
+describe('installShortcuts 总开关', () => {
+  function target(): EventTarget {
+    return new EventTarget()
+  }
+
+  function ctrlT(): KeyboardEvent {
+    return new KeyboardEvent('keydown', { key: 't', code: 'KeyT', ctrlKey: true, bubbles: true })
+  }
+
+  function handlers(sink: string[]): ShortcutHandlers {
+    return {
+      newLocal: () => { sink.push('newLocal') },
+      closeActive: () => {},
+      nextTab: () => {},
+      prevTab: () => {},
+      selectTab: () => {},
+      toggleSplit: () => {},
+      focusNext: () => {},
+      openSettings: () => {},
+    }
+  }
+
+  it('enabled 时照常派发', () => {
+    const sink: string[] = []
+    const el = target()
+    const dispose = installShortcuts(el, () => handlers(sink), () => false, () => true)
+    el.dispatchEvent(ctrlT())
+    dispose()
+    expect(sink).toEqual(['newLocal'])
+  })
+
+  it('锁屏（enabled 为 false）时一个键都不派发', () => {
+    const sink: string[] = []
+    const el = target()
+    const dispose = installShortcuts(el, () => handlers(sink), () => false, () => false)
+    el.dispatchEvent(ctrlT())
+    dispose()
+    expect(sink).toEqual([])
   })
 })

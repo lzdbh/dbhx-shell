@@ -55,6 +55,21 @@ export const vaultApi = {
   removeIdentity: (identityId: IdentityId) => unwrap(commands.vaultRemoveIdentity(identityId)),
 }
 
+/**
+ * 应用锁：一个纯 UI/授权门的门面。
+ *
+ * 后端已经把新拨号与凭据读写挡住了，这里只是把「锁没锁、设没设 PIN」搬到界面，
+ * 以及把用户敲的 PIN 明文朝内送一次——`status` 永远不回传 PIN。
+ */
+export const lockApi = {
+  // 这条命令返回裸 `LockStatus`（不是 Result），生成物直接给数据；其余几条仍走 unwrap。
+  status: () => commands.vaultLockStatus(),
+  lock: () => unwrap(commands.vaultLock()),
+  unlock: (pin: string) => unwrap(commands.vaultUnlock(pin)),
+  setPin: (pin: string) => unwrap(commands.vaultSetLockPin(pin)),
+  clearPin: () => unwrap(commands.vaultClearLockPin()),
+}
+
 export const hostkeyApi = {
   list: () => unwrap(commands.hostkeysList()),
   forget: (host: string, port: number, algorithm: string) => unwrap(commands.hostkeysForget(host, port, algorithm)),

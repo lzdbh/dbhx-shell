@@ -9,6 +9,7 @@ import { installShortcuts, type ShortcutHandlers } from '@/lib/shortcuts'
 import { clearSaved, resolve, save, savedSessions } from '@/lib/session-restore'
 import AskModal from '@/components/AskModal.vue'
 import HostTree from '@/components/HostTree.vue'
+import LockOverlay from '@/components/LockOverlay.vue'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
 import SftpPanel from '@/components/SftpPanel.vue'
 import TabBar from '@/components/TabBar.vue'
@@ -16,6 +17,7 @@ import TerminalPane from '@/components/TerminalPane.vue'
 import TransferTray from '@/components/TransferTray.vue'
 import { useHostsStore } from '@/stores/hosts'
 import { useLayoutStore } from '@/stores/layout'
+import { useLockStore } from '@/stores/lock'
 import { useSessionsStore } from '@/stores/sessions'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
@@ -23,6 +25,7 @@ import { useTransfersStore } from '@/stores/transfers'
 
 const hosts = useHostsStore()
 const layout = useLayoutStore()
+const lock = useLockStore()
 const sessions = useSessionsStore()
 const settings = useSettingsStore()
 const themeStore = useThemeStore()
@@ -32,6 +35,7 @@ const drawerOpen = ref(false)
 
 let stopBridge: (() => void) | null = null
 let stopShortcuts: (() => void) | null = null
+let stopActivity: (() => void) | null = null
 
 const antTheme = computed(() => ({
   algorithm: themeStore.dark ? theme.darkAlgorithm : theme.defaultAlgorithm,
@@ -106,6 +110,21 @@ function toggleSplit(): void {
   layout.setFocused(current)
 }
 
+/**
+ * 用户活动跟踪：任何指针/键盘/窗口聚焦动作都回调一次，用来把自动上锁往后推。
+ *
+ * 监听挂在 `document` 冒泡阶段即可——我们只关心「发生过没有」，不需要抢在任何
+ * 处理器之前看到事件；节流由 store 侧的 setTimeout 复位天然完成。
+ * 返回卸载函数，交给 onBeforeUnmount。
+ */
+function watchUserActivity(onActivity: () => void): () => void {
+  const events: (keyof DocumentEventMap)[] = ['pointerdown', 'keydown', 'wheel', 'visibilitychange']
+  for (const name of events) document.addEventListener(name, onActivity)
+  return () => {
+    for (const name of events) document.removeEventListener(name, onActivity)
+  }
+}
+
 const shortcuts: ShortcutHandlers = {
   newLocal: () => { void sessions.openLocal('本机终端') },
   closeActive: () => {
@@ -138,18 +157,24 @@ async function restoreAll(): Promise<void> {
 }
 
 onMounted(async () => {
-  // 快捷键先装：它是纯 DOM 的事，万一事件桥那边出问题也不该把键盘一起带走
-  stopShortcuts = installShortcuts(document, () => shortcuts, () => splitActive.value)
+  // 快捷键先装：它是纯 DOM 的事，万一事件桥那边出问题也不该把键盘一起带走。
+  // 锁屏期间整体禁用（第四个入参）：capture 监听比覆盖层先看到按键，不拦的话
+  // Ctrl+T 会在锁后偷偷开一个终端。
+  stopShortcuts = installShortcuts(document, () => shortcuts, () => splitActive.value, () => !lock.locked)
+  // 活动跟踪：任何指针/键盘动作都把自动上锁往后推
+  stopActivity = watchUserActivity(() => lock.activity())
   // 再先接事件后拉列表：拉列表期间到达的 term-data 否则会没人认领
   stopBridge = await startEventBridge()
-  await Promise.all([sessions.refresh(), transfers.refresh(), hosts.refresh()])
+  await Promise.all([sessions.refresh(), transfers.refresh(), hosts.refresh(), lock.refresh()])
   // 恢复**不自动拨号**：无人值守地往生产机连不是启动该做的事。
   // 只在「后端确实没有会话」时给一条提示，由用户决定重开哪些。
-  restoreOpen.value = sessions.tabs.length === 0 && restorableCount.value > 0
+  // 锁屏时不弹这条：底层界面都被盖住了，先解锁再谈恢复。
+  restoreOpen.value = !lock.locked && sessions.tabs.length === 0 && restorableCount.value > 0
 })
 
 onBeforeUnmount(() => {
   stopShortcuts?.()
+  stopActivity?.()
   stopBridge?.()
 })
 
@@ -178,6 +203,11 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
         <a-tooltip title="Ctrl+E：把当前会话钉到右格">
           <a-button size="small" :disabled="sessions.activeId === null" @click="toggleSplit">
             {{ splitActive ? '取消分屏' : '分屏' }}
+          </a-button>
+        </a-tooltip>
+        <a-tooltip v-if="lock.hasPin" title="立即锁定：锁定后禁止新连接与凭据读写">
+          <a-button size="small" @click="void lock.lock()">
+            锁定
           </a-button>
         </a-tooltip>
         <a-switch
@@ -242,6 +272,7 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
       <SettingsDrawer />
     </a-drawer>
     <AskModal />
+    <LockOverlay />
   </a-config-provider>
 </template>
 

@@ -679,4 +679,59 @@ mod tests {
         let err = set_lock_pin_impl(&core, Zeroizing::new("2222".into())).unwrap_err();
         assert_eq!(err.code, ErrorCode::Locked);
     }
+
+    /// 脱敏总审计：把每一条「朝外」的 IPC 形状都序列化一遍，确认既不含明文秘密，
+    /// 也不泄露任何密文引用字段名；再直接读磁盘上的 vault.json，确认落盘的是密文。
+    ///
+    /// 这条测试是安全约束「明文口令/私钥永不跨 IPC 朝渲染层」与「密文 id 不外泄」的
+    /// 回归防线——新增字段很容易不知不觉把一个 `secret_id` 或口令带出去。
+    #[tokio::test]
+    async fn nothing_crossing_ipc_or_disk_carries_a_secret() {
+        let (core, _rx) = tests_harness("redact-audit", crate::state::fake_dialer());
+
+        let host_id = upsert_host_impl(&core, draft("db-redact")).unwrap();
+        set_password_impl(&core, host_id.clone(), Zeroizing::new("hunter2".into())).unwrap();
+        add_identity_impl(
+            &core,
+            "运维键".into(),
+            Zeroizing::new(crate::test_keys::PLAIN_ED25519.to_string()),
+            Some(Zeroizing::new("key-pass".into())),
+        )
+        .unwrap();
+        set_lock_pin_impl(&core, Zeroizing::new("9-8-7-6".into())).unwrap();
+        crate::commands::session::open_local_impl(
+            &core,
+            crate::commands::session::default_local_spec(None, dbhx_model::PtySize::default()),
+            "本地".into(),
+        )
+        .await
+        .unwrap();
+
+        // 每一类朝外的投影都拼进同一段文本里统一扫描
+        let mut outward = String::new();
+        outward.push_str(&serde_json::to_string(&hosts_impl(&core).unwrap()).unwrap());
+        outward.push_str(&serde_json::to_string(&identities_impl(&core).unwrap()).unwrap());
+        outward.push_str(&serde_json::to_string(&known_hosts_impl(&core).unwrap()).unwrap());
+        outward.push_str(&serde_json::to_string(&lock_status_impl(&core)).unwrap());
+        outward.push_str(&serde_json::to_string(&crate::commands::session::list_impl(&core)).unwrap());
+        outward.push_str(&serde_json::to_string(&crate::commands::transfer::running_impl(&core)).unwrap());
+
+        // 明文秘密：一个都不许出现在 IPC 载荷里
+        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY", "BEGIN OPENSSH"] {
+            assert!(!outward.contains(leak), "IPC 载荷泄露了明文 {leak}");
+        }
+        // 内部引用字段名：渲染层拿到就能指名换出别的记录的口令
+        for field in ["cipher", "secret_id", "password_secret_id", "private_key_secret_id", "lock_pin", "secrets"] {
+            assert!(!outward.contains(field), "IPC 载荷泄露了内部字段 {field}");
+        }
+
+        // 落盘的是密文：vault.json 里绝不该有裸明文
+        let on_disk = std::fs::read_to_string(core.dir().join("vault.json")).unwrap();
+        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY"] {
+            assert!(!on_disk.contains(leak), "vault.json 明文落盘了 {leak}");
+        }
+
+        // 但主密钥文件确实在（否则上面根本加不了密），且不参与任何 IPC
+        assert!(core.dir().join("master.key").exists());
+    }
 }

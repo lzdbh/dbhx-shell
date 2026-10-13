@@ -45,6 +45,7 @@ declare module 'vue' {
     ATree: typeof import('ant-design-vue/es')['Tree']
     HostFormModal: typeof import('./components/HostFormModal.vue')['default']
     HostTree: typeof import('./components/HostTree.vue')['default']
+    LockOverlay: typeof import('./components/LockOverlay.vue')['default']
     SettingsDrawer: typeof import('./components/SettingsDrawer.vue')['default']
     SftpPanel: typeof import('./components/SftpPanel.vue')['default']
     TabBar: typeof import('./components/TabBar.vue')['default']

@@ -5,6 +5,7 @@ import { message } from 'ant-design-vue'
 import { formatTime } from '@/lib/format'
 import { useHostkeysStore } from '@/stores/hostkeys'
 import { useHostsStore } from '@/stores/hosts'
+import { useLockStore } from '@/stores/lock'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
 
@@ -12,7 +13,17 @@ const settings = useSettingsStore()
 const themeStore = useThemeStore()
 const hosts = useHostsStore()
 const hostkeys = useHostkeysStore()
+const lock = useLockStore()
 const [messageApi, holder] = message.useMessage()
+
+/** 自动上锁的候选时长（分钟）。0 是「关闭」，放在选择器里而不是开关，好让「多久」和「开不开」是一件事。 */
+const IDLE_OPTIONS = [
+  { value: 0, label: '不自动锁定' },
+  { value: 1, label: '空闲 1 分钟' },
+  { value: 5, label: '空闲 5 分钟' },
+  { value: 15, label: '空闲 15 分钟' },
+  { value: 30, label: '空闲 30 分钟' },
+]
 
 const PRIMARY_COLORS = ['#1677ff', '#13a8a8', '#722ed1', '#d4380d', '#389e0d']
 
@@ -39,10 +50,51 @@ const identityPassphrase = ref('')
 
 const addingIdentity = ref(false)
 
+const newPin = ref('')
+const confirmPin = ref('')
+const savingPin = ref(false)
+
 onMounted(() => {
   void hostkeys.refresh()
   void hosts.refresh()
+  void lock.refresh()
 })
+
+/** 前端预校验只是少跑一趟后端；真正的长度校验与「锁着不许改锁」都在 Rust 侧。 */
+async function savePin(): Promise<void> {
+  if (newPin.value.length < 4) {
+    messageApi.warning('PIN 至少 4 位')
+    return
+  }
+  if (newPin.value !== confirmPin.value) {
+    messageApi.warning('两次输入的 PIN 不一致')
+    return
+  }
+  savingPin.value = true
+  try {
+    await lock.setPin(newPin.value)
+    messageApi.success(lock.hasPin ? '已更新解锁 PIN' : '已启用应用锁')
+    newPin.value = ''
+    confirmPin.value = ''
+  } catch (e) {
+    messageApi.error(describe(e))
+  } finally {
+    savingPin.value = false
+  }
+}
+
+async function removePin(): Promise<void> {
+  try {
+    await lock.clearPin()
+    messageApi.success('已关闭应用锁')
+  } catch (e) {
+    messageApi.error(describe(e))
+  }
+}
+
+function describe(e: unknown): string {
+  return e && typeof e === 'object' && 'message' in e ? String((e as { message: unknown }).message) : '操作失败'
+}
 
 async function addIdentity(): Promise<void> {
   if (!identityLabel.value.trim() || !privateKey.value.trim()) {
@@ -137,6 +189,52 @@ function splitPattern(pattern: string): { host: string, port: number } {
       <a-form-item label="下载目录">
         <!-- 没接系统保存对话框：目录由用户写死，下载按钮才知道往哪放 -->
         <a-input v-model:value="settings.downloadDir" placeholder="D:\Downloads 或 /home/dong/Downloads" />
+      </a-form-item>
+
+      <a-divider orientation="left">
+        应用锁
+      </a-divider>
+      <a-form-item label="自动锁定">
+        <a-select
+          :value="lock.idleMinutes"
+          style="width: 200px"
+          :options="IDLE_OPTIONS"
+          :disabled="!lock.hasPin"
+          @update:value="(v) => lock.setIdleMinutes(Number(v))"
+        />
+      </a-form-item>
+      <a-form-item label="解锁 PIN">
+        <a-space direction="vertical" style="width: 100%">
+          <a-input-password
+            v-model:value="newPin"
+            :maxlength="32"
+            autocomplete="new-password"
+            :placeholder="lock.hasPin ? '设置新 PIN 以更换' : '设置一个 PIN 以启用应用锁'"
+          />
+          <a-input-password
+            v-model:value="confirmPin"
+            :maxlength="32"
+            autocomplete="new-password"
+            placeholder="再输入一次确认"
+          />
+          <a-space>
+            <a-button type="primary" size="small" :loading="savingPin" @click="void savePin()">
+              {{ lock.hasPin ? '更换 PIN' : '启用并设置 PIN' }}
+            </a-button>
+            <a-popconfirm
+              v-if="lock.hasPin"
+              title="关闭应用锁会删除已存的 PIN，确定吗？"
+              ok-text="关闭"
+              cancel-text="取消"
+              @confirm="void removePin()"
+            >
+              <a-button size="small" danger>
+                关闭应用锁
+              </a-button>
+            </a-popconfirm>
+          </a-space>
+          <span class="dim">锁定后禁止新建连接与凭据读写，已建立的会话不受影响。</span>
+        </a-space>
       </a-form-item>
 
       <a-divider orientation="left">

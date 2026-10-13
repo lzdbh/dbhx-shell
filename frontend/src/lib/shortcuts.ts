@@ -112,8 +112,14 @@ export function installShortcuts(
   target: EventTarget,
   getHandlers: () => ShortcutHandlers,
   getSplitActive: () => boolean,
+  /**
+   * 快捷键总开关。锁屏时传 `() => false`：覆盖层吃掉了界面，但 `document` 的
+   * capture 监听比它先看到按键，不拦的话 `Ctrl+T` 会在锁后偷偷开一个终端。
+   */
+  getEnabled: () => boolean = () => true,
 ): () => void {
   const onKeydown = (raw: Event) => {
+    if (!getEnabled()) return
     const event = raw as unknown as KeyEvent
     // 正在打字时一个键都不抢——除了 Cmd/Ctrl+W，它是关标签而不是输入字符
     if (isTextEntry(event) && !(event.key.toLowerCase() === 'w' && (event.ctrlKey || event.metaKey))) return
