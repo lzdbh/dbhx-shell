@@ -3,12 +3,31 @@
 //! 做成 plugin 而非裸 command 的原因：命令自动获得 `plugin:dbhx|` 命名空间，
 //! 并可用 capabilities 收紧到具体窗口；同时 `tauri-specta` 能据此导出 TS，
 //! 前端类型与 Rust 同源，杜绝手写契约漂移。
+//!
+//! 装配全部发生在 [`plugin`] 的 setup 里：命令层唯一被托管的状态是 `Arc<Core>`，
+//! 除此之外应用没有第二个全局。两条常驻任务从这里出发：
+//!
+//! - 事件路由：内部总线 ⇒ `app.emit`。总线只有一个读者，所以事件顺序与产生顺序一致。
+//! - 会话 Hub：`SessionManager` 的事件流 ⇒ 总线（`hub::spawn`），同样只有一个读者，
+//!   两个读者会随机丢一半终端字节。
 
-mod commands;
+pub mod bytes;
+pub mod commands;
+pub mod events;
+mod hub;
+mod plansrc;
+pub mod state;
+#[cfg(test)]
+mod test_keys;
 
 pub use commands::{ping, ping_failure};
+pub use state::Core;
 
-use tauri_specta::collect_commands;
+use std::sync::Arc;
+
+use tauri::Manager;
+use tokio::sync::mpsc;
+use tauri_specta::{collect_commands, collect_events};
 
 /// plugin 名，同时也是命令命名空间。builder 与 tauri plugin 必须用同一个值，
 /// 否则生成的 `invoke("plugin:xxx|...")` 与运行时注册的名字对不上。
@@ -19,7 +38,40 @@ const PLUGIN_NAME: &str = "dbhx";
 /// 这份清单本身不是运行时真值（真值是 `collect_commands!`），但它是两份必须同步的
 /// 下游配置的对照基准：`src-tauri/build.rs` 用它生成 ACL 权限，`bindings.ts` 用它
 /// 校验 invoke 名字的命名空间。下面的测试负责抓漂移。
-pub const COMMAND_NAMES: &[&str] = &["ping", "ping_failure"];
+pub const COMMAND_NAMES: &[&str] = &[
+    "ping",
+    "ping_failure",
+    "session_open_local",
+    "session_open_remote",
+    "session_write",
+    "session_resize",
+    "session_close",
+    "session_list",
+    "vault_hosts",
+    "vault_upsert_host",
+    "vault_remove_host",
+    "vault_set_password",
+    "vault_identities",
+    "vault_add_identity",
+    "vault_remove_identity",
+    "hostkeys_list",
+    "hostkeys_forget",
+    "hostkeys_import",
+    "request_reply",
+    "sftp_open_for_session",
+    "sftp_open_for_host",
+    "sftp_browse",
+    "sftp_mkdir",
+    "sftp_remove",
+    "sftp_rename",
+    "sftp_close",
+    "sftp_set_following",
+    "sftp_set_editing",
+    "sftp_download",
+    "sftp_upload",
+    "transfer_cancel",
+    "transfer_running",
+];
 
 /// 命令清单的唯一构造点。运行时注册与 TS 导出都走它，保证不会分叉。
 ///
@@ -31,20 +83,91 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         // 本项目过界的整数只有 epoch 毫秒和字节计数，都远小于 2^53，所以统一按 number 导出。
         // 可能超过 2^53 的量（累计传输字节、纳秒时间戳）必须改走 string。
         .dangerously_cast_bigints_to_number()
-        .commands(collect_commands![commands::ping, commands::ping_failure])
+        .commands(collect_commands![
+            commands::ping,
+            commands::ping_failure,
+            commands::session::session_open_local,
+            commands::session::session_open_remote,
+            commands::session::session_write,
+            commands::session::session_resize,
+            commands::session::session_close,
+            commands::session::session_list,
+            commands::vault::vault_hosts,
+            commands::vault::vault_upsert_host,
+            commands::vault::vault_remove_host,
+            commands::vault::vault_set_password,
+            commands::vault::vault_identities,
+            commands::vault::vault_add_identity,
+            commands::vault::vault_remove_identity,
+            commands::vault::hostkeys_list,
+            commands::vault::hostkeys_forget,
+            commands::vault::hostkeys_import,
+            commands::vault::request_reply,
+            commands::sftp::sftp_open_for_session,
+            commands::sftp::sftp_open_for_host,
+            commands::sftp::sftp_browse,
+            commands::sftp::sftp_mkdir,
+            commands::sftp::sftp_remove,
+            commands::sftp::sftp_rename,
+            commands::sftp::sftp_close,
+            commands::sftp::sftp_set_following,
+            commands::sftp::sftp_set_editing,
+            commands::transfer::sftp_download,
+            commands::transfer::sftp_upload,
+            commands::transfer::transfer_cancel,
+            commands::transfer::transfer_running,
+        ])
+        .events(collect_events![
+            events::TermData,
+            events::SessionCwd,
+            events::SessionEnded,
+            events::HostKeyPending,
+            events::HostKeyConflict,
+            events::PassphraseRequest,
+            events::SftpCwdChanged,
+            events::SftpFollowed,
+            events::TransferProgressEvent,
+            events::TransferBatchEnded,
+            events::VaultChanged,
+        ])
 }
 
-/// M0 起要补的事件清单，届时接进同一个 builder：
-/// ```text
-/// .events(collect_events![
-///     TermStatus, HostKeyPending, PassphraseRequest,
-///     SftpReady, SftpCwdChanged, TransferProgress, VaultChanged,
-/// ])
-/// ```
+/// 装配 plugin。
+///
+/// `mount_events` 必须在任何 `emit` 之前调用，否则事件名没有注册表、前端 `listen`
+/// 收不到东西却不报错；所以它和状态托管写在同一个 setup 里，不存在「命令能用但事件不能发」的中间态。
 pub fn plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    let builder = specta_builder();
+    let handler = builder.invoke_handler();
+
     tauri::plugin::Builder::new(PLUGIN_NAME)
-        .setup(|_app, _api| Ok(()))
-        .invoke_handler(specta_builder().invoke_handler())
+        .setup(move |app, _api| {
+            builder.mount_events(app);
+
+            let dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("无法解析应用数据目录：{e}"))?;
+            let (tx, rx) = mpsc::channel::<events::BusEvent>(state::BUS_QUEUE);
+            let core = state::Core::production(dir, tx).map_err(|e| format!("命令层装配失败：{}", e.message))?;
+            app.manage(Arc::clone(&core));
+
+            // 事件路由：总线只有一个读者。用 spawn 而不是 await，setup 必须马上返回。
+            let app_for_router = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut rx = rx;
+                while let Some(event) = rx.recv().await {
+                    event.dispatch(&app_for_router);
+                }
+            });
+
+            // 会话 Hub 只有一个读者，重复接管会丢字节，所以它返回 false 时只记一条日志。
+            if !hub::spawn(core) {
+                tracing::warn!("会话事件流已被接管，终端输出可能丢失");
+            }
+            Ok(())
+        })
+        .invoke_handler(handler)
         .build()
 }
 
@@ -111,6 +234,23 @@ mod codegen {
                 content.contains(&invoke),
                 "bindings.ts 缺 {invoke} —— 命令没进 builder 或 plugin_name 不一致"
             );
+        }
+        // 事件的运行时名字是 `plugin:dbhx:<kebab>`，前端不算字面量但生成绑定要落盘，
+        // 事件名没进 TS 就说明 collect_events! 漏了一条。
+        for event in [
+            "term-data",
+            "session-cwd",
+            "session-ended",
+            "host-key-pending",
+            "host-key-conflict",
+            "passphrase-request",
+            "sftp-cwd-changed",
+            "sftp-followed",
+            "transfer-progress",
+            "transfer-batch-ended",
+            "vault-changed",
+        ] {
+            assert!(content.contains(event), "bindings.ts 缺事件 {event}");
         }
         // 契约断言：宁可生成失败，也不要悄悄降级成 any
         assert!(

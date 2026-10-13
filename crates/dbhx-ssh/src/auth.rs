@@ -236,6 +236,17 @@ fn load_private_key(
         .map_err(|_| SshError::KeyLoad("私钥口令不正确".into()))
 }
 
+/// 这把 PEM 是不是口令保护的。判定口径与 `load_private_key` 完全一致——
+/// 「要不要向用户要口令」必须与「解析时到底需不需要口令」用同一个答案，
+/// 否则会出现弹了框却说口令错，或者该弹框却直接报 KeyLoad。
+pub fn key_is_encrypted(pem: &str) -> bool {
+    match PrivateKey::from_openssh(pem) {
+        Ok(parsed) => parsed.is_encrypted(),
+        // 连格式都不认，谈不上口令；真正的报错留给认证那一步
+        Err(_) => false,
+    }
+}
+
 /// 供测试与上层复用：把一个 `AuthResult` 摊成人类可读的失败原因。
 pub fn describe_failure(auth: &AuthResult) -> &'static str {
     match auth {

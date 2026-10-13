@@ -40,6 +40,9 @@ pub struct SessionRecord {
     pub encoding: TerminalEncoding,
     /// shell 通过 OSC 7 报出的目录。本地终端没有这个概念，恒为 `None`。
     pub cwd: Option<String>,
+    /// 本地终端为 `None`。文件面板要靠它向池要**同一条** transport——
+    /// 用 vault 记录重算一遍键会拿到「编辑过的旧 endpoint」，正好违反判等规则。
+    pub transport: Option<TransportKey>,
 }
 
 impl SessionRecord {
@@ -132,6 +135,7 @@ impl SessionManager {
             pty: spec.pty.clone(),
             encoding,
             cwd: None,
+            transport: None,
         };
         self.inner.insert(record.clone(), Handle::Local(handle));
 
@@ -160,7 +164,7 @@ impl SessionManager {
 
     /// 远端 shell：先向池要 lease（命中就不碰凭据），再在这条连接上开一条通道。
     pub async fn open_remote(&self, key: TransportKey, term: String, pty: PtySize, encoding: TerminalEncoding, label: String) -> Result<SessionRecord, SessionError> {
-        let lease = self.inner.pool.acquire(key, LeaseKind::Shell).await?;
+        let lease = self.inner.pool.acquire(key.clone(), LeaseKind::Shell).await?;
         let id = self.inner.alloc_id();
         // start 失败时 lease 随参数一起被 drop，租约当场归还——不会留下「有人在用」的幽灵连接
         let session = Arc::new(ShellSession::start(id, lease, term, pty.clone()).await?);
@@ -171,6 +175,7 @@ impl SessionManager {
             pty,
             encoding,
             cwd: None,
+            transport: Some(key),
         };
         self.inner.insert(record.clone(), Handle::Remote(Arc::clone(&session)));
 
@@ -249,6 +254,12 @@ impl SessionManager {
 
     pub fn record(&self, id: SessionId) -> Option<SessionRecord> {
         self.inner.entries().get(&id).map(|e| e.record.clone())
+    }
+
+    /// 这个 tab 用的是哪条 transport。文件面板据此向池要**同一个连接**上的第二个 lease，
+    /// 从而做到「从终端跳过去不用再登录一次」。本地终端返回 `None`。
+    pub fn transport_key(&self, id: SessionId) -> Option<TransportKey> {
+        self.record(id).and_then(|r| r.transport)
     }
 
     /// 会话数。诊断用。

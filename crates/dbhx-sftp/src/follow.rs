@@ -128,6 +128,12 @@ impl FollowGate {
         self.terminal.as_ref().map(|(_, path)| path.as_str())
     }
 
+    /// 是否在跟随终端目录。用户手动浏览过或关掉开关都会变成 `false`，
+    /// 重新打开跟随时才可能补跳。面板重建时要拿它回填开关状态。
+    pub fn is_following(&self) -> bool {
+        !self.user_locked
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -378,11 +384,13 @@ mod tests {
         gate.confirm_navigated("/var/log");
         gate.user_browsed("/srv/");
         assert_eq!(gate.shown(), Some("/srv"));
+        assert!(!gate.is_following(), "用户手动导航过，开关就该是关的");
         let d = gate.report(0, Some("/home/app"), CwdSource::Osc7, &blacklist);
         assert_eq!(d, Decision::Hold(Hold::UserLocked));
         assert_eq!(gate.terminal_cwd(), Some("/home/app"), "用户接管期间仍要记账");
         let d = gate.set_following(true, &blacklist);
         assert_eq!(d, Decision::Navigate("/home/app".into()));
+        assert!(gate.is_following());
     }
 
     #[test]

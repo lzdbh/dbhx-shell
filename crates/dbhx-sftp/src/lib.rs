@@ -34,7 +34,7 @@ pub mod transfer;
 pub use client::{SftpClient, SftpOptions, sort_entries};
 pub use error::SftpError;
 pub use follow::{Blacklist, CwdSource, Decision, FollowGate, Hold};
-pub use plan::{Lister, Plan, Task, expand_local, expand_remote};
+pub use plan::{Lister, Plan, Task, expand_local, expand_remote, expand_remote_paths};
 pub use transfer::{
     Batch, BatchReport, Cancel, Copier, Engine, ProgressMeter, SftpCopier, TransferOptions,
 };

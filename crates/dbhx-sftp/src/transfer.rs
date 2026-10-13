@@ -23,6 +23,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::error::SftpError;
+use crate::path;
 use crate::plan::{BoxFuture, Plan, Task};
 
 /// 分块大小。参考实现取 32 KiB：小于它是白白多打报文，大于它会让单个 WRITE
@@ -120,6 +121,15 @@ pub trait Copier: Send + Sync + 'static {
         cancel: &'a Cancel,
         progress: &'a mut (dyn FnMut(u64) + Send),
     ) -> BoxFuture<'a, Result<(), SftpError>>;
+
+    /// 起跑前把规划出来的目录先建出来。
+    ///
+    /// 默认什么都不做：只有真会碰到目标文件系统的实现才需要管它。
+    /// 这一步是**尽力而为**——文件任务自己会建父目录，所以这里失败不该让整批停摆，
+    /// 它存在的唯一理由是「勾选一个空目录」时不该静默无操作。
+    fn prepare<'a>(&'a self, _plan: &'a Plan) -> BoxFuture<'a, Result<(), SftpError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// 生产用的 copier：真走 SFTP 与本地磁盘。
@@ -147,6 +157,37 @@ impl Copier for SftpCopier {
                 TransferKind::Download => download(self, task, cancel, progress).await,
                 TransferKind::Upload => upload(self, task, cancel, progress).await,
             }
+        })
+    }
+
+    fn prepare<'a>(&'a self, plan: &'a Plan) -> BoxFuture<'a, Result<(), SftpError>> {
+        Box::pin(async move {
+            match self.kind {
+                TransferKind::Download => {
+                    for dir in &plan.local_dirs {
+                        // 尽力而为：文件任务自己会建父目录，这里只是为了空目录不被静默丢掉
+                        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                            tracing::debug!(dir = %dir.display(), ?e, "本地目录创建失败");
+                        }
+                    }
+                }
+                TransferKind::Upload => {
+                    for dir in &plan.remote_dirs {
+                        // SFTP 没有 `mkdir -p`，只能逐段建；已存在的段跳过——
+                        // 并发任务同时建同一层是常态，把「已存在」当错误会让整批失败
+                        for (_, full) in path::breadcrumb(dir) {
+                            if self.session.metadata(&full).await.is_ok() {
+                                continue;
+                            }
+                            if self.session.create_dir(&full).await.is_err() {
+                                tracing::debug!(dir = %full, "远端目录创建失败");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
         })
     }
 }
@@ -277,6 +318,12 @@ impl Batch {
         self.cancel.is_cancelled()
     }
 
+    /// 取一份取消凭证。上层把它存进登记表，之后不必再碰 `Batch` 本体
+    /// （`Batch` 必须一直活着，它的 `Drop` 就是停止信号）。
+    pub fn cancel_handle(&self) -> Cancel {
+        self.cancel.clone()
+    }
+
     /// 等这批跑完。丢弃返回值也安全：任务自己会结束。
     pub async fn joined(mut self) -> Result<BatchReport, SftpError> {
         match self.join.take() {
@@ -337,6 +384,8 @@ async fn run_batch(
     sink: mpsc::Sender<TransferProgress>,
 ) -> BatchReport {
     let mut report = BatchReport { id, completed: 0, failed: 0, cancelled: 0, bytes: 0 };
+    // 目录先建出来：勾选一个空目录时，如果只等文件任务去建父目录，这批会静默地什么也不做
+    let _ = copier.prepare(&plan).await;
     let kind = plan.kind;
     let tasks = plan.tasks;
     // 先把整批登记出去：列表里立刻出现所有条目（排队态），用户才知道排了多少

@@ -17,7 +17,7 @@ pub mod handler;
 pub mod hostkey;
 pub mod transport;
 
-pub use auth::Credential;
+pub use auth::{Credential, key_is_encrypted};
 pub use channel::{Chunk, Exec, ExecOutput, Shell, ShellReader, ShellWriter, SplitChannel};
 pub use config::DialOptions;
 pub use error::SshError;

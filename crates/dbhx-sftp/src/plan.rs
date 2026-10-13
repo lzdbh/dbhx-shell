@@ -4,12 +4,10 @@
 //! 因此目录树展开、符号链接不跟随、深度上限这些规则都能在内存里测，不需要真连接。
 //! 本机侧用 `std::fs`，它本来就是本地的。
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-
-#[cfg(test)]
-use std::collections::HashMap;
 
 use dbhx_model::{FileEntry, FileKind, TransferKind};
 
@@ -93,6 +91,67 @@ pub async fn expand_remote(
 fn local_dir_for(remote: &str, local_root: &Path) -> PathBuf {
     let name = path::basename(remote).unwrap_or("root");
     local_root.join(name)
+}
+
+/// 摊平一批远端选择（下载）。
+///
+/// 每一项的类型只能从**父目录的列举**里读：[`Lister`] 走 readdir，条目带的是 lstat
+/// 的 mode 位，所以符号链接不会被误当成目录展开（改用 `opendir` 试探的话会，
+/// SFTP 服务端在 opendir 时是跟随链接的）。父目录正是面板当前展示的那一层——
+/// 能勾到的项本来就在同一层，所以同一层的多项勾选只列举一次。
+///
+/// 目录走 [`expand_remote`]，落点是 `local_root/<目录名>`；
+/// 文件直接落 `local_root/<文件名>`——两种混选各自独立，互不影响。
+pub async fn expand_remote_paths(
+    list: &Lister,
+    remote_paths: &[String],
+    local_root: &Path,
+) -> Result<Plan, SftpError> {
+    let mut plan = Plan::new(TransferKind::Download);
+    let mut parents: HashMap<String, Vec<FileEntry>> = HashMap::new();
+    for raw in remote_paths {
+        let remote = path::normalize(raw);
+        // 根目录（没有父）直接算「不存在」：下载 `/` 本来就不是一个合理操作
+        let parent = path::parent(&remote).ok_or_else(|| SftpError::BadPath(remote.clone()))?;
+        if !parents.contains_key(&parent) {
+            let entries = list(parent.clone()).await?;
+            parents.insert(parent.clone(), entries);
+        }
+        let entry = parents
+            .get(&parent)
+            .and_then(|entries| entries.iter().find(|e| e.path == remote))
+            .ok_or_else(|| SftpError::NotFound(remote.clone()))?
+            .clone();
+        if entry.kind == FileKind::Dir {
+            merge(&mut plan, expand_remote(list, &remote, local_root).await?);
+            continue;
+        }
+        if entry.kind == FileKind::Symlink || entry.kind == FileKind::Other {
+            // 与目录遍历同规则：链接和特殊文件搬过去也读不出内容
+            tracing::debug!(path = %remote, "非普通文件，跳过");
+            continue;
+        }
+        let name = path::basename(&remote).ok_or_else(|| SftpError::BadPath(remote.clone()))?;
+        plan.push_file(Task { remote: remote.clone(), local: local_root.join(name), size: entry.size });
+    }
+    Ok(plan)
+}
+
+/// 合并两个计划。目录条目要去重：勾选 `logs` 与 `logs/archive` 时，
+/// 同一个本地目录会被两条各自建一次。
+fn merge(into: &mut Plan, other: Plan) {
+    for dir in other.local_dirs {
+        if !into.local_dirs.contains(&dir) {
+            into.local_dirs.push(dir);
+        }
+    }
+    for remote_dir in other.remote_dirs {
+        if !into.remote_dirs.contains(&remote_dir) {
+            into.remote_dirs.push(remote_dir);
+        }
+    }
+    into.tasks.extend(other.tasks);
+    into.total_bytes += other.total_bytes;
 }
 
 /// 递归列举。签名手写 `BoxFuture` 而不是 `async fn`：
@@ -237,6 +296,8 @@ mod tests {
 
     fn tree() -> HashMap<String, Vec<FileEntry>> {
         let mut t = HashMap::new();
+        // 勾选根下的第一层时，父目录就是 `/`：混选要先靠它读出「logs 是目录」
+        t.insert("/".to_string(), vec![dir("logs", "/")]);
         t.insert(
             "/logs".to_string(),
             vec![
@@ -272,6 +333,38 @@ mod tests {
     async fn missing_root_directory_is_an_error_not_an_empty_plan() {
         let err = expand_remote(&fake_tree(tree()), "/nope", Path::new("/tmp/dl")).await.unwrap_err();
         assert!(matches!(err, SftpError::NotFound(p) if p == "/nope"));
+    }
+
+    #[tokio::test]
+    async fn a_mixed_selection_expands_dirs_and_keeps_loose_files() {
+        // 面板里勾「一个目录 + 一个文件」是最常见的操作，两种落点规则不一样
+        let list = fake_tree(tree());
+        let plan = expand_remote_paths(&list, &["/logs".to_string(), "/logs/app.log".to_string()], Path::new("/tmp/dl"))
+            .await
+            .unwrap();
+        let mut remotes: Vec<&str> = plan.tasks.iter().map(|t| t.remote.as_str()).collect();
+        remotes.sort_unstable();
+        assert_eq!(remotes, ["/logs/app.log", "/logs/app.log", "/logs/archive/2025.log.gz"], "混选按勾选逐项展开");
+
+        let loose = plan.tasks.iter().find(|t| t.local == PathBuf::from("/tmp/dl/app.log")).unwrap();
+        assert_eq!(loose.size, 100, "文件大小取自规划时的元数据");
+        assert!(plan.local_dirs.contains(&PathBuf::from("/tmp/dl/logs")), "目录项仍按 logs/ 落");
+        assert_eq!(plan.total_bytes, 100 + 100 + 50);
+    }
+
+    #[tokio::test]
+    async fn a_selected_symlink_is_skipped_rather_than_read() {
+        let list = fake_tree(tree());
+        let plan = expand_remote_paths(&list, &["/logs/latest".to_string()], Path::new("/tmp/dl")).await.unwrap();
+        assert!(plan.is_empty(), "勾选单个符号链接不该搬任何东西，也不该报错");
+    }
+
+    #[tokio::test]
+    async fn a_vanished_selection_reports_not_found() {
+        // 面板停留期间远端把文件删了：要报「不存在」，而不是静默交付一个空计划
+        let list = fake_tree(tree());
+        let err = expand_remote_paths(&list, &["/logs/gone.log".to_string()], Path::new("/tmp/dl")).await.unwrap_err();
+        assert!(matches!(err, SftpError::NotFound(p) if p == "/logs/gone.log"));
     }
 
     #[tokio::test]

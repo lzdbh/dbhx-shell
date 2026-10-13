@@ -884,6 +884,11 @@ name = "dbhx-ipc"
 version = "0.1.0"
 dependencies = [
  "dbhx-model",
+ "dbhx-pty",
+ "dbhx-session",
+ "dbhx-sftp",
+ "dbhx-ssh",
+ "dbhx-vault",
  "serde",
  "serde_json",
  "specta",
@@ -891,6 +896,8 @@ dependencies = [
  "tauri",
  "tauri-specta",
  "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
