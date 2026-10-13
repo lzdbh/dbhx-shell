@@ -8,6 +8,8 @@
 //! 读写半区刻意拆开（`split`），这样终端层可以把读循环放进独立任务，
 //! 写路径不再碰任何共享锁——键盘回显对延迟敏感，值得这个复杂度。
 
+use std::sync::Arc;
+
 use dbhx_model::PtySize;
 use russh::{Channel, ChannelReadHalf, ChannelWriteHalf};
 use russh::client::Msg;
@@ -73,24 +75,33 @@ impl SplitChannel {
 
     /// 只取数据类消息；`WindowAdjusted` 之类包成 `Control` 交回调用方处置。
     pub async fn read_chunk(&mut self) -> Option<Chunk> {
-        match self.read.wait().await? {
-            ChannelMsg::Data { data } => Some(Chunk::Stdout(data.to_vec())),
-            ChannelMsg::ExtendedData { ext, data } => Some(if ext == 1 {
-                Chunk::Stderr(data.to_vec())
-            } else {
-                Chunk::Other { ext, data: data.to_vec() }
-            }),
-            ChannelMsg::Eof | ChannelMsg::Close => None,
-            ChannelMsg::WindowAdjusted { new_size } => Some(Chunk::WindowAdjusted { bytes: new_size }),
-            ChannelMsg::ExitStatus { exit_status } => Some(Chunk::ExitStatus(exit_status)),
-            ChannelMsg::ExitSignal { signal_name, .. } => {
-                Some(Chunk::ExitSignal(format!("{signal_name:?}")))
-            }
-            other => {
-                // 终端通道不该收到 Success/Open/XonXoff 之类；记下来但不吞掉字节流
-                tracing::debug!(channel = %self.id, ?other, "忽略未预期的通道消息");
-                Some(Chunk::Control(other))
-            }
+        chunk_of(self.id, self.read.wait().await?)
+    }
+}
+
+/// 通道消息 ⇒ 终端层关心的 `Chunk`。读半区与 `ShellReader` 共用这一份映射，
+/// 避免两处对「哪些消息算数据」有不同答案。
+///
+/// 返回 `Option`：`None` 是「通道到此为止」的信号，所以 `Eof`/`Close` 只能在这里一次用完，
+/// 调用方拿到 `None` 之后不该再期待任何东西。
+fn chunk_of(id: ChannelId, msg: ChannelMsg) -> Option<Chunk> {
+    match msg {
+        ChannelMsg::Data { data } => Some(Chunk::Stdout(data.to_vec())),
+        ChannelMsg::ExtendedData { ext, data } => Some(if ext == 1 {
+            Chunk::Stderr(data.to_vec())
+        } else {
+            Chunk::Other { ext, data: data.to_vec() }
+        }),
+        ChannelMsg::Eof | ChannelMsg::Close => None,
+        ChannelMsg::WindowAdjusted { new_size } => Some(Chunk::WindowAdjusted { bytes: new_size }),
+        ChannelMsg::ExitStatus { exit_status } => Some(Chunk::ExitStatus(exit_status)),
+        ChannelMsg::ExitSignal { signal_name, .. } => {
+            Some(Chunk::ExitSignal(format!("{signal_name:?}")))
+        }
+        other => {
+            // 终端通道不该收到 Success/Open/XonXoff 之类；记下来但不吞掉字节流
+            tracing::debug!(channel = %id, ?other, "忽略未预期的通道消息");
+            Some(Chunk::Control(other))
         }
     }
 }
@@ -109,19 +120,74 @@ pub enum Chunk {
 }
 
 /// 一条已确认（pty + shell 都收到 Success）的交互通道。
+///
+/// 本身没有方法：它唯一的作用是把自己拆成读写两半（`into_split`）。
+/// 之所以不给它 `write`/`read` 方法，是因为终端必须**同时**读和写，
+/// 而一个所有者的 `select!` 里读分支要 `&mut`、写分支要 `&`，借用检查一定会拦住。
 pub struct Shell(pub SplitChannel);
 
 impl Shell {
+    /// 拆成可共享的写端与独占的读端。
+    ///
+    /// `ChannelWriteHalf` 不是 `Clone`（`ChannelReadHalf` 也不是），所以写端套一层 `Arc`；
+    /// 读端保持独占——它的 `wait` 要 `&mut self`，而且一个字节流不该有两个读者。
+    pub fn into_split(self) -> (ShellWriter, ShellReader) {
+        let Shell(SplitChannel { id, read, write }) = self;
+        (ShellWriter { inner: Arc::new(write) }, ShellReader { id, inner: read })
+    }
+}
+
+/// 终端输入侧：键盘字节、尺寸变化、关闭。可以多处共享。
+#[derive(Clone)]
+pub struct ShellWriter {
+    inner: Arc<ChannelWriteHalf<Msg>>,
+}
+
+impl ShellWriter {
+    pub fn id(&self) -> ChannelId {
+        self.inner.id()
+    }
+
     pub async fn write(&self, bytes: &[u8]) -> Result<(), SshError> {
-        self.0.write(bytes).await
+        self.inner.data_bytes(bytes.to_vec()).await?;
+        Ok(())
     }
 
     pub async fn resize(&self, pty: &PtySize) -> Result<(), SshError> {
-        self.0.resize(pty).await
+        self.inner
+            .window_change(u32::from(pty.cols), u32::from(pty.rows), 0, 0)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn send_signal(&self, sig: russh::Sig) -> Result<(), SshError> {
+        self.inner.signal(sig).await.map_err(Into::into)
+    }
+
+    /// 告诉远端 stdin 结束，不关闭通道。
+    pub async fn close_write(&self) -> Result<(), SshError> {
+        self.inner.eof().await.map_err(Into::into)
     }
 
     pub async fn close(&self) -> Result<(), SshError> {
-        self.0.close().await
+        self.inner.close().await.map_err(Into::into)
+    }
+}
+
+/// 终端输出侧。独占，由会话层的读循环持有。
+pub struct ShellReader {
+    id: ChannelId,
+    inner: ChannelReadHalf,
+}
+
+impl ShellReader {
+    pub fn id(&self) -> ChannelId {
+        self.id
+    }
+
+    /// 下一条通道消息。`None` 表示通道结束（EOF、close 或对端断开）。
+    pub async fn next_chunk(&mut self) -> Option<Chunk> {
+        chunk_of(self.id, self.inner.wait().await?)
     }
 }
 
