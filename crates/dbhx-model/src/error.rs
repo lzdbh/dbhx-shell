@@ -13,6 +13,8 @@ pub enum ErrorCode {
     HostKeyUnknown,
     /// 主机密钥与已存记录不一致：中间人告警，UI 必须硬阻断且不可跳过
     HostKeyChanged,
+    /// 应用锁生效：需要凭据或改凭据的命令一律不接受，解锁之后才恢复
+    Locked,
     /// 堡垒机只允许单通道，无法复用 transport 开 SFTP
     SingleChannelBastion,
     /// 网络不可达 / DNS 失败 / 端口不通

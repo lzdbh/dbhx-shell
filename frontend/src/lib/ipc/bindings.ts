@@ -41,6 +41,12 @@ export const commands = {
 	hostkeysImport: () => typedError<number, IpcError>(__TAURI_INVOKE("plugin:dbhx|hostkeys_import")),
 	/**  回答一次后端发起的询问（主机密钥确认 / 私钥口令）。 */
 	requestReply: (request: number, reply: UserReply) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|request_reply", { request, reply })),
+	vaultLockStatus: () => __TAURI_INVOKE<LockStatus>("plugin:dbhx|vault_lock_status"),
+	vaultLock: () => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_lock")),
+	/**  解锁：PIN 从渲染层输入框进来，是唯一允许明文跨界的又一个入口（方向朝内）。 */
+	vaultUnlock: (pin: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_unlock", { pin })),
+	vaultSetLockPin: (pin: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_set_lock_pin", { pin })),
+	vaultClearLockPin: () => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_clear_lock_pin")),
 	sftpOpenForSession: (session: SessionId) => typedError<PanelInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_open_for_session", { session })),
 	sftpOpenForHost: (hostId: HostId) => typedError<PanelInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_open_for_host", { hostId })),
 	sftpBrowse: (connection: number, path: string | null) => typedError<DirListing, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_browse", { connection, path })),
@@ -149,6 +155,8 @@ export type ErrorCode =
 "host_key_unknown" | 
 /**  主机密钥与已存记录不一致：中间人告警，UI 必须硬阻断且不可跳过 */
 "host_key_changed" | 
+/**  应用锁生效：需要凭据或改凭据的命令一律不接受，解锁之后才恢复 */
+"locked" | 
 /**  堡垒机只允许单通道，无法复用 transport 开 SFTP */
 "single_channel_bastion" | 
 /**  网络不可达 / DNS 失败 / 端口不通 */
@@ -315,6 +323,14 @@ export type LiveEndpoint = {
 	host: string,
 	port: number,
 	username: string,
+};
+
+/**  应用锁状态。锁屏覆盖层与设置抽屉都只按这两个布尔分支，拿不到 PIN 本身。 */
+export type LockStatus = {
+	/**  当前是否处于锁定态（锁定后禁止新拨号与凭据读写） */
+	locked: boolean,
+	/**  是否设置过解锁 PIN。没设过就不可能进入锁定态，覆盖层据此决定显不显示。 */
+	has_pin: boolean,
 };
 
 /**  打开面板的结果。 */

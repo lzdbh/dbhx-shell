@@ -11,6 +11,7 @@
 //!
 //! vault 与 known_hosts 都是「改完即落盘」：进程崩了不该丢用户刚存的主机。
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use dbhx_model::{
@@ -60,6 +61,15 @@ pub enum UserReply {
     Confirmed,
     Cancelled,
     Secret { text: String },
+}
+
+/// 应用锁状态。锁屏覆盖层与设置抽屉都只按这两个布尔分支，拿不到 PIN 本身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct LockStatus {
+    /// 当前是否处于锁定态（锁定后禁止新拨号与凭据读写）
+    pub locked: bool,
+    /// 是否设置过解锁 PIN。没设过就不可能进入锁定态，覆盖层据此决定显不显示。
+    pub has_pin: bool,
 }
 
 /// 草案 + 既有记录 ⇒ 落盘记录。**已有口令引用必须原样保留**，
@@ -115,6 +125,7 @@ pub fn remove_host_impl(core: &Core, id: HostId) -> Result<(), IpcError> {
 
 /// 存主机口令。明文只活在这一行：进 `Zeroizing` 后立刻交给 vault 加密。
 pub fn set_password_impl(core: &Core, id: HostId, password: Zeroizing<String>) -> Result<(), IpcError> {
+    core.require_unlocked()?;
     if password.is_empty() {
         return Err(IpcError::new(ErrorCode::InvalidInput, "口令不能为空", false));
     }
@@ -151,6 +162,7 @@ pub fn add_identity_impl(
     private_key: Zeroizing<String>,
     passphrase: Option<Zeroizing<String>>,
 ) -> Result<IdentityId, IpcError> {
+    core.require_unlocked()?;
     reject_empty(&label, "身份名称不能为空")?;
     if !private_key.contains("PRIVATE KEY") && !private_key.starts_with("PuTTY-User-Key-File-") {
         return Err(IpcError::new(
@@ -211,6 +223,69 @@ pub fn reply_impl(core: &Core, request: u32, reply: UserReply) -> Result<(), Ipc
     };
     core.awaits.reply(request, answer)
 }
+
+/// 应用锁：UI/授权门，**不是加密边界**。主密钥仍在进程里，锁的意义是「锁屏期间
+/// 不给渲染层任何读凭据或发起新连接的机会」，而非抵御能读到磁盘文件的攻击者。
+/// PIN 作为密封条目存在 vault 里，任何命令都不会把它投影出去——连计数之外的一切都不给。
+
+/// 锁状态。覆盖层与设置抽屉只按 `locked`/`has_pin` 分支，拿不到 PIN。
+pub fn lock_status_impl(core: &Core) -> LockStatus {
+    let has_pin = core.vault.lock().unwrap_or_else(|p| p.into_inner()).has_lock_pin();
+    LockStatus { locked: core.locked.load(Ordering::Relaxed), has_pin }
+}
+
+/// 进入锁定态。没设过 PIN 时拒绝——否则会把用户永久关在门外。
+pub fn lock_impl(core: &Core) -> Result<(), IpcError> {
+    if !core.vault.lock().unwrap_or_else(|p| p.into_inner()).has_lock_pin() {
+        return Err(IpcError::new(ErrorCode::InvalidInput, "请先设置解锁 PIN 再启用应用锁", false));
+    }
+    core.locked.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 用 PIN 解锁。明文只来自渲染层输入框，立刻 `Zeroizing` 后走常数时间比对，
+/// 比对结果不泄露内容。错 PIN 回 `PermissionDenied`（重试无意义，得重新输入）。
+pub fn unlock_impl(core: &Core, pin: Zeroizing<String>) -> Result<(), IpcError> {
+    let vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+    let ok = vault
+        .check_lock_pin(pin.as_bytes())
+        .map_err(|_| IpcError::new(ErrorCode::Internal, "解锁校验失败，请稍后再试", true))?;
+    if !ok {
+        return Err(IpcError::new(ErrorCode::PermissionDenied, "PIN 不正确", false));
+    }
+    core.locked.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 设置或更换解锁 PIN。必须先处于解锁态（锁着改不了锁）。
+pub fn set_lock_pin_impl(core: &Core, pin: Zeroizing<String>) -> Result<(), IpcError> {
+    core.require_unlocked()?;
+    let bytes = pin.as_bytes();
+    if bytes.len() < MIN_PIN_LEN {
+        return Err(IpcError::new(ErrorCode::InvalidInput, format!("PIN 至少 {MIN_PIN_LEN} 位"), false));
+    }
+    let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+    vault.set_lock_pin(bytes)?;
+    vault.flush()?;
+    emit_changed(core, &vault);
+    Ok(())
+}
+
+/// 移除解锁 PIN：没有 PIN 就无法成立锁定态，顺手置回解锁。
+pub fn clear_lock_pin_impl(core: &Core) -> Result<(), IpcError> {
+    core.require_unlocked()?;
+    {
+        let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+        vault.clear_lock_pin();
+        vault.flush()?;
+        emit_changed(core, &vault);
+    }
+    core.locked.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 解锁 PIN 的最小长度。太短的 PIN 与「没有锁」差别不大，宁可拒绝。
+const MIN_PIN_LEN: usize = 4;
 
 fn reject_empty(value: &str, message: &str) -> Result<(), IpcError> {
     if value.trim().is_empty() {
@@ -307,6 +382,37 @@ pub fn hostkeys_import(core: State<'_>) -> Result<u32, IpcError> {
 #[specta::specta]
 pub fn request_reply(core: State<'_>, request: u32, reply: UserReply) -> Result<(), IpcError> {
     reply_impl(&core, request, reply)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn vault_lock_status(core: State<'_>) -> LockStatus {
+    lock_status_impl(&core)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn vault_lock(core: State<'_>) -> Result<(), IpcError> {
+    lock_impl(&core)
+}
+
+/// 解锁：PIN 从渲染层输入框进来，是唯一允许明文跨界的又一个入口（方向朝内）。
+#[tauri::command]
+#[specta::specta]
+pub fn vault_unlock(core: State<'_>, pin: String) -> Result<(), IpcError> {
+    unlock_impl(&core, Zeroizing::new(pin))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn vault_set_lock_pin(core: State<'_>, pin: String) -> Result<(), IpcError> {
+    set_lock_pin_impl(&core, Zeroizing::new(pin))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn vault_clear_lock_pin(core: State<'_>) -> Result<(), IpcError> {
+    clear_lock_pin_impl(&core)
 }
 
 #[cfg(test)]
@@ -477,5 +583,100 @@ mod tests {
     async fn forgetting_an_unknown_host_key_reports_zero_not_an_error() {
         let (core, _rx) = tests_harness("vault-forget", crate::state::fake_dialer());
         assert_eq!(forget_host_key_impl(&core, "nope".into(), 22, "ssh-ed25519".into()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn locking_without_a_pin_is_refused() {
+        // 没设过 PIN 就锁定会把用户永久关在门外，必须挡在建锁之前
+        let (core, _rx) = tests_harness("lock-nopin", crate::state::fake_dialer());
+        let err = lock_impl(&core).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(!lock_status_impl(&core).locked);
+    }
+
+    #[tokio::test]
+    async fn a_pin_enables_lock_and_blocks_new_dials_and_credential_writes() {
+        let (core, _rx) = tests_harness("lock-blocks", crate::state::fake_dialer());
+        set_lock_pin_impl(&core, Zeroizing::new("2468".into())).unwrap();
+        let id = upsert_host_impl(&core, draft("db-lock")).unwrap();
+        lock_impl(&core).unwrap();
+        assert!(lock_status_impl(&core).locked);
+
+        let err = crate::commands::session::open_remote_impl(&core, id.clone(), dbhx_model::PtySize::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Locked, "锁定期间不得新拨号");
+
+        let err = set_password_impl(&core, id.clone(), Zeroizing::new("x".into())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Locked, "锁定期间不得写凭据");
+
+        unlock_impl(&core, Zeroizing::new("2468".into())).unwrap();
+        assert!(!lock_status_impl(&core).locked);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_pin_does_not_unlock() {
+        let (core, _rx) = tests_harness("lock-wrong", crate::state::fake_dialer());
+        set_lock_pin_impl(&core, Zeroizing::new("1234".into())).unwrap();
+        lock_impl(&core).unwrap();
+        let err = unlock_impl(&core, Zeroizing::new("0000".into())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(lock_status_impl(&core).locked, "错 PIN 绝不能把锁打开");
+    }
+
+    #[tokio::test]
+    async fn the_pin_never_crosses_ipc() {
+        let (core, _rx) = tests_harness("lock-redact", crate::state::fake_dialer());
+        set_lock_pin_impl(&core, Zeroizing::new("9876".into())).unwrap();
+        let status = lock_status_impl(&core);
+        assert!(status.has_pin);
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("9876"), "锁状态绝不带出 PIN: {json}");
+        let hosts = hosts_impl(&core).unwrap();
+        let json = serde_json::to_string(&hosts).unwrap();
+        assert!(!json.contains("9876"), "主机投影绝不带出 PIN: {json}");
+    }
+
+    #[tokio::test]
+    async fn rotating_the_pin_keeps_one_secret_and_invalidates_the_old_one() {
+        let (core, _rx) = tests_harness("lock-rotate", crate::state::fake_dialer());
+        set_lock_pin_impl(&core, Zeroizing::new("aaaa".into())).unwrap();
+        set_lock_pin_impl(&core, Zeroizing::new("bbbb".into())).unwrap();
+        assert_eq!(core.vault.lock().unwrap().secret_count(), 1, "换 PIN 不该留下两把密文");
+        lock_impl(&core).unwrap();
+        assert_eq!(unlock_impl(&core, Zeroizing::new("aaaa".into())).unwrap_err().code, ErrorCode::PermissionDenied);
+        unlock_impl(&core, Zeroizing::new("bbbb".into())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clearing_the_pin_unlocks_and_reclaims_the_secret() {
+        let (core, _rx) = tests_harness("lock-clear", crate::state::fake_dialer());
+        set_lock_pin_impl(&core, Zeroizing::new("4321".into())).unwrap();
+        lock_impl(&core).unwrap();
+        // 锁着不能改锁，否则等于绕过它——先解锁再清除
+        unlock_impl(&core, Zeroizing::new("4321".into())).unwrap();
+        clear_lock_pin_impl(&core).unwrap();
+        let status = lock_status_impl(&core);
+        assert!(!status.has_pin);
+        assert!(!status.locked, "没有 PIN 就不该停在锁定态");
+        assert_eq!(core.vault.lock().unwrap().secret_count(), 0, "回收 PIN 条目后不该留密文");
+    }
+
+    #[tokio::test]
+    async fn a_too_short_pin_is_rejected_before_it_is_sealed() {
+        let (core, _rx) = tests_harness("lock-short", crate::state::fake_dialer());
+        let err = set_lock_pin_impl(&core, Zeroizing::new("12".into())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(!lock_status_impl(&core).has_pin);
+    }
+
+    #[tokio::test]
+    async fn setting_a_pin_while_locked_is_refused() {
+        // 锁着改锁等于绕过锁：必须先把锁打开
+        let (core, _rx) = tests_harness("lock-setpin-locked", crate::state::fake_dialer());
+        set_lock_pin_impl(&core, Zeroizing::new("1111".into())).unwrap();
+        lock_impl(&core).unwrap();
+        let err = set_lock_pin_impl(&core, Zeroizing::new("2222".into())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Locked);
     }
 }

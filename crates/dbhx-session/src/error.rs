@@ -32,6 +32,11 @@ pub enum SessionError {
     #[error("会话不存在: {0}")]
     NoSuchSession(u32),
 
+    /// 应用锁生效：所有会读凭据或发起连接的操作一律拒绝。
+    /// 这是 UI/授权门，不是加密边界（主密钥仍在进程内），但锁屏期间必须硬拦拨号。
+    #[error("应用已锁定")]
+    Locked,
+
     /// 会话层自己的不变量被破坏，属于 bug。
     #[error("会话层内部错误: {0}")]
     Internal(String),
@@ -59,6 +64,11 @@ impl From<SessionError> for IpcError {
             SessionError::NoSuchSession(id) => IpcError::new(
                 ErrorCode::NotFound,
                 format!("会话 {id} 已不存在，标签页可能已经关闭"),
+                false,
+            ),
+            SessionError::Locked => IpcError::new(
+                ErrorCode::Locked,
+                "应用已锁定，解锁后才能连接",
                 false,
             ),
             SessionError::Internal(_) => IpcError::internal("会话层内部错误"),

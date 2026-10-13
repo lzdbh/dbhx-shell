@@ -26,6 +26,8 @@ pub async fn open_local_impl(core: &Core, spec: ConnectSpec, label: String) -> R
 
 /// 开一个远端 shell。凭据只在拨号内部出现，这一层拿到的一直是引用。
 pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Result<SessionInfo, IpcError> {
+    // 锁屏期间禁止新拨号：这是意图层的拦截，`build_plan` 里还有一道以原子值为准的兜底。
+    core.require_unlocked()?;
     let record = core.host_of(&host_id)?;
     let label = record.label.clone();
     let encoding = record.encoding;

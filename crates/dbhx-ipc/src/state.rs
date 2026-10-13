@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dbhx_model::{HostId, IpcError};
@@ -245,6 +245,10 @@ pub struct Core {
     pub awaits: Arc<Awaits>,
     pub engine: Engine,
     pub bus: mpsc::Sender<BusEvent>,
+    /// 应用锁开关。UI/授权门，不是加密边界：主密钥仍在进程内，但锁屏期间
+    /// 一律拒绝拨号与凭据读写。初值来自 `vault.has_lock_pin()`——存了 PIN 就开机即锁。
+    /// 用 `Arc<AtomicBool>` 而非 `Core` 字段，是因为凭据来源闭包在 `Core` 之前就要建好。
+    pub locked: Arc<AtomicBool>,
     batches: Mutex<HashMap<BatchId, LiveBatch>>,
     /// 传输进度汇聚队列的发送端，交给 `Engine::start`
     progress: mpsc::Sender<dbhx_model::TransferProgress>,
@@ -276,9 +280,17 @@ impl Core {
 
         // 先只有依赖、还没有 `Core`：池会在拨号线程里回调 PlanSource，
         // 让它反过来抓 `Arc<Core>` 就成环了（Core 持池，池的闭包持 Core）。
+        // 锁态在 vault 打开后立刻定：存过 PIN 就以「锁着」启动，避免解锁前有一次静默拨号。
+        let locked = Arc::new(AtomicBool::new(vault.has_lock_pin()));
         let vault = Arc::new(Mutex::new(vault));
         let known = Arc::new(Mutex::new(known));
-        let plans = vault_plan_source(Arc::clone(&vault), Arc::clone(&known), Arc::clone(&awaits), bus.clone());
+        let plans = vault_plan_source(
+            Arc::clone(&vault),
+            Arc::clone(&known),
+            Arc::clone(&awaits),
+            Arc::clone(&locked),
+            bus.clone(),
+        );
         let pool = Arc::new(TransportPool::new(dialer, plans, PoolOptions::default()));
         let sessions = SessionManager::new(Arc::clone(&pool));
 
@@ -294,6 +306,7 @@ impl Core {
             awaits,
             engine: Engine::new(TransferOptions::default()),
             bus,
+            locked,
             batches: Mutex::new(HashMap::new()),
             progress: progress_tx,
         });
@@ -304,6 +317,22 @@ impl Core {
     /// vault 所在目录（主机密钥、known_hosts 都在这）。
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 应用锁生效时挡住一切会读凭据或发起连接的命令。
+    ///
+    /// 这是「意图层」的守门：命令在把参数交给下层之前先问一句，锁着就直接回
+    /// `Locked`，让前端弹解锁框而不是拨号失败。已建立的会话不受影响（锁不该抽掉
+    /// 正在跑的终端），挡的是「新的读取/连接」。
+    pub fn require_unlocked(&self) -> Result<(), IpcError> {
+        if self.locked.load(Ordering::Relaxed) {
+            return Err(IpcError::new(
+                dbhx_model::ErrorCode::Locked,
+                "应用已锁定，解锁后才能连接或改动凭据",
+                false,
+            ));
+        }
+        Ok(())
     }
 
     pub fn emit(&self, event: BusEvent) {
@@ -561,11 +590,13 @@ fn vault_plan_source(
     vault: Arc<Mutex<Vault>>,
     known: Arc<Mutex<KnownHosts>>,
     awaits: Arc<Awaits>,
+    locked: Arc<AtomicBool>,
     bus: mpsc::Sender<BusEvent>,
 ) -> PlanSource {
     Box::new(move |key: TransportKey| {
-        let (vault, known, awaits, bus) = (Arc::clone(&vault), Arc::clone(&known), Arc::clone(&awaits), bus.clone());
-        Box::pin(async move { build_plan(&vault, &known, &awaits, &bus, key).await })
+        let (vault, known, awaits, locked, bus) =
+            (Arc::clone(&vault), Arc::clone(&known), Arc::clone(&awaits), Arc::clone(&locked), bus.clone());
+        Box::pin(async move { build_plan(&vault, &known, &awaits, &locked, &bus, key).await })
     })
 }
 
@@ -577,10 +608,17 @@ async fn build_plan(
     vault: &Arc<Mutex<Vault>>,
     known: &Arc<Mutex<KnownHosts>>,
     awaits: &Arc<Awaits>,
+    locked: &AtomicBool,
     bus: &mpsc::Sender<BusEvent>,
     key: TransportKey,
 ) -> Result<dbhx_session::DialPlan, dbhx_session::SessionError> {
     use dbhx_session::SessionError;
+
+    // 最后一道防线：命令层已经拦过一次，这里再拦是因为池可能在命令之外
+    // （重连、租约补拨）触发 build_plan，锁态必须以进程内原子值为准。
+    if locked.load(Ordering::Relaxed) {
+        return Err(SessionError::Locked);
+    }
 
     let label = key.describe();
     // 锁内只取值

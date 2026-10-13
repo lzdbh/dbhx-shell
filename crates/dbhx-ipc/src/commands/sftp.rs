@@ -41,6 +41,9 @@ pub async fn open_for_host_impl(core: &Core, host_id: HostId) -> Result<PanelInf
 
 /// 面板已存在就复用，不会开第二条 subsystem 通道。
 async fn open_panel(core: &Core, key: TransportKey, terminal_cwd: Option<&str>) -> Result<PanelInfo, IpcError> {
+    // 开面板可能触发拨号（`acquire` 命中不了池时），锁屏期间一律拒绝；
+    // 已经开着的面板的浏览/增删改走的是既有 client，不碰凭据，不在这里拦。
+    core.require_unlocked()?;
     let connection = core.conn_id_of(&key);
     if let Some(info) = existing_panel(core, connection) {
         return Ok(info);

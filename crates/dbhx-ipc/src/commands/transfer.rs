@@ -68,6 +68,8 @@ fn panel_shown(core: &Core, connection: u32) -> Result<String, IpcError> {
 
 /// 摊平后的计划可能是空的（勾选的全是符号链接），这时不起跑、明确报错。
 fn start(core: &Arc<Core>, connection: u32, plan: Plan, kind: TransferKind) -> Result<u32, IpcError> {
+    // 锁屏期间不开新的传输批次（在跑的由覆盖层之下继续，锁不抽走已有连接）。
+    core.require_unlocked()?;
     if plan.is_empty() {
         return Err(IpcError::new(
             ErrorCode::InvalidInput,

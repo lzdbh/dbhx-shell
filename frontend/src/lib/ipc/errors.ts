@@ -13,6 +13,7 @@ const HINTS: Partial<Record<ErrorCode, string>> = {
   already_exists: '目标位置已存在同名文件，请先重命名或删除。',
   channel_closed: '连接已关闭，可能被空闲回收或远端断开。',
   cancelled: '操作已取消。',
+  locked: '应用已锁定，请先解锁。',
 }
 
 function isIpcError(value: unknown): value is IpcError {

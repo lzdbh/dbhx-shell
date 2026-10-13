@@ -26,6 +26,9 @@ pub enum SecretKind {
     Password,
     PrivateKey,
     Passphrase,
+    /// 应用锁口令。它和其它几种一样只是密文条目，但用途是「校验」而不是「交给调用方」：
+    /// 出库只有 `check_lock_pin` 的布尔结果，永远不会把明文带出去。
+    LockPin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +48,10 @@ struct VaultDoc {
     identities: Vec<IdentityRecord>,
     #[serde(default)]
     secrets: BTreeMap<String, SecretEntry>,
+    /// 应用锁口令的密文条目。`None` 表示没设过锁——老库没有这个字段，
+    /// `serde(default)` 让它们在升级后照常打开。
+    #[serde(default)]
+    lock_pin: Option<SecretId>,
 }
 
 fn current_version() -> u32 {
@@ -291,6 +298,9 @@ impl Vault {
                 n += 1;
             }
         }
+        if self.doc.lock_pin.as_ref() == Some(secret_id) {
+            n += 1;
+        }
         n
     }
 
@@ -322,6 +332,56 @@ impl Vault {
     pub fn secret_kind(&self, secret_id: &SecretId) -> Option<SecretKind> {
         self.doc.secrets.get(&secret_id.0).map(|e| e.kind)
     }
+
+    /// 是否设过应用锁口令。启动时靠它决定「界面一打开就该是锁着的」还是「直接用」。
+    pub fn has_lock_pin(&self) -> bool {
+        self.doc.lock_pin.is_some()
+    }
+
+    /// 设置或替换解锁口令。空口令由命令层挡掉，这里不重复判：多一处判空就多一处
+    /// 「命令层以为拦住了、其实没有」的可能。
+    pub fn set_lock_pin(&mut self, pin: &[u8]) -> Result<(), VaultError> {
+        let old = self.doc.lock_pin.take();
+        let id = self.put_secret(SecretKind::LockPin, pin)?;
+        self.doc.lock_pin = Some(id);
+        if let Some(old) = old {
+            // 旧条目此刻已经没有任何引用，直接回收，不留两把口令
+            self.doc.secrets.remove(&old.0);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// 取消应用锁。没设过也是成功——「清除一个不存在的东西」不该报错。
+    pub fn clear_lock_pin(&mut self) {
+        if let Some(old) = self.doc.lock_pin.take() {
+            self.doc.secrets.remove(&old.0);
+            self.dirty = true;
+        }
+    }
+
+    /// 校验解锁口令，返回是否匹配。
+    ///
+    /// 明文只在这条调用里出现，比较走完全部字节：提前返回的话，攻击者可以靠响应
+    /// 时间差逐位猜出口令，而锁防的正是有本地访问的人。
+    pub fn check_lock_pin(&self, pin: &[u8]) -> Result<bool, VaultError> {
+        let Some(id) = self.doc.lock_pin.as_ref() else {
+            return Ok(false);
+        };
+        self.with_secret(id, |stored| Ok(constant_time_eq(stored, pin)))
+    }
+}
+
+/// 长度保密的等长比较：先看长度，再把每个字节的差异累积到最后。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn new_id() -> String {
