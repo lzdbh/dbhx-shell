@@ -81,6 +81,10 @@ pub struct IdentityRecord {
 
 /// 给前端看的主机投影。字段与 `HostRecord` 同源，但 `auth_ref` 已经把
 /// 「用哪个凭据」压成会话层真正需要的形式，省得前端自己拼。
+///
+/// `auth_mode` 与 `auth` 看着重复，其实不然：`AuthRef::Host` 同时覆盖
+/// `Password` 与 `KeyboardInteractive` 两种模式，只给 `auth` 的话，编辑表单
+/// 无法还原用户当初选的是哪种，保存时会把它悄悄降级成密码认证。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct HostInfo {
     pub id: HostId,
@@ -90,6 +94,7 @@ pub struct HostInfo {
     pub favorite: bool,
     pub protocol: crate::session::Protocol,
     pub endpoint: crate::session::Endpoint,
+    pub auth_mode: AuthMode,
     pub auth: crate::session::AuthRef,
     pub keepalive_secs: u16,
     pub encoding: crate::session::TerminalEncoding,
@@ -119,6 +124,7 @@ impl HostInfo {
             favorite: record.favorite,
             protocol: record.protocol,
             endpoint: record.endpoint.clone(),
+            auth_mode: record.auth_mode,
             auth,
             keepalive_secs: record.keepalive_secs,
             encoding: record.encoding,
@@ -192,11 +198,40 @@ mod tests {
     #[test]
     fn host_projection_never_carries_secret_material() {
         let json = serde_json::to_string(&HostInfo::from_record(&host(AuthMode::Password, None))).unwrap();
-        // 只允许出现 secret 的「引用」，不允许出现任何像是凭据的字段
-        assert!(json.contains("\"host_id\":\"h1\""), "{json}");
-        for forbidden in ["password", "passphrase", "private_key", "secret_value"] {
-            assert!(!json.contains(forbidden), "HostInfo 泄露了 `{forbidden}`: {json}");
+        // 只允许出现 secret 的「引用」，不允许出现任何像是凭据的字段。
+        // 按**字段名**判断而不是按整串文本 grep：`auth_mode: "password"` 是模式名，
+        // 而 `password_secret_id` 才是引用，只有后者必须消失。
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys = key_paths(&value);
+        assert!(keys.iter().any(|k| k.ends_with("host_id")), "{keys:?}");
+        for forbidden in ["password", "passphrase", "private_key", "secret"] {
+            let hit = keys.iter().find(|k| k.rsplit('.').next().unwrap_or_default().contains(forbidden));
+            assert!(hit.is_none(), "HostInfo 泄露了字段 `{hit:?}`: {json}");
         }
+    }
+
+    /// 递归收集对象字段名，形如 `auth.host_id`。
+    fn key_paths(value: &serde_json::Value) -> Vec<String> {
+        fn walk(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+                        out.push(path.clone());
+                        walk(child, &path, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, prefix, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(value, "", &mut out);
+        out
     }
 
     #[test]

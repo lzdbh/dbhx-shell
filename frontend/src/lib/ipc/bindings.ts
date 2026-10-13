@@ -221,6 +221,10 @@ export type HostId = string;
 /**
  *  给前端看的主机投影。字段与 `HostRecord` 同源，但 `auth_ref` 已经把
  *  「用哪个凭据」压成会话层真正需要的形式，省得前端自己拼。
+ * 
+ *  `auth_mode` 与 `auth` 看着重复，其实不然：`AuthRef::Host` 同时覆盖
+ *  `Password` 与 `KeyboardInteractive` 两种模式，只给 `auth` 的话，编辑表单
+ *  无法还原用户当初选的是哪种，保存时会把它悄悄降级成密码认证。
  */
 export type HostInfo = {
 	id: HostId,
@@ -230,6 +234,7 @@ export type HostInfo = {
 	favorite: boolean,
 	protocol: Protocol,
 	endpoint: Endpoint,
+	auth_mode: AuthMode,
 	auth: AuthRef,
 	keepalive_secs: number,
 	encoding: TerminalEncoding,
