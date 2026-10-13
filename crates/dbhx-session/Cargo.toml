@@ -1,0 +1,20 @@
+[package]
+name = "dbhx-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "会话层与 transport 池：10 元组身份键、lease 引用计数、拨号去重、idle park"
+
+[dependencies]
+dbhx-model.workspace = true
+dbhx-ssh.workspace = true
+dbhx-pty.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

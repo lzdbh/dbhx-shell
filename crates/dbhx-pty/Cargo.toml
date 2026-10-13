@@ -1,0 +1,16 @@
+[package]
+name = "dbhx-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "本地 PTY 会话（portable-pty）：与 SSH 会话共用同一套读写契约"
+
+[dependencies]
+dbhx-model.workspace = true
+portable-pty.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

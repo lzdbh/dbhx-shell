@@ -1,0 +1,21 @@
+[package]
+name = "dbhx-sftp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "SFTP 文件面板后端：目录列举、cwd 跟随、断点续传的传输引擎"
+
+[dependencies]
+dbhx-model.workspace = true
+dbhx-ssh.workspace = true
+tokio.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

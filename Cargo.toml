@@ -2,17 +2,19 @@
 resolver = "2"
 members = [
   "crates/dbhx-model",
+  "crates/dbhx-vault",
+  "crates/dbhx-ssh",
+  "crates/dbhx-pty",
+  "crates/dbhx-session",
+  "crates/dbhx-sftp",
   "crates/dbhx-ipc",
   "src-tauri",
 ]
 
-# dbhx-ssh / dbhx-pty / dbhx-sftp / dbhx-vault / dbhx-transfer 在 M1·M2 落地时再建，
-# 不留空壳 crate。
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
 # 共享外部依赖，版本只在根处钉一次
@@ -21,14 +23,27 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.9"
 
-# 连接层
-russh = "0.64"
+# 连接层。
+# russh 默认后端是 aws-lc-rs，它会 links aws_lc_0_46_0 并在 build.rs 里编 C ——
+# 交叉 aarch64-pc-windows-msvc / aarch64-apple-darwin 的 `cargo check` 因此必须装
+# 目标平台 cmake+nasm+CC，CI 矩阵直接崩。改用纯 Rust 路径可控的 ring。
+russh = { version = "0.64", default-features = false, features = [
+  "flate2",
+  "ring",
+  "rsa",
+  "des",
+] }
 russh-sftp = "3"
 portable-pty = "0.9"
 
-# 数据层
-rusqlite = { version = "0.40", features = ["bundled"] }
+# 存储层刻意不用 rusqlite/bundled：那会在 build.rs 里跑 cc，
+# 交叉 aarch64-pc-windows-msvc 的 cargo check 需要目标三元组的 C 编译器，CI 矩阵会因此崩。
+# vault 改成 AES-256-GCM 加密的单文件 JSON 文档，纯 Rust、原子写、跨平台零工具链依赖。
+aes-gcm = "0.10"
 keyring = "4"
 
 # IPC 类型生成：tauri-specta 对 Tauri 2 的支持仍在 rc 线，
@@ -43,6 +58,11 @@ specta-util = "0.0.12"
 
 # 内部 crate
 dbhx-model = { path = "crates/dbhx-model" }
+dbhx-vault = { path = "crates/dbhx-vault" }
+dbhx-ssh = { path = "crates/dbhx-ssh" }
+dbhx-pty = { path = "crates/dbhx-pty" }
+dbhx-session = { path = "crates/dbhx-session" }
+dbhx-sftp = { path = "crates/dbhx-sftp" }
 dbhx-ipc = { path = "crates/dbhx-ipc" }
 
 [workspace.lints.rust]

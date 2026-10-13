@@ -6,9 +6,14 @@
 
 pub mod error;
 pub mod session;
+pub mod vault;
 
 pub use error::{redacted, ErrorCode, IpcError};
 pub use session::{
     AuthRef, ConnectSpec, Endpoint, LiveEndpoint, Protocol, Pong, PtySize, SessionId, SessionInfo,
     SessionStatus, TerminalEncoding,
+};
+pub use vault::{
+    AuthMode, GroupMode, HostId, HostInfo, HostKeyDecision, HostRecord, IdentityId, IdentityRecord,
+    KnownHost, KnownHostSource, SecretId,
 };

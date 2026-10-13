@@ -1,0 +1,20 @@
+[package]
+name = "dbhx-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "russh 封装：拨号、认证、shell/PTY 通道、SFTP 子系统通道"
+
+[dependencies]
+dbhx-model.workspace = true
+tokio.workspace = true
+russh.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

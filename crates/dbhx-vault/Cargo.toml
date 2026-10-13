@@ -1,0 +1,19 @@
+[package]
+name = "dbhx-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "加密的主机/凭据库与主机密钥存储；明文秘密只在本 crate 内部出现，出库即成引用"
+
+[dependencies]
+dbhx-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
