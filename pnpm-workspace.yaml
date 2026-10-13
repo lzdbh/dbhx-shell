@@ -1,0 +1,18 @@
+packages:
+  - frontend
+
+# pnpm 11 用 allowBuilds 取代了 onlyBuiltDependencies / ignoredBuiltDependencies
+# （那些键在 11 里已删除）。core-js 的 postinstall 只是打印赞助信息，显式设 false
+# 跳过它：不写的话 install 会把它当未审批的构建脚本、退出码非 0，CI 直接红。
+allowBuilds:
+  core-js: false
+
+# F: 是 exFAT 卷，不支持 symlink；pnpm 默认的 isolated linker 会在
+# node_modules/.pnpm 之间建软链而直接失败（EISDIR / ENOSYS）。
+# hoisted 用扁平复制代替软链，代价是失去依赖隔离，但这是文件系统硬约束。
+nodeLinker: hoisted
+
+# pnpm 默认在 `pnpm <script>` 前校验依赖并自动补装，这会去拉全部平台的可选二进制
+# （@tauri-apps/cli-linux-*、lightningcss-darwin-* 等），镜像上这些请求会失败并让整个命令退出 1。
+# 本地开发不需要这个校验，关掉。
+verifyDepsBeforeRun: off

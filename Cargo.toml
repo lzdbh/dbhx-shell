@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/dbhx-model",
+  "crates/dbhx-ipc",
+  "src-tauri",
+]
+
+# dbhx-ssh / dbhx-pty / dbhx-sftp / dbhx-vault / dbhx-transfer 在 M1·M2 落地时再建，
+# 不留空壳 crate。
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# 共享外部依赖，版本只在根处钉一次
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+# 连接层
+russh = "0.64"
+russh-sftp = "3"
+portable-pty = "0.9"
+
+# 数据层
+rusqlite = { version = "0.40", features = ["bundled"] }
+keyring = "4"
+
+# IPC 类型生成：tauri-specta 对 Tauri 2 的支持仍在 rc 线，
+# 且 specta 必须与 tauri-specta 的 rc 号严格对齐，勿单独升级
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+specta-serde = "0.0.12"
+specta-typescript = "0.0.12"
+specta-util = "0.0.12"
+
+# 内部 crate
+dbhx-model = { path = "crates/dbhx-model" }
+dbhx-ipc = { path = "crates/dbhx-ipc" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

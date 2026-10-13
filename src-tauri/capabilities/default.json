@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口权限。core:default 提供事件与窗口基础能力；dbhx:default 由 src-tauri/build.rs 里 InlinedPlugin::commands 自动生成的 allow-ping / allow-ping-failure 聚合而来——plugin 命令一律走 ACL，不授权就会被 runtime 拒。需要按命令粒度收紧时把 dbhx:default 换成 dbhx:allow-ping。",
+  "windows": ["main"],
+  "permissions": ["core:default", "dbhx:default"]
+}

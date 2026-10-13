@@ -1,0 +1,16 @@
+[package]
+name = "dbhx-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "纯类型与纯函数：不依赖 Tauri、不做 I/O，可 cargo test 直接跑"
+
+[dependencies]
+serde.workspace = true
+specta.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

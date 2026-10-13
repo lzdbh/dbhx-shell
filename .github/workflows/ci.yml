@@ -1,0 +1,131 @@
+name: ci
+
+# M0 的硬要求是跨平台 x64 + arm64，所以矩阵必须在 CI 里就把 6 个 target 都过一遍
+# cargo check，而不是等 M1 引入 russh/portable-pty 后才发现某个平台编不过。
+# `cargo check` 不做链接，跨 target 不需要模拟器；`test` 只在原生 runner 上跑。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: warn
+
+jobs:
+  check:
+    name: cargo check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+          - os: macos-latest          # Apple Silicon，原生 arm64
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri 在 Linux 上的 build script 会 pkg-config 找 webkit2gtk / gtk，
+      # 缺任何一个都会让 cargo check 在任何 crate 编译之前就失败。
+      - name: Install Linux system deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            gcc-aarch64-linux-gnu
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # 交叉 arm64 时，rusqlite bundled 之类的 C 依赖需要目标三元组的编译器；
+      # D1 还没有 C 依赖，先把 cc 配置好，避免 M1 时踩同一个坑。
+      - name: Configure cross linker (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+
+  test:
+    name: cargo test + contract drift (${{ matrix.os }})
+    # 只有原生 runner 能执行测试；跨 target 的 test 由 M1 起用 qemu 补。
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+
+      # dbhx-ipc 的 codegen 测试会重新生成 frontend/src/lib/ipc/bindings.ts。
+      - name: cargo test
+        run: cargo test --workspace
+
+      # bindings.ts 是提交进仓库的生成物：Rust 契约改了但忘了重生成，这里就红。
+      - name: Fail on generated-binding drift
+        run: git diff --exit-code -- frontend/src/lib/ipc/bindings.ts
+
+  frontend:
+    name: frontend build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          # 与本地一致（`pnpm --version` = 11.18.0）。pnpm 11 删掉了
+          # ignoredBuiltDependencies，改用 allowBuilds，版本错开会让
+          # pnpm-workspace.yaml 的构建脚本审批语义两边不一致。
+          version: 11.18.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          # pnpm-workspace.yaml 在仓库根，lockfile 也在根，不在 frontend/ 下
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      # package.json 里 build 已经是 `vue-tsc --noEmit && vite build`，
+      # 不用 `-b`（复杂 SFC 会误报 no default export）。
+      # 用 --filter 走 tauri.conf.json beforeBuildCommand 的同一条命令，别让它先在 CI 里烂掉。
+      - name: Typecheck + build
+        run: pnpm --filter frontend build

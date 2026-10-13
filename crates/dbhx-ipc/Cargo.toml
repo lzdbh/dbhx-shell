@@ -1,0 +1,24 @@
+[package]
+name = "dbhx-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "唯一允许 use tauri:: 的 crate：dbhx plugin + 命令契约 + TS 绑定生成"
+
+[dependencies]
+dbhx-model.workspace = true
+# tauri::command / specta 的宏展开里直接引用了 ::serde 与 ::serde_json 路径，
+# 即使源码没有显式使用也不能删。
+serde.workspace = true
+serde_json.workspace = true
+specta.workspace = true
+# rc.25 的语言实现不在 tauri-specta 里，`Typescript` 要从这个 crate 拿
+specta-typescript.workspace = true
+tauri.workspace = true
+tauri-specta.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

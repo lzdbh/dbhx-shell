@@ -1,0 +1,23 @@
+# 换行归一化必须在 CI 的 `git diff --exit-code -- frontend/src/lib/ipc/bindings.ts`
+# 之前定好：codegen 测试永远用 LF 重写 bindings.ts，而 Windows 上 core.autocrlf=true
+# 会把它 checkout 成 CRLF，于是本地 diff 常年是脏的、漂移检查失去意义。
+* text=auto
+
+# 源码与生成物统一 LF，任何平台 checkout 出来都和 cargo/rustc 写的一致
+*.rs text eol=lf
+*.ts text eol=lf
+*.vue text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+Cargo.lock text eol=lf
+pnpm-lock.yaml text eol=lf
+
+# 图标：别当文本做换行转换，直接二进制存
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
