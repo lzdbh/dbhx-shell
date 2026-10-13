@@ -1,0 +1,20 @@
+[package]
+name = "dbhx-testsrv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "进程内 SSH/SFTP 测试服务器：让连接层与 SFTP 层在离线环境里跑真实协议"
+
+# 这个 crate 只作为其它 crate 的 dev-dependency 存在，不进最终产品。
+# 它存在的理由见 src/lib.rs 顶部。
+[dependencies]
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
+tracing.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }

@@ -117,6 +117,9 @@ impl SshTransport {
         let (req_tx, req_rx) = mpsc::channel(REQUEST_QUEUE);
 
         let handler = ClientHandler::new(endpoint.clone(), Arc::clone(&state_tx), event_tx, check_tx);
+        // 应答任务必须在 connect 之前就位：russh 的 `connect()` 要等密钥交换走完才返回，
+        // 而密钥交换又卡在等 `check_server_key` 的回话——先 connect 再 spawn 就是死锁。
+        tokio::spawn(verify_loop(check_rx, endpoint.clone(), verifier));
         let handle = tokio::time::timeout(
             options.handshake_timeout,
             russh::client::connect(
@@ -133,10 +136,8 @@ impl SshTransport {
             handle,
             Arc::clone(&state_tx),
             state_rx.clone(),
-            check_rx,
             req_rx,
             endpoint.clone(),
-            verifier,
         ));
 
         // 主机密钥必须已经裁完才能继续：等到不再是 Handshaking 为止。
@@ -288,30 +289,38 @@ async fn wait_for_state(
     }
 }
 
+/// 主机密钥应答任务。
+///
+/// 独立成一个任务而不是塞进 actor 的 `select!`，是因为它必须在 `connect()` 返回之前
+/// 就已经在听；actor 那时还没出生。等待用户点「确认」的那段时间没有上限，
+/// 所以这个任务不能持有任何别的锁。
+async fn verify_loop(
+    mut checks: mpsc::UnboundedReceiver<KeyCheck>,
+    endpoint: LiveEndpoint,
+    mut verifier: Box<dyn HostKeyVerifier>,
+) {
+    while let Some(check) = checks.recv().await {
+        let trust = verifier.verify(endpoint.clone(), check.key).await;
+        // 对端已经消失（会话终止）时 send 返回 Err，没有可救的东西
+        let _ = check.reply.send(trust);
+    }
+}
+
 async fn actor_loop(
     mut handle: Handle<ClientHandler>,
     state_tx: Arc<watch::Sender<SessionState>>,
     mut state_rx: watch::Receiver<SessionState>,
-    mut checks: mpsc::UnboundedReceiver<KeyCheck>,
     mut requests: mpsc::Receiver<Request>,
     endpoint: LiveEndpoint,
-    mut verifier: Box<dyn HostKeyVerifier>,
 ) {
     loop {
         tokio::select! {
-            check = checks.recv() => {
-                match check {
-                    Some(c) => {
-                        let trust = verifier.verify(endpoint.clone(), c.key).await;
-                        // 对端已消失（会话终止）时 send 返回 Err，没有可救的东西
-                        let _ = c.reply.send(trust);
-                    }
-                    // handler 已 drop：会话任务结束，不会再有密钥交换要裁决
-                    None => break,
-                }
-            }
             request = requests.recv() => {
                 match request {
+                    // 返回值表示「actor 该退出了」：主动关闭的原因必须在
+                    // russh 的 `disconnected` 回调之前钉下去，否则那条回调带着
+                    // `Error(Disconnected)` 后到，把用户关连接误记成「连接失败」，
+                    // UI 会给出不存在的重试建议。
                     Some(req) => {
                         if handle_request(&endpoint, &mut handle, &state_tx, req).await {
                             break;
@@ -322,18 +331,34 @@ async fn actor_loop(
                 }
             }
             changed = state_rx.changed() => {
-                if changed.is_err() || state_rx.borrow().closed() {
+                // 必须用 `borrow_and_update`：`borrow` 不推进这个 receiver 的观察版本，
+                // 那样每次状态变化之后本分支都会立刻就绪，actor 变成空转的忙等。
+                if changed.is_err() || state_rx.borrow_and_update().closed() {
                     break;
                 }
             }
         }
     }
+    // 先记原因再发 disconnect：disconnect 会让会话任务收尾，
+    // handler 的 `disconnected` 回调随时可能抢到写权。
+    stamp_closed(&state_tx, CloseReason::ClientRequested);
     // 尽量发个 disconnect，让对端日志是「客户端正常关闭」而不是 TCP 断裂
     let _ = handle.disconnect(russh::Disconnect::ByApplication, "", "en").await;
-    let _ = state_tx.send(SessionState::Closed(CloseReason::ClientRequested));
 }
 
-/// 处理一条请求。返回 `true` 表示 actor 应当退出。
+/// 只在「还没有关闭原因」时写入关闭原因。
+///
+/// 关闭原因以**第一个**为准：谁先观察到连接结束，谁就是真正的原因。
+/// handler 侧的 `set_state` 有同样的规矩，两边加起来才能保证
+/// 「服务器断开」不会被随后的本地清理改写成 `ClientRequested`。
+fn stamp_closed(state_tx: &watch::Sender<SessionState>, reason: CloseReason) {
+    if state_tx.borrow().closed() {
+        return;
+    }
+    let _ = state_tx.send(SessionState::Closed(reason));
+}
+
+/// 处理一条请求。返回 `true` 表示连接该结束（只有 `Shutdown` 会）。
 async fn handle_request(
     endpoint: &LiveEndpoint,
     handle: &mut Handle<ClientHandler>,

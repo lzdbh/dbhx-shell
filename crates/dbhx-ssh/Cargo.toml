@@ -14,5 +14,9 @@ tracing.workspace = true
 russh.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+# 真实协议路径要有真服务器才能跑到，见 crates/dbhx-testsrv
+dbhx-testsrv.workspace = true
+
 [lints]
 workspace = true

@@ -8,6 +8,7 @@ members = [
   "crates/dbhx-session",
   "crates/dbhx-sftp",
   "crates/dbhx-ipc",
+  "crates/dbhx-testsrv",
   "src-tauri",
 ]
 
@@ -64,6 +65,8 @@ dbhx-pty = { path = "crates/dbhx-pty" }
 dbhx-session = { path = "crates/dbhx-session" }
 dbhx-sftp = { path = "crates/dbhx-sftp" }
 dbhx-ipc = { path = "crates/dbhx-ipc" }
+# 只给 dev-dependencies 用：SSH/SFTP 协议路径需要真服务器才能跑到
+dbhx-testsrv = { path = "crates/dbhx-testsrv" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

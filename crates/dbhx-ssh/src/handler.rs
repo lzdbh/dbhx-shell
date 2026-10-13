@@ -86,6 +86,12 @@ impl ClientHandler {
     }
 
     fn set_state(&self, next: SessionState) {
+        // 关闭原因以**第一个**为准。russh 在本地主动 disconnect 之后还会回调
+        // `disconnected(Error(Disconnected))`，若不拦住，用户自己关连接会被改写成
+        // 「连接失败」，UI 于是给出一个并不存在的重试建议。
+        if matches!(next, SessionState::Closed(_)) && self.state.borrow().closed() {
+            return;
+        }
         let _ = self.state.send(next);
     }
 
