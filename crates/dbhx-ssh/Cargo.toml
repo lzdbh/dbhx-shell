@@ -3,18 +3,16 @@ name = "dbhx-ssh"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "russh 封装：拨号、认证、shell/PTY 通道、SFTP 子系统通道"
+description = "SSH 拨号、认证与通道；只依赖 russh/tokio，可 cargo test 直接跑"
 
 [dependencies]
 dbhx-model.workspace = true
-tokio.workspace = true
-russh.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+russh.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

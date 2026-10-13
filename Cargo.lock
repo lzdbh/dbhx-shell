@@ -953,6 +953,7 @@ version = "0.1.0"
 dependencies = [
  "dbhx-model",
  "russh",
+ "serde",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

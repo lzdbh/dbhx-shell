@@ -337,12 +337,7 @@ fn new_id() -> String {
     s
 }
 
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+pub(crate) use dbhx_model::now_ms;
 
 /// 不引 base64 crate：这里只需要「字节 <-> 标准 base64 无换行」，
 /// 手写 40 行可以少一个依赖，也让交叉编译矩阵的依赖树更短。
