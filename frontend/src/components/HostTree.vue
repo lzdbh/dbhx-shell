@@ -1,0 +1,139 @@
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+import { message } from 'ant-design-vue'
+
+import type { HostInfo } from '@/lib/ipc/bindings'
+import { useFilesStore } from '@/stores/files'
+import { useHostsStore } from '@/stores/hosts'
+import { useSessionsStore } from '@/stores/sessions'
+import HostFormModal from './HostFormModal.vue'
+
+const hosts = useHostsStore()
+const sessions = useSessionsStore()
+const files = useFilesStore()
+const [messageApi, holder] = message.useMessage()
+
+const keyword = ref('')
+const selectedKey = ref<string | null>(null)
+const formOpen = ref(false)
+const editing = ref<HostInfo | null>(null)
+const connecting = ref(false)
+
+const HOST_PREFIX = 'h:'
+
+const filtered = computed(() => {
+  const text = keyword.value.trim().toLowerCase()
+  if (!text) return hosts.hosts
+  return hosts.hosts.filter(h =>
+    [h.label, h.group ?? '', h.endpoint.host, h.endpoint.username].join(' ').toLowerCase().includes(text),
+  )
+})
+
+const treeData = computed(() =>
+  hosts.groupsOf(filtered.value).map(group => ({
+    title: `${group.name}（${group.hosts.length}）`,
+    key: `g:${group.name}`,
+    selectable: false,
+    children: group.hosts.map(host => ({
+      // 标题里带上 user@host：同名主机在树里撞车时，只有地址能区分它们
+      title: `${host.label} · ${hosts.subtitle(host)}`,
+      key: `${HOST_PREFIX}${host.id}`,
+    })),
+  })),
+)
+
+const selected = computed<HostInfo | null>(() =>
+  selectedKey.value?.startsWith(HOST_PREFIX) ? hosts.byId(selectedKey.value.slice(HOST_PREFIX.length)) ?? null : null,
+)
+
+async function connect(host: HostInfo): Promise<void> {
+  connecting.value = true
+  const result = await sessions.openRemote(host.id)
+  connecting.value = false
+  if (!result.ok) messageApi.error(result.error ?? '连接失败')
+  else messageApi.success(`正在连接 ${host.label}`)
+}
+
+async function openPanel(host: HostInfo): Promise<void> {
+  const panel = await files.openForHost(host.id)
+  if (panel) messageApi.success(`文件面板：${panel.path}`)
+  else messageApi.error(files.openError ?? '打开文件面板失败')
+}
+
+async function remove(host: HostInfo): Promise<void> {
+  if (await hosts.remove(host.id)) {
+    if (selectedKey.value === `${HOST_PREFIX}${host.id}`) selectedKey.value = null
+    messageApi.success('已删除')
+  }
+  else messageApi.error(hosts.error ?? '删除失败')
+}
+
+function edit(host: HostInfo): void {
+  editing.value = host
+  formOpen.value = true
+}
+
+function create(): void {
+  editing.value = null
+  formOpen.value = true
+}
+
+onMounted(() => void hosts.refresh())
+</script>
+
+<template>
+  <div class="host-tree">
+    <holder />
+    <div class="toolbar">
+      <a-input v-model:value="keyword" size="small" placeholder="搜索主机" allow-clear />
+      <a-button size="small" type="primary" @click="create()">新建</a-button>
+    </div>
+    <a-alert v-if="hosts.error" :message="hosts.error" type="error" banner />
+    <a-spin :spinning="hosts.loading">
+      <a-empty v-if="filtered.length === 0" description="还没有主机" style="margin-top: 32px" />
+      <a-tree
+        v-else
+        :tree-data="treeData"
+        :selected-keys="selectedKey ? [selectedKey] : []"
+        default-expand-all
+        block-node
+        @select="keys => selectedKey = (keys[0] ?? null) as string | null"
+      />
+    </a-spin>
+    <div v-if="selected" class="actions">
+      <a-button size="small" type="primary" :loading="connecting" @click="void connect(selected)">连接</a-button>
+      <a-button size="small" :disabled="selected.protocol !== 'ssh'" @click="void openPanel(selected)">文件面板</a-button>
+      <a-button size="small" @click="edit(selected)">编辑</a-button>
+      <a-popconfirm title="删除这台主机及其已存口令？" ok-text="删除" cancel-text="取消" @confirm="void remove(selected)">
+        <a-button size="small" danger>删除</a-button>
+      </a-popconfirm>
+    </div>
+    <HostFormModal v-model:open="formOpen" :host="editing" />
+  </div>
+</template>
+
+<style scoped>
+.host-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 8px;
+  overflow: hidden;
+}
+
+.toolbar {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: none;
+  padding-top: 8px;
+  border-top: 1px solid rgba(128, 128, 128, 0.25);
+}
+</style>

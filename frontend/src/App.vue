@@ -1,128 +1,153 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { message, theme } from 'ant-design-vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
-import { ping, pingFailure } from '@/lib/ipc/client'
-import { describeIpcError, normalizeIpcError } from "@/lib/ipc/errors"
-import type { ErrorCode, Pong } from '@/lib/ipc/bindings'
+import { theme } from 'ant-design-vue'
+
+import { startEventBridge } from '@/lib/ipc/bus'
+import AskModal from '@/components/AskModal.vue'
+import HostTree from '@/components/HostTree.vue'
+import SettingsDrawer from '@/components/SettingsDrawer.vue'
+import SftpPanel from '@/components/SftpPanel.vue'
+import TabBar from '@/components/TabBar.vue'
+import TerminalView from '@/components/TerminalView.vue'
+import TransferTray from '@/components/TransferTray.vue'
+import { useSessionsStore } from '@/stores/sessions'
+import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
+import { useTransfersStore } from '@/stores/transfers'
 
-// AntDV 的静态 message.* 不读 ConfigProvider 的主题，必须用 useMessage + contextHolder
-const [messageApi, contextHolder] = message.useMessage()
+const sessions = useSessionsStore()
+const settings = useSettingsStore()
 const themeStore = useThemeStore()
+const transfers = useTransfersStore()
+
+const drawerOpen = ref(false)
+let stopBridge: (() => void) | null = null
 
 const antTheme = computed(() => ({
   algorithm: themeStore.dark ? theme.darkAlgorithm : theme.defaultAlgorithm,
   token: { colorPrimary: themeStore.colorPrimary },
 }))
 
-const seq = ref(0)
-const pong = ref<Pong | null>(null)
-const errorText = ref('')
-const busy = ref(false)
+onMounted(async () => {
+  // 先接事件再拉列表：拉列表期间到达的 term-data 否则会没人认领
+  stopBridge = await startEventBridge()
+  await Promise.all([sessions.refresh(), transfers.refresh()])
+})
 
-async function runPing(): Promise<void> {
-  busy.value = true
-  errorText.value = ''
-  try {
-    seq.value += 1
-    pong.value = await ping(seq.value, `d1-${Date.now()}`)
-    messageApi.success(`pong #${pong.value.seq}`)
-  } catch (err) {
-    errorText.value = describeIpcError(normalizeIpcError(err))
-  } finally {
-    busy.value = false
-  }
-}
-
-// 错误通道探针：host_key_changed 是必须硬阻断的那一类，UI 侧要能原样拿到 code
-async function runFailureProbe(code: ErrorCode): Promise<void> {
-  busy.value = true
-  pong.value = null
-  try {
-    await pingFailure(code, 'probe from D1 smoke page')
-    errorText.value = '预期返回 Err，实际返回了 Ok —— 契约有变'
-  } catch (err) {
-    errorText.value = describeIpcError(normalizeIpcError(err))
-  } finally {
-    busy.value = false
-  }
-}
+onBeforeUnmount(() => stopBridge?.())
 </script>
 
 <template>
   <a-config-provider :theme="antTheme">
-    <context-holder />
-    <a-layout style="min-height: 100vh">
-      <a-layout-header style="display: flex; align-items: center; gap: 16px">
-        <a-typography-title :level="4" style="margin: 0; color: inherit">
-          dbhx shell · D1 冒烟页
-        </a-typography-title>
+    <a-layout class="shell">
+      <a-layout-header class="bar">
+        <span class="brand">dbhx shell</span>
+        <a-button size="small" @click="void sessions.openLocal('本机终端')">
+          本机终端
+        </a-button>
         <a-switch
           :checked="themeStore.dark"
           checked-children="暗"
           un-checked-children="亮"
+          size="small"
           @change="themeStore.toggleDark()"
         />
-        <a-button :loading="busy" type="primary" @click="runPing">
-          ping
-        </a-button>
-        <a-button :disabled="busy" danger @click="runFailureProbe('host_key_changed')">
-          注入 host_key_changed
+        <a-button size="small" @click="drawerOpen = true">
+          设置
         </a-button>
       </a-layout-header>
-      <a-layout-content style="padding: 24px">
-        <a-space direction="vertical" size="middle" style="width: 100%">
-          <a-alert
-            v-if="errorText"
-            :message="errorText"
-            type="error"
-            show-icon
-          />
-          <a-descriptions
-            v-if="pong"
-            :column="1"
-            bordered
-            size="small"
-            title="来自 Rust 的 Pong"
-          >
-            <a-descriptions-item label="seq">{{ pong.seq }}</a-descriptions-item>
-            <a-descriptions-item label="echo">{{ pong.echo }}</a-descriptions-item>
-            <a-descriptions-item label="server_time_ms">
-              {{ pong.server_time_ms }}
-            </a-descriptions-item>
-            <a-descriptions-item label="target">
-              {{ pong.target.username }}@{{ pong.target.host }}:{{ pong.target.port }}
-            </a-descriptions-item>
-          </a-descriptions>
-          <!-- 终端调色板的可见性检查：M1 要把同一份 ansi 喂给 xterm.js -->
-          <a-typography-paragraph type="secondary">
-            当前终端底色：{{ themeStore.terminalTheme.background }}（{{ themeStore.terminalTheme.id }}）
-          </a-typography-paragraph>
-          <div class="ansi-row">
-            <span
-              v-for="(color, index) in themeStore.terminalTheme.ansi"
-              :key="index"
-              class="ansi-cell"
-              :style="{ background: color }"
+      <a-layout has-sider>
+        <a-layout-sider :width="260" theme="light" class="sider">
+          <HostTree />
+        </a-layout-sider>
+        <a-layout class="center">
+          <TabBar />
+          <div class="terminal-area">
+            <!-- 每个 tab 各挂一个终端实例，切换只用 v-show：
+                 卸载会销毁 xterm，回滚缓冲区里的日志就没了 -->
+            <TerminalView
+              v-for="tab in sessions.tabs"
+              :key="tab.id"
+              :session="tab.id"
+              :active="tab.id === sessions.activeId"
+              v-show="tab.id === sessions.activeId"
             />
+            <a-empty v-if="sessions.tabs.length === 0" description="从左侧选一台主机，或新建本机终端" class="placeholder" />
           </div>
-        </a-space>
-      </a-layout-content>
+        </a-layout>
+        <a-layout-sider :width="settings.panelWidth" theme="light" class="sider">
+          <div class="panel-host">
+            <SftpPanel />
+          </div>
+          <TransferTray />
+        </a-layout-sider>
+      </a-layout>
     </a-layout>
+    <a-drawer v-model:open="drawerOpen" title="设置" :width="420" placement="right">
+      <SettingsDrawer />
+    </a-drawer>
+    <AskModal />
   </a-config-provider>
 </template>
 
 <style scoped>
-.ansi-row {
-  display: flex;
-  gap: 4px;
+.shell {
+  height: 100vh;
 }
 
-.ansi-cell {
-  width: 28px;
-  height: 18px;
-  border-radius: 2px;
-  border: 1px solid rgba(128, 128, 128, 0.35);
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  height: 44px;
+  line-height: 44px;
+  background: rgba(128, 128, 128, 0.08);
+}
+
+.brand {
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.bar :deep(.ant-layout-header) {
+  background: transparent;
+}
+
+.sider {
+  background: rgba(128, 128, 128, 0.04);
+  border-right: 1px solid rgba(128, 128, 128, 0.2);
+  overflow: hidden;
+}
+
+.center {
+  min-width: 0;
+}
+
+.terminal-area {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 6px 8px 8px;
+}
+
+.terminal-area > *:not(.placeholder) {
+  position: absolute;
+  inset: 6px 8px 8px;
+}
+
+.placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.panel-host {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 </style>
