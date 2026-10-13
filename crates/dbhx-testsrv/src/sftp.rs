@@ -23,15 +23,16 @@ enum Opened {
 
 pub struct SftpHandler {
     fs: Arc<Mutex<Vfs>>,
-    /// 会话级 cwd。本夹具从不改它，相对路径一律按 `/` 展开。
+    /// 会话级 cwd。真实 `sftp-server` 起来就在用户家目录，相对路径按这里展开，
+    /// 所以夹具也必须从家目录开始，否则客户端发的相对写法会指向完全不同的地方。
     cwd: String,
     handles: HashMap<String, Opened>,
     next_handle: u32,
 }
 
 impl SftpHandler {
-    pub fn new(fs: Arc<Mutex<Vfs>>) -> Self {
-        Self { fs, cwd: "/".to_string(), handles: HashMap::new(), next_handle: 0 }
+    pub fn new(fs: Arc<Mutex<Vfs>>, cwd: impl Into<String>) -> Self {
+        Self { fs, cwd: cwd.into(), handles: HashMap::new(), next_handle: 0 }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vfs> {

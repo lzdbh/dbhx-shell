@@ -4,7 +4,7 @@
 //! OSC 7 提示符。这不是偷懒——目录跟随的被测点正是**我们从字节流里提取 OSC 7**，
 //! 所以这里必须发它，而发什么并不重要。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -87,6 +87,11 @@ pub struct TestSession {
     channels: HashMap<ChannelId, ChannelState>,
     /// 尚未被 subsystem 取走的原始通道
     pending: HashMap<ChannelId, Channel<Msg>>,
+    /// 已交给 SFTP 报文循环的通道。
+    ///
+    /// russh 在把字节喂给通道的同时**也会**调用 `Handler::data`，
+    /// 不认出来的话就会拿 SFTP 报文当终端输入做行回显，两边都会读到脏数据。
+    subsystems: HashSet<ChannelId>,
 }
 
 struct ChannelState {
@@ -96,7 +101,7 @@ struct ChannelState {
 
 impl TestSession {
     fn new(shared: Shared) -> Self {
-        Self { shared, channels: HashMap::new(), pending: HashMap::new() }
+        Self { shared, channels: HashMap::new(), pending: HashMap::new(), subsystems: HashSet::new() }
     }
 
     fn note<T>(&self, field: impl FnOnce(&mut Observed) -> T) {
@@ -216,12 +221,19 @@ impl russh::server::Handler for TestSession {
             return Ok(());
         };
         session.channel_success(channel_id)?;
-        let handler = SftpHandler::new(Arc::clone(&self.shared.spec.fs));
+        self.subsystems.insert(channel_id);
+        let handler = SftpHandler::new(Arc::clone(&self.shared.spec.fs), self.shared.spec.home.clone());
         russh_sftp::server::run(channel.into_stream(), handler).await;
         Ok(())
     }
 
     async fn data(&mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession) -> Result<(), Self::Error> {
+        // subsystem 通道的字节是 SFTP 报文，已经由 `russh_sftp::server::run` 在读了。
+        // 这里必须一个字都不碰：行回显会把报文塞回通道，客户端的报文解析器
+        // 于是看到一堆「长度字段为 1」的垃圾，症状是握手永远等不到应答。
+        if self.subsystems.contains(&channel) {
+            return Ok(());
+        }
         // `\r` 结尾才算一行；没有换行的按键（方向键、Ctrl-C）原样回显，
         // 这样才能测「一次 read 只拿到半截转义序列」那种真实切分。
         let text = String::from_utf8_lossy(data).to_string();
@@ -280,6 +292,7 @@ impl russh::server::Handler for TestSession {
     async fn channel_close(&mut self, channel: ChannelId, _session: &mut ServerSession) -> Result<(), Self::Error> {
         self.channels.remove(&channel);
         self.pending.remove(&channel);
+        self.subsystems.remove(&channel);
         Ok(())
     }
 }

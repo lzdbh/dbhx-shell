@@ -938,10 +938,12 @@ version = "0.1.0"
 dependencies = [
  "dbhx-model",
  "dbhx-ssh",
+ "dbhx-testsrv",
  "russh-sftp",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
