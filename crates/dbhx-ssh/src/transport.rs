@@ -130,7 +130,15 @@ impl SshTransport {
         )
         .await
         .map_err(|_| SshError::Timeout)?
-        .map_err(|e| classify_connect_error(&e))?;
+        .map_err(|e| {
+            // 主机密钥被裁决为「拒绝」时 russh 只能给出一个笼统的握手错误，
+            // 那个错误解释不了「为什么连不上」。以本地裁决结论为准：中间人阻断
+            // 若被翻译成「请核对地址与端口」，用户会去改端口而不是去查密钥。
+            if matches!(&*state_rx.borrow_and_update(), SessionState::Closed(CloseReason::HostKeyRejected)) {
+                return SshError::HostKeyUnknown;
+            }
+            classify_connect_error(&e)
+        })?;
 
         tokio::spawn(actor_loop(
             handle,

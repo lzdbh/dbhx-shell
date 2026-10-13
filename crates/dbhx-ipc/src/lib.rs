@@ -14,7 +14,8 @@
 pub mod bytes;
 pub mod commands;
 pub mod events;
-mod hub;
+// `pub` 只为集成测试：真服务器的端到端用例要自己起唯一的会话事件读者。
+pub mod hub;
 mod plansrc;
 pub mod state;
 #[cfg(test)]

@@ -888,6 +888,7 @@ dependencies = [
  "dbhx-session",
  "dbhx-sftp",
  "dbhx-ssh",
+ "dbhx-testsrv",
  "dbhx-vault",
  "serde",
  "serde_json",

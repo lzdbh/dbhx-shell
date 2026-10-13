@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use dbhx_model::{LiveEndpoint, PtySize};
-use dbhx_ssh::{Credential, DialOptions, ExecOutput, SshError, SshTransport, TrustAll, Chunk};
+use dbhx_ssh::{Credential, DialOptions, ExecOutput, RejectAll, SshError, SshTransport, TrustAll, Chunk};
 use dbhx_testsrv::{TestServer, TestSpec, sample_fs};
 use zeroize::Zeroizing;
 
@@ -184,5 +184,20 @@ async fn closing_the_client_ends_the_session_state() {
     transport.close().await;
     let reason = tokio::time::timeout(BUDGET, dbhx_ssh::wait_until_closed(&mut updates)).await.unwrap();
     assert_eq!(reason, dbhx_ssh::CloseReason::ClientRequested);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_host_key_reads_as_a_key_problem_not_a_network_one() {
+    let server = TestServer::start(spec()).await.unwrap();
+    // 裁决为拒绝时 russh 交回的是一个笼统的握手错误。那个错误解释不了「为什么连不上」，
+    // 必须让本地的 HostKeyRejected 结论盖掉它——否则中间人阻断在 UI 上就变成
+    // 「请核对地址与端口」，用户会去改端口而不是去查密钥。
+    let err = match SshTransport::dial(DialOptions::new(endpoint(&server)), Box::new(RejectAll)).await {
+        Err(err) => err,
+        Ok(_) => panic!("一律拒绝的裁决不该把握手放过去"),
+    };
+    assert!(matches!(err, SshError::HostKeyUnknown), "{err:?}");
+
     server.shutdown().await;
 }

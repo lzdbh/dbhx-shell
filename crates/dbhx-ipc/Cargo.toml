@@ -28,6 +28,9 @@ zeroize.workspace = true
 [dev-dependencies]
 # 测试里要推进假拨号器的时钟、也要 #[tokio::test] 宏
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# 真协议路径（拨号、认证、shell 通道、SFTP、传输）只能对着真服务器跑，
+# 假拨号器造不出 `SubsystemStream`
+dbhx-testsrv.workspace = true
 
 [lints]
 workspace = true
