@@ -3,10 +3,12 @@ import { computed } from 'vue'
 import { message } from 'ant-design-vue'
 
 import { useFilesStore } from '@/stores/files'
+import { useLayoutStore } from '@/stores/layout'
 import { useSessionsStore } from '@/stores/sessions'
 
 const sessions = useSessionsStore()
 const files = useFilesStore()
+const layout = useLayoutStore()
 const [messageApi, holder] = message.useMessage()
 
 /** 当前 tab。模板里不能把 `number | null` 收窄，所以在脚本里算好。 */
@@ -52,6 +54,13 @@ async function openPanel(): Promise<void> {
         <span class="label">{{ tab.label }}</span>
         <span v-if="tab.cwd" class="cwd">{{ tab.cwd }}</span>
         <span v-if="tab.error" class="error" :title="tab.error">!</span>
+        <!-- 钉住状态直接标在 tab 上：右格显示的是哪个会话，看一眼就知道 -->
+        <button
+          class="pin"
+          :class="{ on: tab.id === layout.pinned }"
+          :title="tab.id === layout.pinned ? '取消分屏' : '钉到右格分屏'"
+          @click.stop="layout.toggle(tab.id)"
+        >⑂</button>
         <button class="close" title="关闭会话" @click.stop="void sessions.close(tab.id)">×</button>
       </div>
       <button class="add" title="新建本机终端" @click="void openLocal()">＋</button>
@@ -147,6 +156,26 @@ async function openPanel(): Promise<void> {
 .error {
   color: #ff4d4f;
   font-weight: 700;
+}
+
+.pin {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.35;
+}
+
+.pin:hover {
+  opacity: 0.8;
+}
+
+/* 钉住的 tab 一直显色，不用鼠标悬停去猜哪个会话在右格 */
+.pin.on {
+  opacity: 1;
+  color: #1677ff;
 }
 
 .close {

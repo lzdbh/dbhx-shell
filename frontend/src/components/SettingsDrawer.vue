@@ -16,6 +16,22 @@ const [messageApi, holder] = message.useMessage()
 
 const PRIMARY_COLORS = ['#1677ff', '#13a8a8', '#722ed1', '#d4380d', '#389e0d']
 
+const SHORTCUT_COLUMNS = [
+  { title: '按键', dataIndex: 'keys', width: 130 },
+  { title: '作用', dataIndex: 'what' },
+]
+
+/** `Cmd` 在 macOS 上与 `Ctrl` 等价，判定里就是同一个修饰键，这里照实写。 */
+const SHORTCUTS = [
+  { keys: 'Ctrl/Cmd + T', what: '新建本机终端' },
+  { keys: 'Ctrl/Cmd + W', what: '关闭当前格子的会话' },
+  { keys: 'Ctrl/Cmd + E', what: '把当前会话钉到右格（再按取消）' },
+  { keys: 'Ctrl/Cmd + Tab', what: '切到下一个标签，Shift 反向' },
+  { keys: 'Ctrl/Cmd + 1…9', what: '跳到第 N 个标签' },
+  { keys: 'Ctrl/Cmd + ,', what: '打开设置' },
+  { keys: 'Alt + ←/→', what: '分屏时在两格之间移焦点' },
+]
+
 const identityLabel = ref('')
 /** 私钥文本只活在这一次提交里：不写 store、不进 localStorage。 */
 const privateKey = ref('')
@@ -101,6 +117,19 @@ function splitPattern(pattern: string): { host: string, port: number } {
       <a-form-item label="终端字号">
         <a-input-number v-model:value="settings.fontSize" :min="10" :max="28" />
       </a-form-item>
+
+      <a-divider orientation="left">
+        快捷键
+      </a-divider>
+      <!-- 只做展示：判定逻辑在 lib/shortcuts.ts，这里写错了不会影响行为，但会误导用户，
+           所以两边都改的时候记得对齐 -->
+      <a-table
+        size="small"
+        :columns="SHORTCUT_COLUMNS"
+        :data-source="SHORTCUTS"
+        :pagination="false"
+        row-key="keys"
+      />
 
       <a-divider orientation="left">
         文件
