@@ -99,7 +99,8 @@ pub struct SshTransport {
     endpoint: LiveEndpoint,
     tx: mpsc::Sender<Request>,
     state: watch::Receiver<SessionState>,
-    events: mpsc::UnboundedReceiver<SshEvent>,
+    /// 取走一次就没了（见 `take_events`），所以是 Option。
+    events: Option<mpsc::UnboundedReceiver<SshEvent>>,
 }
 
 impl SshTransport {
@@ -152,7 +153,7 @@ impl SshTransport {
             SessionState::Closed(other) => return Err(SshError::Unreachable(format!("{other:?}"))),
             SessionState::Handshaking => return Err(SshError::Timeout),
         }
-        Ok(Self { endpoint, tx: req_tx, state: state_rx, events })
+        Ok(Self { endpoint, tx: req_tx, state: state_rx, events: Some(events) })
     }
 
     pub fn endpoint(&self) -> &LiveEndpoint {
@@ -167,22 +168,21 @@ impl SshTransport {
         matches!(*self.state.borrow(), SessionState::Authenticated)
     }
 
-    /// 等连接结束并返回原因。会话层用它把标签页标成 Closed。
-    pub async fn wait_closed(&mut self) -> CloseReason {
-        loop {
-            if let SessionState::Closed(reason) = self.state.borrow_and_update().clone() {
-                return reason;
-            }
-            if self.state.changed().await.is_err() {
-                return CloseReason::Failed("transport 状态发送端已关闭".into());
-            }
-        }
+    /// 状态变化的订阅端。每个 clone 自己记「看到哪了」，互不影响。
+    ///
+    /// 池子必须走这条路观察连接死亡：等关闭要 `&mut` 接收端，而 transport 进
+    /// `Arc` 之后只剩 `&self`。
+    pub fn state_updates(&self) -> watch::Receiver<SessionState> {
+        self.state.clone()
     }
 
-    /// 服务器横幅等事件。注意：这个接收端只有一个持有者，
-    /// 会话层必须把它抽干，否则 `SshEvent` 会堆在无界队列里。
-    pub async fn next_event(&mut self) -> Option<SshEvent> {
-        self.events.recv().await
+    /// 取走事件接收端，只能成功一次。
+    ///
+    /// 做成 take 而不是 `next_event(&mut self)` 的理由同上。取走后必须有人抽干，
+    /// 否则 `SshEvent` 在无界队列里堆到内存耗尽；没人取走时发送端会随接收端 drop
+    /// 而静默丢事件，那是可接受的行为（横幅只是锦上添花）。
+    pub fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SshEvent>> {
+        self.events.take()
     }
 
     fn is_closed_now(&self) -> bool {
@@ -234,8 +234,23 @@ impl SshTransport {
     }
 }
 
-fn classify_connect_error(e: &russh::Error) -> SshError {
-    use russh::Error::*;
+/// 等一条连接结束并返回原因。会话层用它把标签页标成 Closed。
+///
+/// 独立成函数而不是 `SshTransport` 的方法，是因为调用方手上通常只有一个
+/// `state_updates()` 的 clone（transport 已经在 `Arc` 里）。发送端被 drop 意味着
+/// actor 任务已经退出，连接不复存在，同样算关闭。
+pub async fn wait_until_closed(rx: &mut watch::Receiver<SessionState>) -> CloseReason {
+    loop {
+        if let SessionState::Closed(reason) = rx.borrow_and_update().clone() {
+            return reason;
+        }
+        if rx.changed().await.is_err() {
+            return CloseReason::Failed("transport 状态发送端已关闭".into());
+        }
+    }
+}
+
+fn classify_connect_error(e: &russh::Error) -> SshError {    use russh::Error::*;
     // 文案是给运维看的，原文是给日志看的：russh 的 Display 是英文短语，
     // 直接透出既看不懂也不稳定，所以固定成可行动中文 + tracing::debug 留原文。
     let actionable = |hint: &str| {

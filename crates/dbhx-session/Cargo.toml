@@ -8,7 +8,6 @@ description = "会话层与 transport 池：10 元组身份键、lease 引用计
 [dependencies]
 dbhx-model.workspace = true
 dbhx-ssh.workspace = true
-dbhx-pty.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

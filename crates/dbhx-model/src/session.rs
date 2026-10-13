@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 /// M0–M2 只落地两种协议；telnet/mosh/et/serial 属 M6，先不占位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     Ssh,
@@ -24,7 +24,7 @@ pub enum SessionStatus {
 pub struct SessionId(pub u32);
 
 /// 凭据引用。**类型层面就不允许明文出现** —— 密码/私钥永远不过 IPC。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum AuthRef {
     /// 使用 vault 中该主机已存的凭据
@@ -35,7 +35,8 @@ pub enum AuthRef {
     Agent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+/// `Hash` 是给 `dbhx-session` 的连接身份键用的：同一条 transport 的判定要能进 `HashMap`。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 pub struct Endpoint {
     pub host: String,
     /// None 表示协议默认端口（SSH 为 22）
@@ -48,7 +49,7 @@ pub struct Endpoint {
 /// vault 里的 host 在连上之后可能被用户编辑，任何判等都必须用会话建立时的
 /// endpoint 覆盖 host 记录，否则会误判为不同目标而另开连接。port 缺失时取 22，
 /// 不回落 host.port。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 pub struct LiveEndpoint {
     pub host: String,
     pub port: u16,

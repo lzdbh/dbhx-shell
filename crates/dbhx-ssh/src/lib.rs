@@ -23,7 +23,9 @@ pub use config::DialOptions;
 pub use error::SshError;
 pub use handler::{CloseReason, SessionState, SshEvent};
 pub use hostkey::{pattern_of, ServerKey};
-pub use transport::{HostKeyVerifier, RejectAll, SshTransport, TrustAll};
+pub use transport::{
+    wait_until_closed, HostKeyVerifier, RejectAll, SshTransport, TrustAll,
+};
 
 /// 给会话层与 dbhx-sftp 用的裸流类型别名，避免它们到处写 russh 的路径。
 pub type SubsystemStream = russh::ChannelStream<russh::client::Msg>;
