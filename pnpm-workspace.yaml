@@ -6,6 +6,9 @@ packages:
 # 跳过它：不写的话 install 会把它当未审批的构建脚本、退出码非 0，CI 直接红。
 allowBuilds:
   core-js: false
+  # esbuild 的 postinstall 会把平台二进制从 @esbuild/win32-x64 复制进自己的 bin，
+  # 不给它跑脚本的话 vite/vitest 一起来就报找不到 esbuild 可执行文件。
+  esbuild: true
 
 # F: 是 exFAT 卷，不支持 symlink；pnpm 默认的 isolated linker 会在
 # node_modules/.pnpm 之间建软链而直接失败（EISDIR / ENOSYS）。
