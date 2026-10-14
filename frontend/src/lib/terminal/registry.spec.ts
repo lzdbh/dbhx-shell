@@ -21,12 +21,17 @@ class FakeTerminal {
   pasted: string[] = []
   selection = ''
   keyHandler: ((event: KeyboardEvent) => boolean) | null = null
+  /** 被 fit 了几次。字号变化后必须重算行列，验的就是这个数。 */
+  fitCount = 0
 
   constructor(options: Record<string, unknown>) {
     this.options = options
   }
 
-  loadAddon(): void {}
+  // 真 FitAddon 在 loadAddon 时会拿到终端引用，测试要靠它把 fit 记到具体终端头上
+  loadAddon(addon: { attach?: (term: { fitCount: number }) => void }): void {
+    addon.attach?.(this)
+  }
   open(element: HTMLElement): void { this.openedIn = element }
   onData(): { dispose: () => void } { return { dispose() {} } }
   onResize(): { dispose: () => void } { return { dispose() {} } }
@@ -40,9 +45,15 @@ class FakeTerminal {
 }
 
 vi.mock('@xterm/xterm', () => ({ Terminal: FakeTerminal }))
+/** FitAddon 只记一件事：装到哪个终端上、被 fit 了几次。 */
 vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
-    fit(): void {}
+    private term: { fitCount: number } | null = null
+
+    attach(term: { fitCount: number }): void { this.term = term }
+    fit(): void {
+      if (this.term) this.term.fitCount += 1
+    }
     dispose(): void {}
   },
 }))
@@ -114,7 +125,7 @@ const theme: TerminalTheme = {
   ansi: ['#0', '#1', '#2', '#3', '#4', '#5', '#6', '#7', '#8', '#9', '#10', '#11', '#12', '#13', '#14', '#15'],
 }
 
-const handlers = { onData: () => {}, onResize: () => {} }
+const handlers = { onData: () => {}, onResize: () => {}, onZoom: () => {} }
 
 /**
  * 假剪贴板。真实实现是后端的 `local_clipboard_*` 命令，测试里既没有那个进程也不该
@@ -350,6 +361,45 @@ describe('终端剪贴板', () => {
     await flush()
     expect(term.pasted).toEqual([])
     clip.state.denied = false
+  })
+})
+
+describe('终端缩放', () => {
+  /** happy-dom 没有 WheelEvent，而登记处只读 ctrlKey 与 deltaY 两个字段。 */
+  function wheel(deltaY: number, ctrlKey: boolean): Event {
+    return Object.assign(new Event('wheel', { bubbles: true, cancelable: true }), { deltaY, ctrlKey })
+  }
+
+  it('Ctrl+滚轮换算成缩放档位，向上为正', () => {
+    const steps: number[] = []
+    const element = registry.ensureTerminal(40, theme, 13, { onData: () => {}, onResize: () => {}, onZoom: s => { steps.push(s) } })
+    const up = wheel(-120, true)
+    element.dispatchEvent(up)
+    element.dispatchEvent(wheel(120, true))
+    expect(steps).toEqual([1, -1])
+    // 不拦下这条滚轮，WebView2 会把整个界面一起放大
+    expect(up.defaultPrevented).toBe(true)
+  })
+
+  it('不带 Ctrl 的滚轮原样交给终端翻历史', () => {
+    const steps: number[] = []
+    const element = registry.ensureTerminal(41, theme, 13, { onData: () => {}, onResize: () => {}, onZoom: s => { steps.push(s) } })
+    const plain = wheel(120, false)
+    element.dispatchEvent(plain)
+    expect(steps).toEqual([])
+    expect(plain.defaultPrevented).toBe(false)
+  })
+
+  it('改字号要顺手重新 fit，否则行列还是按旧字号算的', () => {
+    registry.ensureTerminal(42, theme, 13, handlers)
+    const term = fake(42)!
+    // ensure 时 fit 过一次，改字号必须再来一次
+    expect(term.fitCount).toBe(1)
+    term.fitCount = 0
+    registry.applyFontSizeAll(18)
+    expect(term.options.fontSize).toBe(18)
+    // 字号变了宿主尺寸没变，ResizeObserver 不会响；不主动 fit 就半屏被裁掉
+    expect(term.fitCount).toBe(1)
   })
 })
 

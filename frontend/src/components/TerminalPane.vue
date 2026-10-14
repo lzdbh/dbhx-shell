@@ -3,6 +3,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import type { SessionId } from '@/lib/ipc/bindings'
 import { attachTerminal, detachTerminal, ensureTerminal, focusTerminal } from '@/lib/terminal/registry'
+import TerminalStatus from '@/components/TerminalStatus.vue'
 import { useSessionsStore } from '@/stores/sessions'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
@@ -36,6 +37,7 @@ function claim(id: SessionId): void {
   ensureTerminal(id, themeStore.terminalTheme, settings.fontSize, {
     onData: data => { void sessions.send(id, data) },
     onResize: (rows, cols) => { void sessions.reportResize(id, { rows, cols }) },
+    onZoom: step => { settings.zoom(step) },
   })
   attachTerminal(id, host)
 }
@@ -64,27 +66,39 @@ onBeforeUnmount(release)
 </script>
 
 <template>
-  <div ref="slot" class="pane" />
+  <div class="pane">
+    <div ref="slot" class="screen" />
+    <TerminalStatus :session="props.session" />
+  </div>
 </template>
 
 <style scoped>
 .pane {
   /* 格子的尺寸完全由父层的 flex 决定，这里只保证终端撑满 */
   position: relative;
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
 
+/* 状态条占掉的那一行高度由 flex 算，屏幕元素只管剩下的部分 */
+.screen {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
 /* 宿主元素是登记处 createElement 造的，带不上 scoped 的 data-v 属性，只能 :deep 进去 */
-.pane :deep(.xterm-host) {
+.screen :deep(.xterm-host) {
   position: absolute;
   inset: 0;
   padding: 4px 0 0 6px;
 }
 
-.pane :deep(.xterm) {
+.screen :deep(.xterm) {
   height: 100%;
 }
 </style>

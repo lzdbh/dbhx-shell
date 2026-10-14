@@ -32,6 +32,8 @@ function fired(event: KeyEvent, options = ctx): string | null {
     focusNext: () => { calls.push('focusNext') },
     openSettings: () => { calls.push('openSettings') },
     find: () => { calls.push('find') },
+    zoom: step => { calls.push(`zoom:${step}`) },
+    resetZoom: () => { calls.push('resetZoom') },
   })
   return calls[0] ?? null
 }
@@ -56,11 +58,20 @@ describe('快捷键判定', () => {
     expect(fired(key({ key: 'f', metaKey: true, code: 'KeyF' }))).toBe('find')
   })
 
-  it('Ctrl+1..9 选标签，Ctrl+0 不抢', () => {
+  it('Ctrl+1..9 选标签，Ctrl+0 回默认字号', () => {
     expect(fired(key({ key: '1', ctrlKey: true, code: 'Digit1' }))).toBe('selectTab:0')
     expect(fired(key({ key: '9', ctrlKey: true, code: 'Digit9' }))).toBe('selectTab:8')
-    // 0 常常是「放大回默认字号」，我们没做，所以必须原样放行
-    expect(fired(key({ key: '0', ctrlKey: true, code: 'Digit0' }))).toBeNull()
+    // 0 没有第 10 个标签可指，给了「缩放回 100%」
+    expect(fired(key({ key: '0', ctrlKey: true, code: 'Digit0' }))).toBe('resetZoom')
+  })
+
+  it('Ctrl+= / Ctrl+- 缩放字号，加号与小键盘两条写法都认', () => {
+    expect(fired(key({ key: '=', ctrlKey: true, code: 'Equal' }))).toBe('zoom:1')
+    // 美式布局的 + 要按 Shift，键盘上报的是 '+' 而不是 '='
+    expect(fired(key({ key: '+', ctrlKey: true, shiftKey: true, code: 'Equal' }))).toBe('zoom:1')
+    expect(fired(key({ key: '+', ctrlKey: true, code: 'NumpadAdd' }))).toBe('zoom:1')
+    expect(fired(key({ key: '-', ctrlKey: true, code: 'Minus' }))).toBe('zoom:-1')
+    expect(fired(key({ key: '_', ctrlKey: true, shiftKey: true, code: 'Minus' }))).toBe('zoom:-1')
   })
 
   it('Ctrl+Tab 向后，Ctrl+Shift+Tab 向前', () => {
@@ -111,6 +122,8 @@ describe('installShortcuts 总开关', () => {
       focusNext: () => {},
       openSettings: () => {},
       find: () => {},
+      zoom: () => {},
+      resetZoom: () => {},
     }
   }
 

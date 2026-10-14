@@ -24,6 +24,9 @@ export interface ShortcutHandlers {
   focusNext: () => void
   openSettings: () => void
   find: () => void
+  /** 字号缩放。`zoom` 收 ±1 这样的档位，`resetZoom` 回默认值。 */
+  zoom: (step: number) => void
+  resetZoom: () => void
 }
 
 /** 事件对象里我们真正用得上的三个字段——单测直接造这个形状就够了。 */
@@ -88,6 +91,11 @@ export function match(
       // readline 里 Ctrl+F 是「光标前移一格」，但同类客户端一律把它给了查找——
       // 单字符移动没人用 Alt 替代，查找却是每次都靠鼠标点菜单的事。
       case 'f': return h => { h.find() }
+      // 缩放三件套。`=` 与 `+` 并列为放大：美式布局要打 Ctrl+Shift+= 才出 `+`，
+      // 而小键盘的 + 直接就是 '+'，两条路都得认。`-` 与 `0` 不用按 Shift，同理。
+      case '=': case '+': return h => { h.zoom(1) }
+      case '-': case '_': return h => { h.zoom(-1) }
+      case '0': return h => { h.resetZoom() }
       default: break
     }
     if (event.code === 'Tab') {

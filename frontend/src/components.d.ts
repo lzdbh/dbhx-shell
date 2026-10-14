@@ -56,6 +56,7 @@ declare module 'vue' {
     SettingsDrawer: typeof import('./components/SettingsDrawer.vue')['default']
     TabBar: typeof import('./components/TabBar.vue')['default']
     TerminalPane: typeof import('./components/TerminalPane.vue')['default']
+    TerminalStatus: typeof import('./components/TerminalStatus.vue')['default']
     TransferTray: typeof import('./components/TransferTray.vue')['default']
   }
 }

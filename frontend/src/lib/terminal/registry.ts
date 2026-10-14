@@ -28,6 +28,13 @@ export interface TerminalHandlers {
   onData: (data: string) => void
   /**  fit 之后的新尺寸，用于向上游报告  */
   onResize: (rows: number, cols: number) => void
+  /**
+   * `Ctrl+滚轮` 缩放，一格一档，正负号即方向。
+   *
+   * 由登记处翻译滚轮、由调用方决定字号：字号是全局偏好，归 settings store 管，
+   * 这里碰它就得反过来 import store，终端实例从此拖着一个 Vue 依赖。
+   */
+  onZoom: (step: number) => void
 }
 
 interface Entry {
@@ -161,6 +168,13 @@ export function ensureTerminal(
     if (term.hasSelection()) void copyText(term.getSelection())
     else void pasteInto(term)
   })
+  element.addEventListener('wheel', event => {
+    // Ctrl+滚轮 = 缩放。必须 preventDefault：不拦的话这条滚轮既会被 xterm 当成
+    // 翻历史滚走，又会被 WebView2 当成页面缩放（后者会把整个界面一起放大）。
+    if (!event.ctrlKey) return
+    event.preventDefault()
+    handlers.onZoom(event.deltaY < 0 ? 1 : -1)
+  }, { passive: false })
   const entry: Entry = { term, fit, search, element, resizeObserver: null, found: null }
   entries.set(id, entry)
   term.open(element)
@@ -306,9 +320,18 @@ export function applyTheme(id: SessionId, theme: TerminalTheme): void {
   if (entry) entry.term.options.theme = toXtermTheme(theme)
 }
 
-/** 字号影响所有终端：它是全局偏好，不是每会话属性。 */
+/**
+ * 字号影响所有终端：它是全局偏好，不是每会话属性。
+ *
+ * 改完必须立刻重新 fit：宿主元素是 `position:absolute; inset:0` 撑满格子的，
+ * 字号变了它的尺寸却一点没变，ResizeObserver 不会替我们响。不重新算行列，
+ * 终端会继续按旧字号的行数往新尺寸里画——放大时下半截被裁掉，缩小时空一圈白边。
+ */
 export function applyFontSizeAll(fontSize: number): void {
-  entries.forEach(entry => { entry.term.options.fontSize = fontSize })
+  entries.forEach((entry, id) => {
+    entry.term.options.fontSize = fontSize
+    fitTerminal(id)
+  })
 }
 
 export function fitTerminal(id: SessionId): void {

@@ -138,6 +138,9 @@ const shortcuts: ShortcutHandlers = {
   focusNext: cycleFocus,
   openSettings: () => { drawerOpen.value = true },
   find: () => { findOpen.value = true },
+  // 缩放写进 settings：字号是全局偏好，格子上的 Ctrl+滚轮和这里的 Ctrl+= 必须改同一个值
+  zoom: step => { settings.zoom(step) },
+  resetZoom: () => { settings.resetZoom() },
 }
 
 /**

@@ -6,7 +6,7 @@ import { formatTime } from '@/lib/format'
 import { useHostkeysStore } from '@/stores/hostkeys'
 import { useHostsStore } from '@/stores/hosts'
 import { useLockStore } from '@/stores/lock'
-import { useSettingsStore } from '@/stores/settings'
+import { DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE, useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
 
 const settings = useSettingsStore()
@@ -41,6 +41,8 @@ const SHORTCUTS = [
   { keys: 'Ctrl/Cmd + 1…9', what: '跳到第 N 个标签' },
   { keys: 'Ctrl/Cmd + ,', what: '打开设置' },
   { keys: 'Ctrl/Cmd + F', what: '在当前终端查找，Enter 下一条、Shift+Enter 上一条，Esc 关闭' },
+  { keys: 'Ctrl/Cmd + = / -', what: '放大 / 缩小终端字号（也可以 Ctrl + 滚轮）' },
+  { keys: 'Ctrl/Cmd + 0', what: '字号回到默认' },
   { keys: 'Alt + ←/→', what: '分屏时在两格之间移焦点' },
 ]
 
@@ -168,7 +170,16 @@ function splitPattern(pattern: string): { host: string, port: number } {
         </a-space>
       </a-form-item>
       <a-form-item label="终端字号">
-        <a-input-number v-model:value="settings.fontSize" :min="10" :max="28" />
+        <!-- 上下限与缩放共用一套常量：设置页能填到 9 而 Ctrl+滚轮 缩不到 9 会很怪 -->
+        <a-input-number v-model:value="settings.fontSize" :min="MIN_FONT_SIZE" :max="MAX_FONT_SIZE" />
+        <a-button
+          v-if="settings.fontSize !== DEFAULT_FONT_SIZE"
+          size="small"
+          type="link"
+          @click="settings.resetZoom()"
+        >
+          恢复默认
+        </a-button>
       </a-form-item>
 
       <a-divider orientation="left">
