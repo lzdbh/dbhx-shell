@@ -11,10 +11,8 @@ import AskModal from '@/components/AskModal.vue'
 import HostTree from '@/components/HostTree.vue'
 import LockOverlay from '@/components/LockOverlay.vue'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
-import SftpPanel from '@/components/SftpPanel.vue'
 import TabBar from '@/components/TabBar.vue'
 import TerminalPane from '@/components/TerminalPane.vue'
-import TransferTray from '@/components/TransferTray.vue'
 import { useHostsStore } from '@/stores/hosts'
 import { useLayoutStore } from '@/stores/layout'
 import { useLockStore } from '@/stores/lock'
@@ -260,12 +258,6 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
             />
           </div>
         </a-layout>
-        <a-layout-sider :width="settings.panelWidth" theme="light" class="sider">
-          <div class="panel-host">
-            <SftpPanel />
-          </div>
-          <TransferTray />
-        </a-layout-sider>
       </a-layout>
     </a-layout>
     <a-drawer v-model:open="drawerOpen" title="设置" :width="420" placement="right">
@@ -345,11 +337,5 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-.panel-host {
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
 }
 </style>

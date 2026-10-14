@@ -228,7 +228,10 @@ async fn a_telnet_session_is_labeled_telnet_not_ssh() {
     });
 
     let m = manager();
-    let record = m.open_telnet("127.0.0.1".into(), port, pty(), TerminalEncoding::Utf8, "tn".into()).await.expect("telnet 应能连上");
+    let record = m
+        .open_telnet("127.0.0.1".into(), port, pty(), TerminalEncoding::Utf8, "tn".into(), HostId("telnet-host".into()))
+        .await
+        .expect("telnet 应能连上");
 
     // 核心回归：带 live_endpoint 的会话不等于 SSH——telnet 必须如实标注
     assert_eq!(record.info().protocol, dbhx_model::Protocol::Telnet);

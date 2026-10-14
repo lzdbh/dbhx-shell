@@ -27,6 +27,7 @@ function info(id: number, patch: Partial<SessionInfo> = {}): SessionInfo {
     protocol: 'ssh',
     status: 'connected',
     label: `db-${id}`,
+    host_id: null,
     live_endpoint: { host: '10.0.0.1', port: 22, username: 'app' },
     pty: { rows: 30, cols: 110 },
     encoding: 'utf8',
@@ -102,6 +103,17 @@ describe('sessions store', () => {
     mock.list.mockResolvedValueOnce([info(2)])
     await sessions.refresh()
     expect(sessions.tabs.map(t => t.id)).toEqual([2])
+  })
+
+  it('carries the vault host through so the file window can be opened', async () => {
+    mock.openRemote.mockResolvedValueOnce(info(1, { host_id: 'h1' }))
+    const sessions = useSessionsStore()
+    await sessions.openRemote('h1')
+    expect(sessions.tab(1)?.hostId).toBe('h1')
+    // 重开窗口走的是 session_list：这一趟之后 hostId 还在，按钮才不会变成永久灰着
+    mock.list.mockResolvedValueOnce([info(1, { host_id: 'h1' })])
+    await sessions.refresh()
+    expect(sessions.tab(1)?.hostId).toBe('h1')
   })
 
   it('writes a failed keystroke onto the tab', async () => {

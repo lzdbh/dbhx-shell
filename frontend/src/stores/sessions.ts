@@ -19,6 +19,8 @@ export interface SessionTab {
   label: string
   protocol: Protocol
   status: SessionStatus
+  /** 来自 vault 的哪台主机；本机终端为 null。文件管理窗口按它开。 */
+  hostId: string | null
   endpoint: LiveEndpoint | null
   pty: PtySize
   cwd: string | null
@@ -39,7 +41,7 @@ export const useSessionsStore = defineStore('sessions', () => {
   function upsert(info: SessionInfo): SessionTab {
     const existing = tab(info.id)
     if (existing) {
-      Object.assign(existing, { label: info.label, status: info.status, endpoint: info.live_endpoint, pty: info.pty })
+      Object.assign(existing, { label: info.label, status: info.status, hostId: info.host_id, endpoint: info.live_endpoint, pty: info.pty })
       return existing
     }
     const created: SessionTab = {
@@ -47,6 +49,7 @@ export const useSessionsStore = defineStore('sessions', () => {
       label: info.label,
       protocol: info.protocol,
       status: info.status,
+      hostId: info.host_id,
       endpoint: info.live_endpoint,
       pty: info.pty,
       cwd: null,

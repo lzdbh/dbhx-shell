@@ -115,6 +115,11 @@ pub struct SessionInfo {
     pub status: SessionStatus,
     /// 主机友好名，供标签页标题
     pub label: String,
+    /// 这条会话来自 vault 里的哪台主机。本机终端为 `None`。
+    ///
+    /// 有了它，前端才不需要拿 `live_endpoint` 去主机列表里猜——同一台服务器存成两条
+    /// 记录（同 host、同端口、同用户）时猜必然错，而文件管理窗口是按 hostId 开的。
+    pub host_id: Option<crate::HostId>,
     pub live_endpoint: Option<LiveEndpoint>,
     pub pty: PtySize,
     pub encoding: TerminalEncoding,

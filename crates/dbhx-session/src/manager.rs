@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dbhx_model::{LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo, SessionStatus, TerminalEncoding};
+use dbhx_model::{HostId, LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo, SessionStatus, TerminalEncoding};
 use dbhx_pty::{LocalHandle, LocalSession, LocalSpec, PtyEvent};
 use dbhx_telnet::{TelnetEvent, TelnetHandle};
 use tokio::sync::mpsc;
@@ -44,6 +44,8 @@ pub struct SessionRecord {
     pub encoding: TerminalEncoding,
     /// shell 通过 OSC 7 报出的目录。本地终端没有这个概念，恒为 `None`。
     pub cwd: Option<String>,
+    /// 本机终端为 `None`。文件管理窗口按这个 id 开：窗口 label 里带的就是它。
+    pub host_id: Option<HostId>,
     /// 本地终端为 `None`。文件面板要靠它向池要**同一条** transport——
     /// 用 vault 记录重算一遍键会拿到「编辑过的旧 endpoint」，正好违反判等规则。
     pub transport: Option<TransportKey>,
@@ -61,6 +63,7 @@ impl SessionRecord {
             protocol: self.protocol,
             status: SessionStatus::Connected,
             label: self.label.clone(),
+            host_id: self.host_id.clone(),
             live_endpoint: self.live_endpoint.clone(),
             pty: self.pty.clone(),
             encoding: self.encoding,
@@ -141,6 +144,7 @@ impl SessionManager {
             pty: spec.pty.clone(),
             encoding,
             cwd: None,
+            host_id: None,
             transport: None,
         };
         self.inner.insert(record.clone(), Handle::Local(handle));
@@ -182,6 +186,7 @@ impl SessionManager {
             pty,
             encoding,
             cwd: None,
+            host_id: Some(key.host_id.clone()),
             transport: Some(key),
         };
         self.inner.insert(record.clone(), Handle::Remote(Arc::clone(&session)));
@@ -219,7 +224,7 @@ impl SessionManager {
     ///
     /// 与本地终端同形——拨号即连接，登录发生在流里，所以这一层连「凭据」都不需要，
     /// 天然满足「明文不跨 IPC」。收尾仍走同一条路径：转发任务看到通道结束才摘条目。
-    pub async fn open_telnet(&self, host: String, port: u16, pty: PtySize, encoding: TerminalEncoding, label: String) -> Result<SessionRecord, SessionError> {
+    pub async fn open_telnet(&self, host: String, port: u16, pty: PtySize, encoding: TerminalEncoding, label: String, host_id: HostId) -> Result<SessionRecord, SessionError> {
         let (handle, mut events) = dbhx_telnet::connect(&host, port, &pty).await?;
         let id = self.inner.alloc_id();
         let record = SessionRecord {
@@ -230,6 +235,7 @@ impl SessionManager {
             pty,
             encoding,
             cwd: None,
+            host_id: Some(host_id),
             transport: None,
         };
         self.inner.insert(record.clone(), Handle::Telnet(handle));

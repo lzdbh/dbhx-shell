@@ -48,6 +48,13 @@ fn main() {
                     "sftp_upload",
                     "transfer_cancel",
                     "transfer_running",
+                    "local_home",
+                    "local_drives",
+                    "local_list",
+                    "local_mkdir",
+                    "local_remove",
+                    "local_rename",
+                    "open_file_window",
                 ])
                 .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
         ),

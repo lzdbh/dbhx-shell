@@ -2,12 +2,11 @@
 import { computed } from 'vue'
 import { message } from 'ant-design-vue'
 
-import { useFilesStore } from '@/stores/files'
+import { fileWindowApi } from '@/lib/ipc/client'
 import { useLayoutStore } from '@/stores/layout'
 import { useSessionsStore } from '@/stores/sessions'
 
 const sessions = useSessionsStore()
-const files = useFilesStore()
 const layout = useLayoutStore()
 const [messageApi, holder] = message.useMessage()
 
@@ -28,14 +27,26 @@ async function openLocal(): Promise<void> {
 }
 
 async function openPanel(): Promise<void> {
-  const id = sessions.activeId
-  if (id === null) {
+  const tab = activeTab.value
+  if (tab === undefined) {
     messageApi.warning('先打开一个会话')
     return
   }
-  const panel = await files.openForSession(id)
-  if (panel) messageApi.success(`文件面板：${panel.path}`)
-  else messageApi.error(files.openError ?? '打开文件面板失败')
+  // 本机终端没有 hostId，telnet 也没有 SFTP 可开——两种情况都直接说明，
+  // 而不是让后端回一句英文的「找不到主机」。
+  if (tab.hostId === null) {
+    messageApi.warning('本机终端没有远端文件')
+    return
+  }
+  if (tab.protocol !== 'ssh') {
+    messageApi.warning('该协议没有文件管理')
+    return
+  }
+  try {
+    await fileWindowApi.open(tab.hostId)
+  } catch (err) {
+    messageApi.error(err instanceof Error ? err.message : '打开文件管理窗口失败')
+  }
 }
 </script>
 

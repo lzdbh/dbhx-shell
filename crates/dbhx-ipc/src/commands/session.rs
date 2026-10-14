@@ -38,7 +38,7 @@ pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Res
         Protocol::Telnet => {
             // 缺省端口取 telnet 的 23，不能沿用 SSH 的 22
             let port = record.endpoint.port.or(Protocol::Telnet.default_port()).unwrap_or(23);
-            core.sessions.open_telnet(record.endpoint.host.clone(), port, pty, encoding, label).await?
+            core.sessions.open_telnet(record.endpoint.host.clone(), port, pty, encoding, label, host_id.clone()).await?
         }
         Protocol::Ssh => {
             let key = key_of_record(&record);

@@ -42,3 +42,32 @@ export function pathSegments(path: string): { label: string, path: string }[] {
   }
   return out
 }
+
+/**
+ * 本机路径的分隔符。
+ *
+ * 后端按平台原样回传绝对路径，Windows 是 `\`、其余是 `/`。用「是不是盘符开头」判断
+ * 比「字符串里有没有反斜杠」稳，因为一个 Unix 目录名里合法地可以带反斜杠。
+ */
+export function localSep(path: string): string {
+  return /^[A-Za-z]:/.test(path) ? '\\' : '/'
+}
+
+/** 本机路径的上一级。到盘符根（`C:\`）或 `/` 就返回 `null`，让「上级」按钮置灰。 */
+export function localParent(path: string): string | null {
+  const sep = localSep(path)
+  const trimmed = path.replace(/[\\/]+$/, '')
+  if (trimmed === '' || trimmed === sep) return null
+  const cut = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'))
+  if (cut < 0) return null
+  let parent = trimmed.slice(0, cut)
+  if (parent === '') return sep === '/' ? '/' : null
+  if (/^[A-Za-z]:$/.test(parent)) parent += '\\'
+  return parent
+}
+
+/** 拼本机子路径。已带分隔符的根（`C:\`、`/`）不重复加分隔符。 */
+export function localJoin(path: string, name: string): string {
+  const sep = localSep(path)
+  return path.endsWith(sep) || path.endsWith('\\') || path.endsWith('/') ? `${path}${name}` : `${path}${sep}${name}`
+}

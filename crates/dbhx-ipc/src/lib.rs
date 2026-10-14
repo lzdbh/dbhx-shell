@@ -78,6 +78,13 @@ pub const COMMAND_NAMES: &[&str] = &[
     "sftp_upload",
     "transfer_cancel",
     "transfer_running",
+    "local_home",
+    "local_drives",
+    "local_list",
+    "local_mkdir",
+    "local_remove",
+    "local_rename",
+    "open_file_window",
 ];
 
 /// 命令清单的唯一构造点。运行时注册与 TS 导出都走它，保证不会分叉。
@@ -129,6 +136,13 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::transfer::sftp_upload,
             commands::transfer::transfer_cancel,
             commands::transfer::transfer_running,
+            commands::local::local_home,
+            commands::local::local_drives,
+            commands::local::local_list,
+            commands::local::local_mkdir,
+            commands::local::local_remove,
+            commands::local::local_rename,
+            commands::local::open_file_window,
         ])
         .events(collect_events![
             events::TermData,

@@ -218,22 +218,23 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   /**
-   * 下载远端条目到设置里指定的目录。
+   * 下载远端条目到指定目录。
    *
+   * `dir` 省略时落到设置里的下载目录（内嵌面板的老行为）；双栏文件窗口会显式传本机栏
+   * 的当前目录，让「下载」就是把右边选中的东西放到左边正看着的那个文件夹。
    * 没有用系统保存对话框：那需要 `tauri-plugin-dialog`（Cargo 依赖 + capabilities 授权 +
-   * npm 包三处同时加），而这一批的目标是把 SFTP 主链路接完。
-   * 目录为空时直接给出可执行的提示，不静默失败。
+   * npm 包三处同时加）。目录为空时直接给出可执行的提示，不静默失败。
    */
-  async function download(connection: number, targets: string[]): Promise<{ ok: boolean, error: string | null }> {
+  async function download(connection: number, targets: string[], dir?: string): Promise<{ ok: boolean, error: string | null }> {
     const p = panels.get(connection)
-    const dir = settings.downloadDir.trim()
-    if (!dir) {
+    const to = (dir ?? settings.downloadDir).trim()
+    if (!to) {
       const message = '请先在设置里指定下载目录'
       if (p) p.error = message
       return { ok: false, error: message }
     }
     try {
-      transfers.noteStart(await sftpApi.download(connection, targets, dir), connection)
+      transfers.noteStart(await sftpApi.download(connection, targets, to), connection)
       if (p) p.error = null
       return { ok: true, error: null }
     } catch (err) {

@@ -105,6 +105,26 @@ export const transferApi = {
   running: () => unwrap(commands.transferRunning()),
 }
 
+/**
+ * 本机文件系统浏览。文件管理窗口左半边的数据源。
+ *
+ * 与 SFTP 那组同形（都返回 `DirListing`），所以前端能用同一套列渲染与导航逻辑。
+ * 路径是本机绝对路径，分隔符由后端按平台给（Windows 是 `\`）。
+ */
+export const localApi = {
+  home: () => unwrap(commands.localHome()),
+  drives: () => commands.localDrives(),
+  list: (path: string | null) => unwrap(commands.localList(path)),
+  mkdir: (path: string) => unwrap(commands.localMkdir(path)),
+  remove: (path: string, isDir: boolean) => unwrap(commands.localRemove(path, isDir)),
+  rename: (from: string, to: string) => unwrap(commands.localRename(from, to)),
+}
+
+/** 让 Rust 侧弹出（或聚焦）某台主机的文件管理窗口。 */
+export const fileWindowApi = {
+  open: (hostId: HostId) => unwrap(commands.openFileWindow(hostId)),
+}
+
 /** 回答后端主动发起的询问：主机密钥确认、私钥口令。 */
 export const requestApi = {
   replyConfirmed: (request: number) => reply(request, { kind: 'confirmed' }),

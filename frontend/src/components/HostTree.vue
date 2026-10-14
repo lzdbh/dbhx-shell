@@ -3,14 +3,13 @@ import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 
 import type { HostInfo } from '@/lib/ipc/bindings'
-import { useFilesStore } from '@/stores/files'
+import { fileWindowApi } from '@/lib/ipc/client'
 import { useHostsStore } from '@/stores/hosts'
 import { useSessionsStore } from '@/stores/sessions'
 import HostFormModal from './HostFormModal.vue'
 
 const hosts = useHostsStore()
 const sessions = useSessionsStore()
-const files = useFilesStore()
 const [messageApi, holder] = message.useMessage()
 
 const keyword = ref('')
@@ -55,9 +54,14 @@ async function connect(host: HostInfo): Promise<void> {
 }
 
 async function openPanel(host: HostInfo): Promise<void> {
-  const panel = await files.openForHost(host.id)
-  if (panel) messageApi.success(`文件面板：${panel.path}`)
-  else messageApi.error(files.openError ?? '打开文件面板失败')
+  // 文件管理是独立窗口：这里只让 Rust 把窗口弹/聚起来，远端栏由那个窗口自己按
+  // label 里的 hostId 去开。主窗口不再嵌面板。
+  try {
+    await fileWindowApi.open(host.id)
+  }
+  catch (err) {
+    messageApi.error(err instanceof Error ? err.message : '打开文件管理窗口失败')
+  }
 }
 
 async function remove(host: HostInfo): Promise<void> {
