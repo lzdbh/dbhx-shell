@@ -34,6 +34,7 @@ function fired(event: KeyEvent, options = ctx): string | null {
     find: () => { calls.push('find') },
     zoom: step => { calls.push(`zoom:${step}`) },
     resetZoom: () => { calls.push('resetZoom') },
+    toggleQuickBar: () => { calls.push('toggleQuickBar') },
   })
   return calls[0] ?? null
 }
@@ -74,8 +75,13 @@ describe('快捷键判定', () => {
     expect(fired(key({ key: '_', ctrlKey: true, shiftKey: true, code: 'Minus' }))).toBe('zoom:-1')
   })
 
-  it('Ctrl+Tab 向后，Ctrl+Shift+Tab 向前', () => {
-    expect(fired(key({ key: 'Tab', code: 'Tab', ctrlKey: true }))).toBe('nextTab')
+  it('快捷命令栏要带 Shift：不带 Shift 的 Ctrl+K 还给终端', () => {
+    expect(fired(key({ key: 'K', code: 'KeyK', ctrlKey: true, shiftKey: true }))).toBe('toggleQuickBar')
+    // readline 的 kill-line（删到行尾）是天天用的键，抢了它用户只会觉得终端坏了
+    expect(fired(key({ key: 'k', code: 'KeyK', ctrlKey: true }))).toBeNull()
+  })
+
+  it('Ctrl+Tab 向后，Ctrl+Shift+Tab 向前', () => {    expect(fired(key({ key: 'Tab', code: 'Tab', ctrlKey: true }))).toBe('nextTab')
     expect(fired(key({ key: 'Tab', code: 'Tab', ctrlKey: true, shiftKey: true }))).toBe('prevTab')
   })
 
@@ -114,17 +120,32 @@ describe('installShortcuts 总开关', () => {
   function handlers(sink: string[]): ShortcutHandlers {
     return {
       newLocal: () => { sink.push('newLocal') },
-      closeActive: () => {},
+      closeActive: () => { sink.push('closeActive') },
       nextTab: () => {},
       prevTab: () => {},
       selectTab: () => {},
       toggleSplit: () => {},
       focusNext: () => {},
       openSettings: () => {},
-      find: () => {},
+      find: () => { sink.push('find') },
       zoom: () => {},
       resetZoom: () => {},
+      toggleQuickBar: () => { sink.push('toggleQuickBar') },
     }
+  }
+
+  /** 终端的收键壳子：真 xterm 就是这样一个藏在 `.xterm` 里的 textarea。 */
+  function terminalKeypress(): HTMLElement {
+    const host = document.createElement('div')
+    host.className = 'xterm'
+    const area = document.createElement('textarea')
+    host.append(area)
+    document.body.append(host)
+    return area
+  }
+
+  function combo(over: Partial<KeyboardEvent>): KeyboardEvent {
+    return new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...over })
   }
 
   it('enabled 时照常派发', () => {
@@ -143,5 +164,26 @@ describe('installShortcuts 总开关', () => {
     el.dispatchEvent(ctrlT())
     dispose()
     expect(sink).toEqual([])
+  })
+
+  it('终端聚焦时照抢：那个 textarea 只是 xterm 收键的壳子，不是打字的地方', () => {
+    const sink: string[] = []
+    const area = terminalKeypress()
+    const dispose = installShortcuts(area, () => handlers(sink), () => false, () => true)
+    area.dispatchEvent(combo({ key: 'f', code: 'KeyF', ctrlKey: true }))
+    area.dispatchEvent(combo({ key: 'K', code: 'KeyK', ctrlKey: true, shiftKey: true }))
+    dispose()
+    expect(sink).toEqual(['find', 'toggleQuickBar'])
+  })
+
+  it('表单输入框里不抢键，但命令栏开关与关标签这类不产字的组合例外', () => {
+    const sink: string[] = []
+    const input = document.createElement('input')
+    document.body.append(input)
+    const dispose = installShortcuts(input, () => handlers(sink), () => false, () => true)
+    input.dispatchEvent(combo({ key: 'f', code: 'KeyF', ctrlKey: true }))
+    input.dispatchEvent(combo({ key: 'K', code: 'KeyK', ctrlKey: true, shiftKey: true }))
+    dispose()
+    expect(sink).toEqual(['toggleQuickBar'])
   })
 })

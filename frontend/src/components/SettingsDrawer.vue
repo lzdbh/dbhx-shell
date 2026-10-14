@@ -43,6 +43,7 @@ const SHORTCUTS = [
   { keys: 'Ctrl/Cmd + F', what: '在当前终端查找，Enter 下一条、Shift+Enter 上一条，Esc 关闭' },
   { keys: 'Ctrl/Cmd + = / -', what: '放大 / 缩小终端字号（也可以 Ctrl + 滚轮）' },
   { keys: 'Ctrl/Cmd + 0', what: '字号回到默认' },
+  { keys: 'Ctrl/Cmd + Shift + K', what: '开/收快捷命令栏（不带 Shift 的 Ctrl+K 仍归终端）' },
   { keys: 'Alt + ←/→', what: '分屏时在两格之间移焦点' },
 ]
 

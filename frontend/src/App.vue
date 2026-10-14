@@ -17,6 +17,7 @@ import TerminalPane from '@/components/TerminalPane.vue'
 import { useHostsStore } from '@/stores/hosts'
 import { useLayoutStore } from '@/stores/layout'
 import { useLockStore } from '@/stores/lock'
+import { useQuickStore } from '@/stores/quick'
 import { useSessionsStore } from '@/stores/sessions'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
@@ -25,6 +26,7 @@ import { useTransfersStore } from '@/stores/transfers'
 const hosts = useHostsStore()
 const layout = useLayoutStore()
 const lock = useLockStore()
+const quick = useQuickStore()
 const sessions = useSessionsStore()
 const settings = useSettingsStore()
 const themeStore = useThemeStore()
@@ -141,6 +143,7 @@ const shortcuts: ShortcutHandlers = {
   // 缩放写进 settings：字号是全局偏好，格子上的 Ctrl+滚轮和这里的 Ctrl+= 必须改同一个值
   zoom: step => { settings.zoom(step) },
   resetZoom: () => { settings.resetZoom() },
+  toggleQuickBar: () => { quick.toggle() },
 }
 
 /**

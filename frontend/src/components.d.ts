@@ -53,6 +53,7 @@ declare module 'vue' {
     HostFormModal: typeof import('./components/HostFormModal.vue')['default']
     HostTree: typeof import('./components/HostTree.vue')['default']
     LockOverlay: typeof import('./components/LockOverlay.vue')['default']
+    QuickCommandBar: typeof import('./components/QuickCommandBar.vue')['default']
     SettingsDrawer: typeof import('./components/SettingsDrawer.vue')['default']
     TabBar: typeof import('./components/TabBar.vue')['default']
     TerminalPane: typeof import('./components/TerminalPane.vue')['default']

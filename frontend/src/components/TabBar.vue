@@ -4,10 +4,12 @@ import { message } from 'ant-design-vue'
 
 import { fileWindowApi } from '@/lib/ipc/client'
 import { useLayoutStore } from '@/stores/layout'
+import { useQuickStore } from '@/stores/quick'
 import { useSessionsStore } from '@/stores/sessions'
 
 const sessions = useSessionsStore()
 const layout = useLayoutStore()
+const quick = useQuickStore()
 const [messageApi, holder] = message.useMessage()
 
 /** 当前 tab。模板里不能把 `number | null` 收窄，所以在脚本里算好。 */
@@ -77,6 +79,18 @@ async function openPanel(): Promise<void> {
       <button class="add" title="新建本机终端" @click="void openLocal()">＋</button>
     </div>
     <div class="actions">
+      <!-- 开关是全局的，栏子却是每格一条、各发各的会话。一个会话都没有时开了也只
+           剩一条空栏，所以直接禁用，别让用户按了没反应去猜是不是坏了 -->
+      <a-tooltip :title="quick.visible ? '收起快捷命令栏（Ctrl+Shift+K）' : '打开快捷命令栏（Ctrl+Shift+K）'">
+        <a-button
+          size="small"
+          :type="quick.visible ? 'primary' : 'default'"
+          :disabled="sessions.tabs.length === 0"
+          @click="quick.toggle()"
+        >
+          命令栏
+        </a-button>
+      </a-tooltip>
       <a-button size="small" :disabled="sessions.activeId === null" @click="void openPanel()">
         文件面板
       </a-button>

@@ -3,7 +3,9 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import type { SessionId } from '@/lib/ipc/bindings'
 import { attachTerminal, detachTerminal, ensureTerminal, focusTerminal } from '@/lib/terminal/registry'
+import QuickCommandBar from '@/components/QuickCommandBar.vue'
 import TerminalStatus from '@/components/TerminalStatus.vue'
+import { useQuickStore } from '@/stores/quick'
 import { useSessionsStore } from '@/stores/sessions'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
@@ -23,6 +25,7 @@ const props = defineProps<{ session: SessionId | null }>()
 const sessions = useSessionsStore()
 const settings = useSettingsStore()
 const themeStore = useThemeStore()
+const quick = useQuickStore()
 
 const slot = ref<HTMLElement | null>(null)
 
@@ -69,6 +72,8 @@ onBeforeUnmount(release)
   <div class="pane">
     <div ref="slot" class="screen" />
     <TerminalStatus :session="props.session" />
+    <!-- 命令栏在状态栏下面：它一出一退会把屏幕高度改一截，格子靠 ResizeObserver 重新 fit -->
+    <QuickCommandBar v-if="quick.visible" :session="props.session" />
   </div>
 </template>
 

@@ -27,6 +27,8 @@ export interface ShortcutHandlers {
   /** 字号缩放。`zoom` 收 ±1 这样的档位，`resetZoom` 回默认值。 */
   zoom: (step: number) => void
   resetZoom: () => void
+  /** 快捷命令栏的显示/隐藏。 */
+  toggleQuickBar: () => void
 }
 
 /** 事件对象里我们真正用得上的三个字段——单测直接造这个形状就够了。 */
@@ -101,6 +103,11 @@ export function match(
     if (event.code === 'Tab') {
       return event.shiftKey ? (h => { h.prevTab() }) : (h => { h.nextTab() })
     }
+    // Ctrl+Shift+K 开快捷命令栏。不带 Shift 的 Ctrl+K 是 readline 的「删到行尾」，
+    // 那一条终端里天天有人用，不能碰。
+    if (event.shiftKey && event.key.toLowerCase() === 'k') {
+      return h => { h.toggleQuickBar() }
+    }
     const digit = /^Digit([1-9])$/.exec(event.code ?? '')
     if (digit) {
       const index = Number(digit[1]) - 1
@@ -120,6 +127,18 @@ export function match(
 }
 
 /** 装好监听，返回卸载函数（App 在 onBeforeUnmount 调用）。 */
+/**
+ * 正在打字时也照抢的组合。
+ *
+ * 判据只有一条：这个键在输入框里不会打出任何字符，所以抢了不丢用户的东西，
+ * 放过了反而丢动作——`Ctrl+W` 关标签、`Ctrl+Shift+K` 开关命令栏都是这类。
+ */
+function grabbedWhileTyping(event: KeyEvent): boolean {
+  if (!event.ctrlKey && !event.metaKey) return false
+  const key = event.key.toLowerCase()
+  return key === 'w' || (key === 'k' && event.shiftKey)
+}
+
 export function installShortcuts(
   target: EventTarget,
   getHandlers: () => ShortcutHandlers,
@@ -133,8 +152,9 @@ export function installShortcuts(
   const onKeydown = (raw: Event) => {
     if (!getEnabled()) return
     const event = raw as unknown as KeyEvent
-    // 正在打字时一个键都不抢——除了 Cmd/Ctrl+W，它是关标签而不是输入字符
-    if (isTextEntry(event) && !(event.key.toLowerCase() === 'w' && (event.ctrlKey || event.metaKey))) return
+    // 终端不算「正在打字」：xterm 靠一个藏在 `.xterm` 里的 textarea 收键，把它当
+    // 输入框，这些组合键就恰好在它们唯一会被按的地方集体失灵。
+    if (!inTerminal(event) && isTextEntry(event) && !grabbedWhileTyping(event)) return
     const action = match(event, { splitActive: getSplitActive(), inTerminal: inTerminal(event) })
     if (action === null) return
     raw.preventDefault()
