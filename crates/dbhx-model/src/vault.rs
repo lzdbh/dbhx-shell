@@ -96,6 +96,10 @@ pub struct HostInfo {
     pub endpoint: crate::session::Endpoint,
     pub auth_mode: AuthMode,
     pub auth: crate::session::AuthRef,
+    /// vault 里是否已存凭据（口令）。纯布尔存在性标记，不带引用、不含任何凭据名，
+    /// 供编辑表单决定「查看口令」按钮显不显示。命名刻意避开 password/secret 等词，
+    /// 这样 `host_projection_never_carries_secret_material` 的按名守卫可以继续一刀切。
+    pub has_credential: bool,
     pub keepalive_secs: u16,
     pub encoding: crate::session::TerminalEncoding,
 }
@@ -126,6 +130,7 @@ impl HostInfo {
             endpoint: record.endpoint.clone(),
             auth_mode: record.auth_mode,
             auth,
+            has_credential: record.password_secret_id.is_some(),
             keepalive_secs: record.keepalive_secs,
             encoding: record.encoding,
         }

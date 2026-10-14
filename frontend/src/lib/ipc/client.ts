@@ -49,6 +49,11 @@ export const vaultApi = {
   upsertHost: (draft: HostDraft) => unwrap(commands.vaultUpsertHost(draft)),
   removeHost: (hostId: HostId) => unwrap(commands.vaultRemoveHost(hostId)),
   setPassword: (hostId: HostId, password: string) => unwrap(commands.vaultSetPassword(hostId, password)),
+  /**
+   * 按需查看已存口令。这是**唯一**一条把明文送回渲染层的调用（用户显式点击才触发），
+   * 其余一切自动投影都不含口令——见后端 vault.rs 模块头规则 2 与脱敏审计测试。
+   */
+  revealPassword: (hostId: HostId) => unwrap(commands.vaultRevealPassword(hostId)),
   identities: () => unwrap(commands.vaultIdentities()),
   addIdentity: (label: string, privateKey: string, passphrase: string | null) =>
     unwrap(commands.vaultAddIdentity(label, privateKey, passphrase)),

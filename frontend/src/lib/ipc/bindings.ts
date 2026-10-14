@@ -33,6 +33,11 @@ export const commands = {
 	vaultUpsertHost: (draft: HostDraft) => typedError<HostId, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_upsert_host", { draft })),
 	vaultRemoveHost: (hostId: HostId) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_remove_host", { hostId })),
 	vaultSetPassword: (hostId: HostId, password: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_set_password", { hostId, password })),
+	/**
+	 *  编辑主机时按需查看已存口令。**这是唯一一条把明文送回渲染层的命令**，
+	 *  是用户显式批准的安全弱化，务必只经此单条、单主机、解锁态下的按需路径。
+	 */
+	vaultRevealPassword: (hostId: HostId) => typedError<string, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_reveal_password", { hostId })),
 	vaultIdentities: () => typedError<IdentityInfo[], IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_identities")),
 	vaultAddIdentity: (label: string, privateKey: string, passphrase: string | null) => typedError<IdentityId, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_add_identity", { label, privateKey, passphrase })),
 	vaultRemoveIdentity: (identityId: IdentityId) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_remove_identity", { identityId })),
@@ -244,6 +249,12 @@ export type HostInfo = {
 	endpoint: Endpoint,
 	auth_mode: AuthMode,
 	auth: AuthRef,
+	/**
+	 *  vault 里是否已存凭据（口令）。纯布尔存在性标记，不带引用、不含任何凭据名，
+	 *  供编辑表单决定「查看口令」按钮显不显示。命名刻意避开 password/secret 等词，
+	 *  这样 `host_projection_never_carries_secret_material` 的按名守卫可以继续一刀切。
+	 */
+	has_credential: boolean,
 	keepalive_secs: number,
 	encoding: TerminalEncoding,
 };

@@ -22,6 +22,7 @@ fn main() {
                     "vault_upsert_host",
                     "vault_remove_host",
                     "vault_set_password",
+                    "vault_reveal_password",
                     "vault_identities",
                     "vault_add_identity",
                     "vault_remove_identity",

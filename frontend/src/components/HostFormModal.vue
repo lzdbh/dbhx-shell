@@ -3,6 +3,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 
 import type { AuthMode, HostDraft, HostId, HostInfo, Protocol, TerminalEncoding } from '@/lib/ipc/bindings'
+import { vaultApi } from '@/lib/ipc/client'
 import { useHostsStore } from '@/stores/hosts'
 
 const props = defineProps<{ open: boolean, host: HostInfo | null }>()
@@ -39,6 +40,7 @@ const form = reactive({
 const PROTOCOL_DEFAULT_PORT: Record<Protocol, number | null> = { ssh: 22, telnet: 23, local: null }
 
 const submitting = ref(false)
+const revealing = ref(false)
 const needsIdentity = computed(() => form.authMode === 'public_key')
 const needsPassword = computed(() => form.authMode === 'password' || form.authMode === 'keyboard_interactive')
 /** 需要远端地址的协议：SSH 与 telnet 都要 host/port，本机终端不要。 */
@@ -117,6 +119,21 @@ async function submit(): Promise<void> {
   emit('saved', id)
   emit('update:open', false)
 }
+
+/** 编辑时按需取回已存明文口令填进输入框——用户显式点击，这是唯一一条明文回读入口。 */
+async function revealStored(): Promise<void> {
+  if (!props.host) return
+  revealing.value = true
+  try {
+    form.password = await vaultApi.revealPassword(props.host.id)
+  }
+  catch (e) {
+    messageApi.error(e instanceof Error ? e.message : '读取口令失败')
+  }
+  finally {
+    revealing.value = false
+  }
+}
 </script>
 
 <template>
@@ -167,8 +184,11 @@ async function submit(): Promise<void> {
             </a-select>
           </a-form-item>
           <a-form-item v-if="needsPassword" :label="host ? '口令（留空则不修改）' : '口令'">
-            <!-- 口令永不出现在读取方向上，所以这里没有回填，只有覆盖 -->
             <a-input-password v-model:value="form.password" autocomplete="new-password" />
+            <!-- 编辑且已存口令时，按需把明文取回填入：口令默认只进不出，这是唯一显式回读入口 -->
+            <a-button v-if="host?.has_credential" size="small" type="link" :loading="revealing" @click="void revealStored()">
+              查看已存口令
+            </a-button>
           </a-form-item>
           <a-form-item label="保活间隔（秒）">
             <a-input-number v-model:value="form.keepaliveSecs" :min="0" :max="600" style="width: 120px" />

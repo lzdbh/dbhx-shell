@@ -5,9 +5,11 @@
 //! 1. **`SecretId` 不出 IPC**。vault 的内部记录（`HostRecord`/`IdentityRecord`）带着
 //!    密文条目的引用，渲染层拿到它就能指名换出别的记录的口令，所以命令层用两套
 //!    「草案 / 投影」类型（[`HostDraft`]、[`IdentityInfo`]），`SecretId` 只在 Rust 内部存在。
-//! 2. **口令只进不出**。`vault_set_password` 的入参是用户刚敲的明文（这是唯一允许明文
-//!    跨界的方——它来自渲染层的输入框），立刻封进 `Zeroizing` 交给 vault；
-//!    任何命令的返回值里都不会再有口令字段。
+//! 2. **口令默认只进不出**。`vault_set_password` 的入参是用户刚敲的明文（这是入向唯一允许
+//!    明文跨界的方——它来自渲染层的输入框），立刻封进 `Zeroizing` 交给 vault；主机列表、身份、
+//!    会话、事件、日志等一切「自动朝外」的投影里都不会有口令字段，连 `SecretId` 引用都不给。
+//!    唯一的例外是 [`vault_reveal_password`]：用户点击「查看口令」时按需把解密明文回传一次，
+//!    这是一条被显式许可的明文的唯一出口，且受应用锁约束。除此之外不得再开任何明文回读通道。
 //!
 //! vault 与 known_hosts 都是「改完即落盘」：进程崩了不该丢用户刚存的主机。
 
@@ -143,6 +145,19 @@ pub fn set_password_impl(core: &Core, id: HostId, password: Zeroizing<String>) -
     Ok(())
 }
 
+/// 按需把已存口令解密回明文交给渲染层。这是**唯一**一条明文朝外的命令，
+/// 是应用主有意的安全弱化（编辑主机时想看到已存口令），因此：
+/// * 必须先解锁——锁定态下 `require_unlocked` 直接挡住，和写口令对称；
+/// * 只按 `host_id` 取该主机自己的口令，不做任何列表/批量投影；
+/// * 主机列表等一切自动投影仍绝不含明文（见模块头规则 2 与本文件的脱敏审计测试）。
+pub fn reveal_password_impl(core: &Core, id: HostId) -> Result<String, IpcError> {
+    core.require_unlocked()?;
+    let vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+    let secret = vault
+        .password_of(&id)?
+        .ok_or_else(|| IpcError::new(ErrorCode::NotFound, "该主机没有已保存的口令", false))?;
+    Ok(vault.with_secret(&secret, |bytes| Ok(String::from_utf8_lossy(bytes).into_owned()))?)
+}
 pub fn identities_impl(core: &Core) -> Result<Vec<IdentityInfo>, IpcError> {
     let vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
     Ok(vault.identities().iter().map(|i| identity_info(&vault, i)).collect())
@@ -336,6 +351,14 @@ pub fn vault_remove_host(core: State<'_>, host_id: HostId) -> Result<(), IpcErro
 #[specta::specta]
 pub fn vault_set_password(core: State<'_>, host_id: HostId, password: String) -> Result<(), IpcError> {
     set_password_impl(&core, host_id, Zeroizing::new(password))
+}
+
+/// 编辑主机时按需查看已存口令。**这是唯一一条把明文送回渲染层的命令**，
+/// 是用户显式批准的安全弱化，务必只经此单条、单主机、解锁态下的按需路径。
+#[tauri::command]
+#[specta::specta]
+pub fn vault_reveal_password(core: State<'_>, host_id: HostId) -> Result<String, IpcError> {
+    reveal_password_impl(&core, host_id)
 }
 
 #[tauri::command]
@@ -560,6 +583,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reveal_returns_the_stored_plaintext_for_that_host() {
+        // 这是唯一一条明文朝外的命令：解锁态、指名到具体主机时，应把已存口令原样解出
+        let (core, _rx) = tests_harness("vault-reveal", crate::state::fake_dialer());
+        let id = upsert_host_impl(&core, draft("db-reveal")).unwrap();
+        set_password_impl(&core, id.clone(), Zeroizing::new("s3cr3t".into())).unwrap();
+        assert_eq!(reveal_password_impl(&core, id.clone()).unwrap(), "s3cr3t");
+    }
+
+    #[tokio::test]
+    async fn revealing_a_host_with_no_stored_password_reports_not_found() {
+        let (core, _rx) = tests_harness("vault-reveal-empty", crate::state::fake_dialer());
+        let id = upsert_host_impl(&core, draft("db-nopass")).unwrap();
+        let err = reveal_password_impl(&core, id).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn reveal_is_blocked_while_locked() {
+        // 明文出口必须和写口令一样吃应用锁：锁着绝不能把口令漏出去
+        let (core, _rx) = tests_harness("vault-reveal-locked", crate::state::fake_dialer());
+        set_lock_pin_impl(&core, Zeroizing::new("2468".into())).unwrap();
+        let id = upsert_host_impl(&core, draft("db-rev-lock")).unwrap();
+        set_password_impl(&core, id.clone(), Zeroizing::new("pw".into())).unwrap();
+        lock_impl(&core).unwrap();
+        let err = reveal_password_impl(&core, id).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Locked, "锁定期间不得回读明文口令");
+    }
+
+    #[tokio::test]
     async fn a_key_that_is_not_a_private_key_is_rejected() {
         let (core, _rx) = tests_harness("vault-key", crate::state::fake_dialer());
         let err = add_identity_impl(&core, "跳板".into(), Zeroizing::new("ssh-ed25519 AAAA...".into()), None).unwrap_err();
@@ -712,11 +764,14 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Locked);
     }
 
-    /// 脱敏总审计：把每一条「朝外」的 IPC 形状都序列化一遍，确认既不含明文秘密，
+    /// 脱敏总审计：把每一条「自动朝外」的 IPC 形状都序列化一遍，确认既不含明文秘密，
     /// 也不泄露任何密文引用字段名；再直接读磁盘上的 vault.json，确认落盘的是密文。
     ///
-    /// 这条测试是安全约束「明文口令/私钥永不跨 IPC 朝渲染层」与「密文 id 不外泄」的
+    /// 这条测试是安全约束「明文口令/私钥永不*自动*跨 IPC 朝渲染层」与「密文 id 不外泄」的
     /// 回归防线——新增字段很容易不知不觉把一个 `secret_id` 或口令带出去。
+    /// 唯一被许可的明文出口是 `reveal_password_impl`（用户点击「查看口令」时按主机取用），
+    /// 它不在这里的扫描范围内：它本就该返回明文，其正确性由 `reveal_returns_the_stored_plaintext_*` 钉住。
+    /// `HostInfo.has_credential` 是布尔存在性标记，不是明文也不是引用，允许出现。
     #[tokio::test]
     async fn nothing_crossing_ipc_or_disk_carries_a_secret() {
         let (core, _rx) = tests_harness("redact-audit", crate::state::fake_dialer());
