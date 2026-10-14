@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use dbhx_model::{LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo, SessionStatus, TerminalEncoding};
 use dbhx_pty::{LocalHandle, LocalSession, LocalSpec, PtyEvent};
+use dbhx_telnet::{TelnetEvent, TelnetHandle};
 use tokio::sync::mpsc;
 
 use crate::error::SessionError;
@@ -34,6 +35,9 @@ const HUB_QUEUE: usize = 1024;
 pub struct SessionRecord {
     pub id: SessionId,
     pub label: String,
+    /// 会话种类。有 `live_endpoint` 的不一定是 SSH——telnet 也带主机+端口，
+    /// 靠 `live_endpoint.is_some()` 判协议会把 telnet 误报成 SSH，所以这里显式存一份。
+    pub protocol: Protocol,
     /// `None` = 本地终端
     pub live_endpoint: Option<LiveEndpoint>,
     pub pty: PtySize,
@@ -54,7 +58,7 @@ impl SessionRecord {
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             id: self.id,
-            protocol: if self.live_endpoint.is_some() { Protocol::Ssh } else { Protocol::Local },
+            protocol: self.protocol,
             status: SessionStatus::Connected,
             label: self.label.clone(),
             live_endpoint: self.live_endpoint.clone(),
@@ -97,6 +101,7 @@ struct Inner {
 enum Handle {
     Remote(Arc<ShellSession>),
     Local(LocalHandle),
+    Telnet(TelnetHandle),
 }
 
 struct Entry {
@@ -131,6 +136,7 @@ impl SessionManager {
         let record = SessionRecord {
             id,
             label,
+            protocol: Protocol::Local,
             live_endpoint: None,
             pty: spec.pty.clone(),
             encoding,
@@ -171,6 +177,7 @@ impl SessionManager {
         let record = SessionRecord {
             id,
             label,
+            protocol: Protocol::Ssh,
             live_endpoint: Some(session.endpoint().clone()),
             pty,
             encoding,
@@ -208,6 +215,46 @@ impl SessionManager {
         Ok(record)
     }
 
+    /// telnet 会话：一条裸 TCP，不进 transport 池、没有 lease、没有主机密钥。
+    ///
+    /// 与本地终端同形——拨号即连接，登录发生在流里，所以这一层连「凭据」都不需要，
+    /// 天然满足「明文不跨 IPC」。收尾仍走同一条路径：转发任务看到通道结束才摘条目。
+    pub async fn open_telnet(&self, host: String, port: u16, pty: PtySize, encoding: TerminalEncoding, label: String) -> Result<SessionRecord, SessionError> {
+        let (handle, mut events) = dbhx_telnet::connect(&host, port, &pty).await?;
+        let id = self.inner.alloc_id();
+        let record = SessionRecord {
+            id,
+            label,
+            protocol: Protocol::Telnet,
+            live_endpoint: Some(LiveEndpoint { host, port, username: String::new() }),
+            pty,
+            encoding,
+            cwd: None,
+            transport: None,
+        };
+        self.inner.insert(record.clone(), Handle::Telnet(handle));
+
+        let weak = Arc::downgrade(&self.inner);
+        let tx = self.inner.hub_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let mapped = match event {
+                    TelnetEvent::Data(bytes) => SessionEvent::Data { id, bytes },
+                    // telnet 没有退出码概念：流结束就是一次干净的 Ended
+                    TelnetEvent::Closed => {
+                        let _ = tx.send(SessionEvent::Ended { id, info: ExitInfo::default() }).await;
+                        break;
+                    }
+                };
+                if tx.send(mapped).await.is_err() {
+                    break;
+                }
+            }
+            reap(&weak, id);
+        });
+        Ok(record)
+    }
+
     /// 键盘输入。
     pub async fn write(&self, id: SessionId, bytes: &[u8]) -> Result<(), SessionError> {
         // 锁只用来取句柄：`send` 可能因对端阻塞而 await，
@@ -216,6 +263,7 @@ impl SessionManager {
         match handle {
             Handle::Remote(session) => session.write(bytes).await,
             Handle::Local(local) => local.write(bytes).map_err(SessionError::Pty),
+            Handle::Telnet(telnet) => telnet.write(bytes).map_err(SessionError::Telnet),
         }
     }
 
@@ -225,6 +273,8 @@ impl SessionManager {
         let result = match &handle {
             Handle::Remote(session) => session.resize(pty).await,
             Handle::Local(local) => local.resize(pty).map_err(SessionError::Pty),
+            // TelnetHandle 的入参是 (cols, rows)，与 `PtySize { rows, cols }` 反着来，别写顺
+            Handle::Telnet(telnet) => telnet.resize(pty.cols, pty.rows).map_err(SessionError::Telnet),
         };
         if result.is_ok() {
             self.inner.set_pty(id, pty);
@@ -240,6 +290,11 @@ impl SessionManager {
             Handle::Remote(session) => session.close().await,
             Handle::Local(local) => {
                 local.kill();
+                Ok(())
+            }
+            Handle::Telnet(telnet) => {
+                // 发出关闭帧 ⇒ 任务退出 ⇒ 转发任务摘条目，与远端同一条收尾链
+                telnet.close();
                 Ok(())
             }
         }
@@ -290,6 +345,7 @@ impl Inner {
         Ok(match &entry.handle {
             Handle::Remote(session) => Handle::Remote(Arc::clone(session)),
             Handle::Local(local) => Handle::Local(local.clone()),
+            Handle::Telnet(telnet) => Handle::Telnet(telnet.clone()),
         })
     }
 

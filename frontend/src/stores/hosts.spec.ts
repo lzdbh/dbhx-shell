@@ -84,6 +84,8 @@ describe('hosts store', () => {
     const hosts = useHostsStore()
     expect(hosts.subtitle(host('a'))).toBe('app@10.0.0.1:22')
     expect(hosts.subtitle(host('b', { endpoint: { host: '10.0.0.2', port: 2222, username: 'root' } }))).toBe('root@10.0.0.2:2222')
+    // telnet 默认端口 23、无用户名：不该渲染成 `@host:22` 这种串味的地址
+    expect(hosts.subtitle(host('c', { protocol: 'telnet', endpoint: { host: '10.0.0.3', port: null, username: '' } }))).toBe('10.0.0.3:23')
   })
 
   it('keeps the last error for the caller to display', async () => {

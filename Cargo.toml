@@ -4,6 +4,7 @@ members = [
   "crates/dbhx-model",
   "crates/dbhx-vault",
   "crates/dbhx-ssh",
+  "crates/dbhx-telnet",
   "crates/dbhx-pty",
   "crates/dbhx-session",
   "crates/dbhx-sftp",
@@ -61,6 +62,7 @@ specta-util = "0.0.12"
 dbhx-model = { path = "crates/dbhx-model" }
 dbhx-vault = { path = "crates/dbhx-vault" }
 dbhx-ssh = { path = "crates/dbhx-ssh" }
+dbhx-telnet = { path = "crates/dbhx-telnet" }
 dbhx-pty = { path = "crates/dbhx-pty" }
 dbhx-session = { path = "crates/dbhx-session" }
 dbhx-sftp = { path = "crates/dbhx-sftp" }

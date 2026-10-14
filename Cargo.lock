@@ -928,6 +928,7 @@ dependencies = [
  "dbhx-model",
  "dbhx-pty",
  "dbhx-ssh",
+ "dbhx-telnet",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -968,6 +969,16 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "dbhx-telnet"
+version = "0.1.0"
+dependencies = [
+ "dbhx-model",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -10,8 +10,9 @@ function endpoint(host: string, port: number, username = 'root'): LiveEndpoint {
 }
 
 const hosts = [
-  { id: 'h1', endpoint: { host: '10.0.0.1', port: null, username: 'app' } },
-  { id: 'h2', endpoint: { host: '10.0.0.1', port: 2222, username: 'app' } },
+  { id: 'h1', protocol: 'ssh' as const, endpoint: { host: '10.0.0.1', port: null, username: 'app' } },
+  { id: 'h2', protocol: 'ssh' as const, endpoint: { host: '10.0.0.1', port: 2222, username: 'app' } },
+  { id: 'h3', protocol: 'telnet' as const, endpoint: { host: '10.0.0.1', port: null, username: '' } },
 ]
 
 beforeEach(() => {
@@ -42,10 +43,10 @@ describe('会话恢复快照', () => {
     expect(savedSessions()).toEqual([])
     localStorage.setItem(KEY, '{"label":"x"}')
     expect(savedSessions()).toEqual([])
-    // 坏一条只丢那一条
+    // 坏一条只丢那一条（协议不认识、字段缺失各算一条坏的）
     localStorage.setItem(KEY, JSON.stringify([
       { label: '好', protocol: 'local', endpoint: null },
-      { label: '坏', protocol: 'telnet', endpoint: null },
+      { label: '坏', protocol: 'ftp', endpoint: null },
       { label: '缺字段', protocol: 'ssh' },
     ]))
     expect(savedSessions().map(entry => entry.label)).toEqual(['好'])
@@ -63,6 +64,12 @@ describe('会话恢复快照', () => {
   it('按 endpoint 反查主机：默认端口要能和 null 对上', () => {
     const list = resolve([{ label: '生产 A', protocol: 'ssh', endpoint: endpoint('10.0.0.1', 22, 'app') }], hosts)
     expect(list).toEqual([{ kind: 'host', label: '生产 A', hostId: 'h1' }])
+  })
+
+  it('telnet 快照按协议默认端口 23 反查，不会错配到 SSH 的 22', () => {
+    // 会话侧 LiveEndpoint 的端口是坐实的 23；主机记录存的是 null，靠 protocol 补成 23 才对得上
+    const list = resolve([{ label: '老设备', protocol: 'telnet', endpoint: endpoint('10.0.0.1', 23, '') }], hosts)
+    expect(list).toEqual([{ kind: 'host', label: '老设备', hostId: 'h3' }])
   })
 
   it('非默认端口按端口区分，不会把 2222 认成 22', () => {

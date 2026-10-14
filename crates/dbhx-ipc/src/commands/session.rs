@@ -25,14 +25,28 @@ pub async fn open_local_impl(core: &Core, spec: ConnectSpec, label: String) -> R
 }
 
 /// 开一个远端 shell。凭据只在拨号内部出现，这一层拿到的一直是引用。
+///
+/// SSH 走 transport 池（要 lease、要主机密钥、要凭据）；telnet 是裸 TCP，
+/// 登录在流里发生，不碰池——两条路共用这一个命令入口，靠记录里的 `protocol` 分流。
 pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Result<SessionInfo, IpcError> {
     // 锁屏期间禁止新拨号：这是意图层的拦截，`build_plan` 里还有一道以原子值为准的兜底。
     core.require_unlocked()?;
     let record = core.host_of(&host_id)?;
     let label = record.label.clone();
     let encoding = record.encoding;
-    let key = key_of_record(&record);
-    let session = core.sessions.open_remote(key, DEFAULT_TERM.to_string(), pty, encoding, label).await?;
+    let session = match record.protocol {
+        Protocol::Telnet => {
+            // 缺省端口取 telnet 的 23，不能沿用 SSH 的 22
+            let port = record.endpoint.port.or(Protocol::Telnet.default_port()).unwrap_or(23);
+            core.sessions.open_telnet(record.endpoint.host.clone(), port, pty, encoding, label).await?
+        }
+        Protocol::Ssh => {
+            let key = key_of_record(&record);
+            core.sessions.open_remote(key, DEFAULT_TERM.to_string(), pty, encoding, label).await?
+        }
+        // 本机终端不该从「开远端」进来：它有自己的入口，且没有 host_id 可言
+        Protocol::Local => return Err(IpcError::new(ErrorCode::InvalidInput, "本机终端不走远端打开入口", false)),
+    };
     Ok(session.info())
 }
 
@@ -197,6 +211,32 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(list_impl(&core).is_empty());
+    }
+
+    #[tokio::test]
+    async fn opening_a_local_protocol_host_through_the_remote_entry_is_refused() {
+        // 本机终端有自己的入口；万一有人把 protocol=local 存成主机记录再从「开远端」点它，
+        // 也要干净拒绝，而不是拿 SSH 的拨号路径去撞一个不存在的连接。
+        let (core, _rx) = crate::state::tests_harness("local-through-remote", crate::state::fake_dialer());
+        let id = crate::commands::vault::upsert_host_impl(
+            &core,
+            crate::commands::vault::HostDraft {
+                id: None,
+                label: "本机".into(),
+                group: None,
+                tags: vec![],
+                favorite: false,
+                protocol: Protocol::Local,
+                endpoint: Endpoint { host: String::new(), port: None, username: String::new() },
+                auth_mode: AuthMode::Agent,
+                identity_id: None,
+                keepalive_secs: 0,
+                encoding: TerminalEncoding::Utf8,
+            },
+        )
+        .unwrap();
+        let err = open_remote_impl(&core, id, PtySize::default()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
     #[tokio::test]

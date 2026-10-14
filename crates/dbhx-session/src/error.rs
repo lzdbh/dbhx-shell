@@ -6,6 +6,7 @@
 use dbhx_model::{ErrorCode, IpcError};
 use dbhx_pty::PtyError;
 use dbhx_ssh::SshError;
+use dbhx_telnet::TelnetError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -15,6 +16,10 @@ pub enum SessionError {
     /// 本地终端的错。与 SSH 一样，分类已经在 `dbhx-pty` 里做过，这里只透传。
     #[error(transparent)]
     Pty(#[from] PtyError),
+
+    /// telnet 的错。分类已在 `dbhx-telnet` 里按「UI 能做什么」分好，这里只透传。
+    #[error(transparent)]
+    Telnet(#[from] TelnetError),
 
     /// 身份键指向的主机在 vault 里不存在（记录被删了，但还有 tab 拿着旧 id）。
     #[error("找不到主机记录: {0}")]
@@ -48,6 +53,7 @@ impl From<SessionError> for IpcError {
             // 协议层的分类已经决定了 UI 该给什么按钮，不要在这里改写
             SessionError::Ssh(inner) => inner.into(),
             SessionError::Pty(inner) => inner.into(),
+            SessionError::Telnet(inner) => inner.into(),
             SessionError::UnknownHost(id) => IpcError::new(
                 ErrorCode::NotFound,
                 format!("主机记录已不存在（{id}），请重新选择主机"),

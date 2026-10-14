@@ -108,10 +108,11 @@ export const useHostsStore = defineStore('hosts', () => {
     return hosts.value.find(h => h.id === id)
   }
 
-  /** 一条主机的次行文本：`user@host:port`，端口缺省按协议的 22 显示。 */
+  /** 主机次行文本：SSH 是 `user@host:port`；telnet 无用户名、默认端口 23，只显 `host:port`。 */
   function subtitle(host: HostInfo): string {
-    const port = host.endpoint.port ?? 22
-    return `${host.endpoint.username}@${host.endpoint.host}:${port}`
+    const defaultPort = host.protocol === 'telnet' ? 23 : 22
+    const where = `${host.endpoint.host}:${host.endpoint.port ?? defaultPort}`
+    return host.endpoint.username ? `${host.endpoint.username}@${where}` : where
   }
 
   return { hosts, identities, loading, error, groups, groupsOf, groupNames, refresh, save, remove, addIdentity, removeIdentity, byId, subtitle }

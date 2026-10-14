@@ -35,9 +35,14 @@ const form = reactive({
   password: '',
 })
 
+/** 各协议的默认端口；存回记录时等于默认值就归一成 null，让后端 `default_port` 兜底。 */
+const PROTOCOL_DEFAULT_PORT: Record<Protocol, number | null> = { ssh: 22, telnet: 23, local: null }
+
 const submitting = ref(false)
 const needsIdentity = computed(() => form.authMode === 'public_key')
 const needsPassword = computed(() => form.authMode === 'password' || form.authMode === 'keyboard_interactive')
+/** 需要远端地址的协议：SSH 与 telnet 都要 host/port，本机终端不要。 */
+const isRemote = computed(() => form.protocol === 'ssh' || form.protocol === 'telnet')
 
 // 每次打开都从选中的主机重新灌一遍，避免上一次编辑的残留
 watch(() => [props.open, props.host] as const, ([open]) => {
@@ -48,7 +53,7 @@ watch(() => [props.open, props.host] as const, ([open]) => {
   form.favorite = host?.favorite ?? false
   form.protocol = host?.protocol ?? 'ssh'
   form.host = host?.endpoint.host ?? ''
-  form.port = host?.endpoint.port ?? 22
+  form.port = host?.endpoint.port ?? PROTOCOL_DEFAULT_PORT[host?.protocol ?? 'ssh'] ?? 22
   form.username = host?.endpoint.username ?? ''
   form.authMode = host?.auth_mode ?? 'password'
   // 身份引用是 auth 带的，不是 auth_mode 能推出来的：PublicKey 一定配 Identity
@@ -58,11 +63,20 @@ watch(() => [props.open, props.host] as const, ([open]) => {
   form.password = ''
 }, { immediate: true })
 
+// 切协议时，若用户没改过端口（还停在旧协议的默认值），就跟着换成新协议的默认端口，
+// 免得存一个 telnet 主机却带着 22 这种明显的串味。
+watch(() => form.protocol, (next, prev) => {
+  const prevDefault = PROTOCOL_DEFAULT_PORT[prev]
+  const nextDefault = PROTOCOL_DEFAULT_PORT[next]
+  if (nextDefault !== null && prevDefault !== null && form.port === prevDefault) form.port = nextDefault
+})
+
 function valid(): string | null {
   if (!form.label.trim()) return '请填写名称'
-  if (form.protocol === 'ssh' && !form.host.trim()) return '请填写主机地址'
+  if (isRemote.value && !form.host.trim()) return '请填写主机地址'
+  // telnet 在流里登录，压根没有「用户名」这一说，别拿 SSH 的必填去卡它
   if (form.protocol === 'ssh' && !form.username.trim()) return '请填写用户名'
-  if (form.port < 1 || form.port > 65535) return '端口要在 1-65535 之间'
+  if (isRemote.value && (form.port < 1 || form.port > 65535)) return '端口要在 1-65535 之间'
   if (needsIdentity.value && !form.identityId) return '私钥认证要选一把密钥'
   return null
 }
@@ -73,6 +87,7 @@ async function submit(): Promise<void> {
     messageApi.warning(problem)
     return
   }
+  const defaultPort = PROTOCOL_DEFAULT_PORT[form.protocol]
   const draft: HostDraft = {
     id: props.host?.id ?? null,
     label: form.label.trim(),
@@ -82,8 +97,9 @@ async function submit(): Promise<void> {
     protocol: form.protocol,
     endpoint: {
       host: form.host.trim(),
-      port: form.port === 22 ? null : form.port,
-      username: form.username.trim(),
+      // 等于该协议默认端口就存 null，让后端的 default_port 兜底，记录更干净
+      port: defaultPort !== null && form.port === defaultPort ? null : form.port,
+      username: form.protocol === 'ssh' ? form.username.trim() : '',
     },
     auth_mode: form.authMode,
     identity_id: needsIdentity.value ? form.identityId : null,
@@ -124,36 +140,40 @@ async function submit(): Promise<void> {
       <a-form-item label="协议">
         <a-select v-model:value="form.protocol">
           <a-select-option value="ssh">SSH</a-select-option>
+          <a-select-option value="telnet">Telnet</a-select-option>
           <a-select-option value="local">本机终端</a-select-option>
         </a-select>
       </a-form-item>
-      <template v-if="form.protocol === 'ssh'">
+      <template v-if="isRemote">
         <a-form-item label="主机">
           <a-input v-model:value="form.host" placeholder="10.0.0.12" />
         </a-form-item>
         <a-form-item label="端口">
           <a-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 120px" />
         </a-form-item>
-        <a-form-item label="用户名">
-          <a-input v-model:value="form.username" placeholder="root" />
-        </a-form-item>
-        <a-form-item label="认证方式">
-          <a-select v-model:value="form.authMode" :options="AUTH_OPTIONS" />
-        </a-form-item>
-        <a-form-item v-if="needsIdentity" label="密钥">
-          <a-select v-model:value="form.identityId" placeholder="先在设置里导入私钥" allow-clear>
-            <a-select-option v-for="item in hosts.identities" :key="item.id" :value="item.id">
-              {{ item.label }}
-            </a-select-option>
-          </a-select>
-        </a-form-item>
-        <a-form-item v-if="needsPassword" :label="host ? '口令（留空则不修改）' : '口令'">
-          <!-- 口令永不出现在读取方向上，所以这里没有回填，只有覆盖 -->
-          <a-input-password v-model:value="form.password" autocomplete="new-password" />
-        </a-form-item>
-        <a-form-item label="保活间隔（秒）">
-          <a-input-number v-model:value="form.keepaliveSecs" :min="0" :max="600" style="width: 120px" />
-        </a-form-item>
+        <!-- SSH 才有登录用户与认证；telnet 在流里登录，用户名/口令这一套不存在 -->
+        <template v-if="form.protocol === 'ssh'">
+          <a-form-item label="用户名">
+            <a-input v-model:value="form.username" placeholder="root" />
+          </a-form-item>
+          <a-form-item label="认证方式">
+            <a-select v-model:value="form.authMode" :options="AUTH_OPTIONS" />
+          </a-form-item>
+          <a-form-item v-if="needsIdentity" label="密钥">
+            <a-select v-model:value="form.identityId" placeholder="先在设置里导入私钥" allow-clear>
+              <a-select-option v-for="item in hosts.identities" :key="item.id" :value="item.id">
+                {{ item.label }}
+              </a-select-option>
+            </a-select>
+          </a-form-item>
+          <a-form-item v-if="needsPassword" :label="host ? '口令（留空则不修改）' : '口令'">
+            <!-- 口令永不出现在读取方向上，所以这里没有回填，只有覆盖 -->
+            <a-input-password v-model:value="form.password" autocomplete="new-password" />
+          </a-form-item>
+          <a-form-item label="保活间隔（秒）">
+            <a-input-number v-model:value="form.keepaliveSecs" :min="0" :max="600" style="width: 120px" />
+          </a-form-item>
+        </template>
         <a-form-item label="远端编码">
           <a-select v-model:value="form.encoding">
             <a-select-option value="utf8">UTF-8</a-select-option>

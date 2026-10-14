@@ -363,8 +363,8 @@ export type Pong = {
 	target: LiveEndpoint,
 };
 
-/**  M0–M2 只落地两种协议；telnet/mosh/et/serial 属 M6，先不占位。 */
-export type Protocol = "ssh" | "local";
+/**  M6 落了 telnet；mosh/et/serial 仍未接，先不占位。 */
+export type Protocol = "ssh" | "local" | "telnet";
 
 export type PtySize = {
 	rows: number,

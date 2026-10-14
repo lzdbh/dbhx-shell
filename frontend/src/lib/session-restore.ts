@@ -30,7 +30,13 @@ export type Restorable =
 
 interface HostLike {
   id: string
+  protocol: Protocol
   endpoint: { host: string, port: number | null, username: string }
+}
+
+/** 协议默认端口：反查主机记录时，把「端口为 null」补齐成它拨号时真正用的端口。 */
+function defaultPort(protocol: Protocol): number {
+  return protocol === 'telnet' ? 23 : 22
 }
 
 /** 存的时候只留列表里那些还能用的 tab（error/closed 也留，用户可能想原样重开）。 */
@@ -83,7 +89,7 @@ function isSnapshot(value: unknown): value is SessionSnapshot {
   if (typeof value !== 'object' || value === null) return false
   const shape = value as { label?: unknown, protocol?: unknown, endpoint?: unknown }
   if (typeof shape.label !== 'string') return false
-  if (shape.protocol !== 'ssh' && shape.protocol !== 'local') return false
+  if (shape.protocol !== 'ssh' && shape.protocol !== 'local' && shape.protocol !== 'telnet') return false
   if (shape.endpoint === null) return true
   if (typeof shape.endpoint !== 'object') return false
   const endpoint = shape.endpoint as { host?: unknown, port?: unknown, username?: unknown }
@@ -95,12 +101,12 @@ function isSnapshot(value: unknown): value is SessionSnapshot {
  *
  * 比对的是「拨号身份」而不是 label——label 随时能改，endpoint 才是那台机器。
  * `HostRecord` 的 port 为 null 表示协议默认端口，会话侧的 `LiveEndpoint` 已经把它
- * 落实成 22，所以两边都要归一到数字才能对上。
+ * 落实成数字（SSH 22、telnet 23），所以两边都要按**各自协议的默认**补齐才能对上。
  */
 export function resolve(saved: SessionSnapshot[], hosts: HostLike[]): Restorable[] {
   const index = new Map<string, string>()
   hosts.forEach(host => {
-    index.set(key(host.endpoint.username, host.endpoint.host, host.endpoint.port ?? 22), host.id)
+    index.set(key(host.endpoint.username, host.endpoint.host, host.endpoint.port ?? defaultPort(host.protocol)), host.id)
   })
   return saved.map((entry): Restorable => {
     if (entry.protocol === 'local') return { kind: 'local', label: entry.label }
@@ -120,7 +126,8 @@ function fallbackEndpoint(label: string): LiveEndpoint {
   return { host: label, port: 22, username: '' }
 }
 
-/** 提示文案用的地址。 */
+/** 提示文案用的地址。telnet 没有用户名，就别渲染成刺眼的 `@host:port`。 */
 export function describe(endpoint: LiveEndpoint): string {
-  return `${endpoint.username}@${endpoint.host}:${endpoint.port}`
+  const where = `${endpoint.host}:${endpoint.port}`
+  return endpoint.username ? `${endpoint.username}@${where}` : where
 }

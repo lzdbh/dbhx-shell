@@ -101,7 +101,14 @@ pub fn hosts_impl(core: &Core) -> Result<Vec<HostInfo>, IpcError> {
 
 pub fn upsert_host_impl(core: &Core, draft: HostDraft) -> Result<HostId, IpcError> {
     reject_empty(&draft.label, "主机名不能为空")?;
-    reject_empty(&draft.endpoint.username, "登录用户名不能为空")?;
+    // 本机终端没有远端地址可言；SSH 与 telnet 都得有个能拨的地址
+    if draft.protocol != Protocol::Local {
+        reject_empty(&draft.endpoint.host, "服务器地址不能为空")?;
+    }
+    // 只有 SSH 谈得上「登录用户名」：telnet 在流里登录、本机终端根本没有远端，都不该被它卡住
+    if draft.protocol == Protocol::Ssh {
+        reject_empty(&draft.endpoint.username, "登录用户名不能为空")?;
+    }
     let now = now_ms();
     let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
     let existing = draft.id.as_ref().and_then(|id| vault.host(id)).cloned();
@@ -468,6 +475,31 @@ mod tests {
         let merged = merge_record(draft("db1"), None, 5);
         assert!(merged.password_secret_id.is_none());
         assert_eq!(merged.created_at_ms, 5);
+    }
+
+    #[test]
+    fn a_telnet_host_can_be_saved_without_a_username() {
+        // telnet 在流里登录，压根没有登录用户：别拿 SSH 的「用户名必填」把它挡在门外
+        let (core, _rx) = tests_harness("telnet-host", crate::state::fake_dialer());
+        let telnet = HostDraft {
+            protocol: Protocol::Telnet,
+            endpoint: Endpoint { host: "10.0.0.5".into(), port: None, username: String::new() },
+            ..draft("老设备")
+        };
+        let id = upsert_host_impl(&core, telnet).expect("telnet 主机不该因为没填用户名而被拒");
+        let infos = hosts_impl(&core).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, id);
+        assert_eq!(infos[0].protocol, Protocol::Telnet);
+    }
+
+    #[test]
+    fn an_ssh_host_still_demands_a_username() {
+        // 反过来也得钉住：放宽只针对 telnet，SSH 少了用户名照样报错
+        let (core, _rx) = tests_harness("ssh-needs-user", crate::state::fake_dialer());
+        let broken = HostDraft { endpoint: Endpoint { host: "h".into(), port: None, username: String::new() }, ..draft("x") };
+        let err = upsert_host_impl(&core, broken).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
     #[tokio::test]

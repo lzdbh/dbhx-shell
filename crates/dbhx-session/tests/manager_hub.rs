@@ -213,3 +213,39 @@ async fn dropping_the_manager_closes_the_event_stream_without_stranding_tasks() 
     // 这里不能有 panic：转发任务在 Weak 落空后只是记一条日志
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
+
+/// telnet 走的是裸 TCP，不碰 transport 池，但同样要经过注册表这套 id/事件流。
+/// 这里用多线程 runtime + 一个「连上就攥着」的本地服务器，只验证注册表的形状，
+/// 真正的协议收发在 `dbhx-telnet` 自己的集成测试里已经钉死。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_telnet_session_is_labeled_telnet_not_ssh() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hold = tokio::spawn(async move {
+        let (_sock, _) = listener.accept().await.unwrap();
+        // 攥住连接直到测试结束，既不读也不写，只为让会话保持存活
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let m = manager();
+    let record = m.open_telnet("127.0.0.1".into(), port, pty(), TerminalEncoding::Utf8, "tn".into()).await.expect("telnet 应能连上");
+
+    // 核心回归：带 live_endpoint 的会话不等于 SSH——telnet 必须如实标注
+    assert_eq!(record.info().protocol, dbhx_model::Protocol::Telnet);
+    assert!(record.is_remote(), "telnet 有远端地址，算远端会话");
+    assert!(m.transport_key(record.id).is_none(), "telnet 不进 transport 池，面板也就无从复用一条 SSH 连接");
+
+    m.write(record.id, b"ls\r").await.unwrap();
+    m.resize(record.id, &PtySize { rows: 40, cols: 120 }).await.unwrap();
+    assert_eq!(m.record(record.id).unwrap().pty, PtySize { rows: 40, cols: 120 }, "改尺寸要写回条目");
+
+    m.close(record.id).await.unwrap();
+    // 关闭后条目会随转发任务摘除；给它一点收敛时间，最多到注册表空为止
+    for _ in 0..100 {
+        if m.record(record.id).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    hold.abort();
+}

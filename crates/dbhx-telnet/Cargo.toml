@@ -1,0 +1,15 @@
+[package]
+name = "dbhx-telnet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "telnet 客户端：IAC 协商与原始字节透传；只依赖 tokio，可 cargo test 直接跑"
+
+[dependencies]
+dbhx-model.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

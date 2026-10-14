@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use dbhx_model::{DirListing, ErrorCode, HostId, IpcError, SessionId};
+use dbhx_model::{DirListing, ErrorCode, HostId, IpcError, Protocol, SessionId};
 use dbhx_session::{LeaseKind, TransportKey};
 use dbhx_sftp::{CwdSource, FollowGate, SftpClient};
 use dbhx_sftp::path;
@@ -26,7 +26,7 @@ pub async fn open_for_session_impl(core: &Core, session: SessionId) -> Result<Pa
     ))?;
     let key = record.transport.clone().ok_or_else(|| IpcError::new(
         ErrorCode::InvalidInput,
-        "本地终端没有远端文件系统可看",
+        "本地终端与 telnet 都没有远端文件系统可看",
         false,
     ))?;
     open_panel(core, key, record.cwd.as_deref()).await
@@ -35,6 +35,11 @@ pub async fn open_for_session_impl(core: &Core, session: SessionId) -> Result<Pa
 /// 从主机树直接打开面板：没有现成会话时自己拨一条（仍然免输密码，凭据来自 vault）。
 pub async fn open_for_host_impl(core: &Core, host_id: HostId) -> Result<PanelInfo, IpcError> {
     let record = core.host_of(&host_id)?;
+    // 只有 SSH 才谈得上复用 transport 开 SFTP 子系统；telnet 是裸 TCP，压根没有文件通道，
+    // 放行到这里只会拿 SSH 的拨号去连一个 telnet 端口。前端已经置灰按钮，这里再兜一道。
+    if record.protocol != Protocol::Ssh {
+        return Err(IpcError::new(ErrorCode::InvalidInput, "只有 SSH 主机有远端文件系统", false));
+    }
     let key = crate::commands::session::key_of_record(&record);
     open_panel(core, key, None).await
 }
@@ -298,5 +303,31 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_telnet_host_has_no_file_panel_and_is_refused_before_dialing() {
+        // 后端兜底：telnet 没有 SFTP 子系统，绝不能在拨号那一刻才发现
+        let (core, _rx) = crate::state::tests_harness("sftp-telnet", crate::state::fake_dialer());
+        let id = crate::commands::vault::upsert_host_impl(
+            &core,
+            crate::commands::vault::HostDraft {
+                id: None,
+                label: "老设备".into(),
+                group: None,
+                tags: vec![],
+                favorite: false,
+                protocol: dbhx_model::Protocol::Telnet,
+                endpoint: dbhx_model::Endpoint { host: "10.0.0.5".into(), port: Some(23), username: String::new() },
+                auth_mode: dbhx_model::AuthMode::Agent,
+                identity_id: None,
+                keepalive_secs: 0,
+                encoding: dbhx_model::TerminalEncoding::Utf8,
+            },
+        )
+        .unwrap();
+        let err = open_for_host_impl(&core, id).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(core.conn_id_count(), 0, "被协议挡在门外时压根不该起一条连接号");
     }
 }

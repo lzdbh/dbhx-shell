@@ -1,12 +1,27 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-/// M0–M2 只落地两种协议；telnet/mosh/et/serial 属 M6，先不占位。
+/// M6 落了 telnet；mosh/et/serial 仍未接，先不占位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     Ssh,
     Local,
+    Telnet,
+}
+
+impl Protocol {
+    /// 该协议的默认远端端口。本地终端没有端口概念，返回 `None`。
+    ///
+    /// telnet 是 23、SSH 是 22：vault 记录里 `endpoint.port` 缺省时靠这个补齐，
+    /// 免得给 telnet 主机拨到 22 上去。
+    pub fn default_port(self) -> Option<u16> {
+        match self {
+            Protocol::Ssh => Some(22),
+            Protocol::Telnet => Some(23),
+            Protocol::Local => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
