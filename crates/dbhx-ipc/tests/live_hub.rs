@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dbhx_ipc::commands::session::{close_impl as close_session_impl, open_remote_impl, write_impl};
-use dbhx_ipc::commands::sftp::{browse_impl, close_impl as close_panel_impl, open_for_session_impl, set_following_impl};
+use dbhx_ipc::commands::sftp::{browse_impl, close_impl as close_panel_impl, mkdir_impl, open_for_session_impl, rename_impl, set_following_impl};
 use dbhx_ipc::commands::transfer::download_impl;
 use dbhx_ipc::commands::vault::{HostDraft, UserReply, reply_impl, set_password_impl, upsert_host_impl};
 use dbhx_ipc::events::{BusEvent, FollowHold};
@@ -259,6 +259,51 @@ async fn a_changed_host_key_blocks_the_connection_and_asks_nobody() {
     assert_eq!(conflict.presented.base64_key, HOST_KEY_B64, "要让用户看见服务器现在出示的是哪把");
     assert_eq!(core.awaits.pending(), 0, "变更不给「仍然连接」，所以不该登记任何等待");
     assert_eq!(core.known.lock().unwrap_or_else(|p| p.into_inner()).entries().len(), 1, "被拒绝的密钥不能写盘");
+
+    server.shutdown().await;
+}
+
+/// 按名字的操作要落在**用户正看着的那个目录**，不是 SFTP 会话的初始目录。
+///
+/// 真机上 root 用户的会话初始目录是 `/root`，所以「在 /data/logs 里把 a.txt 改名成
+/// b.txt」如果直接把裸名字发给服务器，结果是把文件搬到 `/root/b.txt`——用户在 A 目录
+/// 操作，东西出现在 B。这是双栏文件窗口实测踩到的，`browse` 早就按 `shown` 拼了，
+/// `mkdir`/`rename` 是漏网的那两个。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bare_names_resolve_against_the_browsed_dir() {
+    let server = started_server().await;
+    let (core, mut rx) = live_core("naming");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 }).await.expect("远端 shell 应当开起来");
+    await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
+    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
+
+    // 手动进到子目录，之后面板显示的就是 /home/app/logs
+    let entered = browse_impl(core.as_ref(), panel.connection, Some("logs".into())).await.unwrap();
+    assert_eq!(entered.path, "/home/app/logs");
+
+    mkdir_impl(core.as_ref(), panel.connection, "inbox".into(), false).await.unwrap();
+    rename_impl(core.as_ref(), panel.connection, "/home/app/logs/app.log".into(), "app-2.log".into(), false).await.unwrap();
+
+    let names = |listing: dbhx_model::DirListing| listing.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+    let here = names(browse_impl(core.as_ref(), panel.connection, None).await.unwrap());
+    assert!(here.contains(&"inbox".to_string()), "新建的目录要出现在正看着的这一栏，实际 {here:?}");
+    assert!(here.contains(&"app-2.log".to_string()), "改名要原地改，实际 {here:?}");
+    assert!(!here.contains(&"app.log".to_string()), "旧名字该没了，实际 {here:?}");
+    assert_eq!(
+        browse_impl(core.as_ref(), panel.connection, Some("/home/app/logs/inbox".into())).await.unwrap().entries.len(),
+        0,
+        "新建的得是个空目录"
+    );
+
+    // 这一条才是本次回归的核心：上层目录绝不能凭空多出这两个名字
+    let parent = names(browse_impl(core.as_ref(), panel.connection, Some("/home/app".into())).await.unwrap());
+    for leaked in ["inbox", "app-2.log"] {
+        assert!(!parent.contains(&leaked.to_string()), "「{leaked}」被建到了上一级目录，说明裸名字没按显示目录解析：{parent:?}");
+    }
+    assert!(parent.contains(&"logs".to_string()), "上一级本来该有的东西不能被弄丢：{parent:?}");
 
     server.shutdown().await;
 }

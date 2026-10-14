@@ -123,8 +123,11 @@ pub async fn browse_impl(core: &Core, connection: u32, target: Option<String>) -
 }
 
 pub async fn mkdir_impl(core: &Core, connection: u32, target: String, recursive: bool) -> Result<(), IpcError> {
-    let client = core.panel_client(connection)?;
-    if recursive { client.mkdir_all(&target).await? } else { client.mkdir(&target).await? };
+    // 裸名字按面板正在显示的目录拼成绝对路径再发出去。直接丢给服务器的话，它用的是
+    // 会话初始目录（root 用户即 `/root`），用户就会在看着 A 目录的时候把东西建到 B 去。
+    let (client, shown) = core.panel_at(connection)?;
+    let dest = path::join(&shown, &target);
+    if recursive { client.mkdir_all(&dest).await? } else { client.mkdir(&dest).await? };
     Ok(())
 }
 
@@ -135,7 +138,15 @@ pub async fn remove_impl(core: &Core, connection: u32, target: String, is_dir: b
 }
 
 pub async fn rename_impl(core: &Core, connection: u32, from: String, to: String, overwrite: bool) -> Result<(), IpcError> {
-    core.panel_client(connection)?.rename(&from, &to, overwrite).await.map_err(Into::into)
+    let (client, _) = core.panel_at(connection)?;
+    // 目标名按 `from` **自己所在的目录**拼，而不是按面板显示的目录：改名就该是原地的
+    // 事。两者正常情况下是同一个，但万一列表是旧的、面板已经跳走，宁可报错也不要把
+    // 文件搬到别处去。`to` 给绝对路径时 `join` 原样返回，跨目录移动仍然是显式能力。
+    let dest = match path::parent(&from) {
+        Some(dir) => path::join(&dir, &to),
+        None => to.clone(),
+    };
+    client.rename(&from, &dest, overwrite).await.map_err(Into::into)
 }
 
 /// 关面板。lease 随 `Panel` 一起释放，连接是否断开交给池的 TTL 决定。

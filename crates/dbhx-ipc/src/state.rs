@@ -361,6 +361,20 @@ impl Core {
             .ok_or_else(|| not_found_panel(connection))
     }
 
+    /// 面板的客户端 **加上它此刻显示给用户的那个目录**。
+    ///
+    /// 「新建目录」「改名」这类按名字操作必须按正在显示的目录解析，而不是把裸名字
+    /// 直接丢给服务器：SFTP 服务器解析相对路径用的是**会话初始目录**（root 用户就是
+    /// `/root`），于是「在 /data/logs 里把 a.txt 改名成 b.txt」会把文件搬到 `/root/b.txt`。
+    /// `browse` 早就按 `shown` 拼了，这两个命令是漏网的那两个。
+    pub fn panel_at(&self, connection: u32) -> Result<(SftpClient, String), IpcError> {
+        let panels = self.panels.lock().unwrap_or_else(|p| p.into_inner());
+        panels
+            .get(connection)
+            .map(|p| (p.client.clone(), p.shown.clone()))
+            .ok_or_else(|| not_found_panel(connection))
+    }
+
     /// 让面板重开一条 transport 上的第二个 lease（用于「终端还在、面板先关又开」）。
     pub async fn acquire(&self, key: TransportKey, kind: LeaseKind) -> Result<Lease, dbhx_session::SessionError> {
         self.pool.acquire(key, kind).await
