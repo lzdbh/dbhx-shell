@@ -15,6 +15,7 @@ tauri-build.workspace = true
 [dependencies]
 dbhx-ipc.workspace = true
 tauri.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
