@@ -90,6 +90,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "local_stat",
     "local_open",
     "local_edit_dir",
+    "local_clipboard_read",
+    "local_clipboard_write",
     "open_file_window",
 ];
 
@@ -154,6 +156,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::local::local_stat,
             commands::local::local_open,
             commands::local::local_edit_dir,
+            commands::clipboard::local_clipboard_read,
+            commands::clipboard::local_clipboard_write,
             commands::local::open_file_window,
         ])
         .events(collect_events![

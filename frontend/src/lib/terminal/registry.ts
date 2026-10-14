@@ -1,7 +1,12 @@
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+// xterm 的骨架样式：视口滚动条、隐藏输入框、宽度测量容器全靠它定位。
+// 漏掉它不会报错，但那些辅助元素会直接显示在终端上方（输入框的缩放手柄、
+// 一行用于测宽度的重复字符），而且 `.xterm-viewport` 高度塌成 0、滚轮翻不了历史。
+import '@xterm/xterm/css/xterm.css'
 
 import type { SessionId } from '../ipc/bindings'
+import { clipboardApi } from '../ipc/client'
 import { decodeBase64 } from '../bytes'
 import type { TerminalTheme } from '../../stores/theme'
 
@@ -34,6 +39,51 @@ interface Entry {
 const entries = new Map<SessionId, Entry>()
 
 /**
+ * 还没人认领的会话，输出先在这儿排着。
+ *
+ * 建 tab 与建终端是两件事：`session_open_remote` 返回、tab 进 store、格子挂载、
+ * `ensureTerminal` 造实例，中间隔着好几次异步与渲染帧。远端的登录横幅
+ * （`Welcome to Ubuntu …`、`Last login: …`）正好落在这段缝里——它只在登录那一刻
+ * 打一次，之后没有任何东西会重画它。原先这里直接丢弃，于是连上主机后只剩一个空提示符，
+ * 用户以为横幅没发过来。攒起来等实例建好一次性补写就对了。
+ *
+ * 上限是硬约束：后台 tab 一直没人看也不能把输出堆到内存吃紧。超了就丢最老的——
+ * 掉的是最早几屏日志，比整段卡死或 OOM 都轻。
+ */
+interface Pending {
+  chunks: Uint8Array[]
+  bytes: number
+}
+
+const pending = new Map<SessionId, Pending>()
+const PENDING_CAP = 512 * 1024
+
+function stashPending(id: SessionId, data: Uint8Array): void {
+  const held = pending.get(id) ?? { chunks: [], bytes: 0 }
+  held.chunks.push(data)
+  held.bytes += data.byteLength
+  while (held.bytes > PENDING_CAP && held.chunks.length > 1) {
+    const dropped = held.chunks.shift()
+    if (dropped) held.bytes -= dropped.byteLength
+  }
+  pending.set(id, held)
+}
+
+function takePending(id: SessionId): Uint8Array | null {
+  const held = pending.get(id)
+  pending.delete(id)
+  if (!held || held.chunks.length === 0) return null
+  if (held.chunks.length === 1) return held.chunks[0] ?? null
+  const joined = new Uint8Array(held.bytes)
+  let at = 0
+  for (const chunk of held.chunks) {
+    joined.set(chunk, at)
+    at += chunk.byteLength
+  }
+  return joined
+}
+
+/**
  * 取回或惰性创建某个会话的终端元素。
  *
  * 创建时机是「第一次被挂进格子」而不是「tab 出现」：恢复会话、切 tab、分屏都只是
@@ -51,8 +101,8 @@ export function ensureTerminal(
     allowProposedApi: true,
     scrollback: 8000,
     fontSize,
-    // 选中即复制的起点：翻日志时双击选词比拖拽省事
-    rightClickSelectsWord: true,
+    // 右键留给粘贴（有选区时先复制选区），选中靠双击取词，这是同类 SSH 客户端的习惯
+    rightClickSelectsWord: false,
     theme: toXtermTheme(theme),
   })
   const fit = new FitAddon()
@@ -61,9 +111,18 @@ export function ensureTerminal(
   term.onResize(({ rows, cols }) => { handlers.onResize(rows, cols) })
   const element = document.createElement('div')
   element.className = 'xterm-host'
+  term.attachCustomKeyEventHandler(event => handleClipboardKey(term, event))
+  element.addEventListener('contextmenu', event => {
+    // 不拦的话 WebView2 会弹自己的菜单，用户点不到也复制不了
+    event.preventDefault()
+    if (term.hasSelection()) void copyText(term.getSelection())
+    else void pasteInto(term)
+  })
   const entry: Entry = { term, fit, element, resizeObserver: null }
   entries.set(id, entry)
   term.open(element)
+  const early = takePending(id)
+  if (early) term.write(early)
   // 格子大小由 CSS 决定（分屏比例、侧栏拖动都会改它），ResizeObserver 是唯一
   // 不用把布局状态反灌进这里的通知方式
   entry.resizeObserver = new ResizeObserver(() => { fitTerminal(id) })
@@ -100,10 +159,60 @@ export function lookup(id: SessionId): Terminal | undefined {
   return entries.get(id)?.term
 }
 
-/** 一段 base64 输出直接写进终端；没有终端（还没挂进格子）时丢弃是安全的：
- *  回滚缓冲由服务端的重绘负责，我们不替它记账。 */
+/** 一段 base64 输出写进终端；终端还没建时先进暂存区，建好即补写，一个字节都不丢。 */
 export function writeTerminal(id: SessionId, data: string): void {
-  entries.get(id)?.term.write(new Uint8Array(decodeBase64(data)))
+  const bytes = new Uint8Array(decodeBase64(data))
+  const entry = entries.get(id)
+  if (entry) entry.term.write(bytes)
+  else stashPending(id, bytes)
+}
+
+/**
+ * 剪贴板按键：有选区时 `Ctrl/Cmd+C` 是复制，没有才让 xterm 把 `^C` 发给 shell；
+ * `Ctrl/Cmd+V` 从剪贴板取文本，交给 `term.paste`（它会按远端是否开启括号粘贴模式处理）。
+ *
+ * 返回 `false` 表示这个键由我们接管，xterm 不再产生对应的输入。
+ */
+export function handleClipboardKey(term: Terminal, event: KeyboardEvent): boolean {
+  if (event.type !== 'keydown') return true
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return true
+  // 只认不带 Shift 的组合：`Ctrl+Shift+C` 那类留给 shell 自己的绑定
+  if (event.shiftKey) return true
+  switch (event.key.toLowerCase()) {
+    case 'c':
+      if (!term.hasSelection()) return true
+      void copyText(term.getSelection())
+      return false
+    case 'v':
+      void pasteInto(term)
+      return false
+    default:
+      return true
+  }
+}
+
+/**
+ * 写剪贴板失败只是复制没生效，不该打断终端。
+ *
+ * 读写都走后端命令而不是 `navigator.clipboard`——见 client.ts 里 `clipboardApi` 的说明：
+ * WebView2 会把读剪贴板当成网页权限，弹一次原生授权气泡，用户拒绝后终端粘贴就再也用不了。
+ */
+async function copyText(text: string): Promise<void> {
+  if (text === '') return
+  try {
+    await clipboardApi.write(text)
+  } catch (err) {
+    console.warn('复制到剪贴板失败', err)
+  }
+}
+
+async function pasteInto(term: Terminal): Promise<void> {
+  try {
+    const text = await clipboardApi.read()
+    if (text !== '') term.paste(text)
+  } catch (err) {
+    console.warn('读取剪贴板失败', err)
+  }
 }
 
 export function applyTheme(id: SessionId, theme: TerminalTheme): void {
@@ -128,6 +237,7 @@ export function fitTerminal(id: SessionId): void {
 
 export function destroyTerminal(id: SessionId): void {
   const entry = entries.get(id)
+  pending.delete(id)
   if (!entry) return
   entry.resizeObserver?.disconnect()
   entry.term.dispose()

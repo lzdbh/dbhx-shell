@@ -60,6 +60,8 @@ fn main() {
                     "local_stat",
                     "local_open",
                     "local_edit_dir",
+                    "local_clipboard_read",
+                    "local_clipboard_write",
                     "open_file_window",
                 ])
                 .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),

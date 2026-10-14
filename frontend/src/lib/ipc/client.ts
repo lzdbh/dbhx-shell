@@ -132,6 +132,19 @@ export const localApi = {
   editDir: () => unwrap(commands.localEditDir()),
 }
 
+/**
+ * 系统剪贴板。
+ *
+ * 渲染层自己的 `navigator.clipboard` 在这里不能用：WebView2 把「读剪贴板」按网页权限
+ * 处理，第一次粘贴会弹系统原生的授权气泡，用户点了「阻止」之后终端粘贴就永久失效，
+ * 而且没有入口改回来。桌面应用的剪贴板属于应用本身，所以下沉到 Rust。
+ */
+export const clipboardApi = {
+  /** 剪贴板为空或内容不是文本时返回空串，不报错。 */
+  read: () => unwrap(commands.localClipboardRead()),
+  write: (text: string) => unwrap(commands.localClipboardWrite(text)),
+}
+
 /** 让 Rust 侧弹出（或聚焦）某台主机的文件管理窗口。 */
 export const fileWindowApi = {
   open: (hostId: HostId) => unwrap(commands.openFileWindow(hostId)),

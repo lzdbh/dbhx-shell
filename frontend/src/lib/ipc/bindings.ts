@@ -81,6 +81,12 @@ export const commands = {
 	 */
 	localOpen: (path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_open", { path })),
 	localEditDir: () => typedError<string, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_edit_dir")),
+	localClipboardRead: () => typedError<string, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_clipboard_read")),
+	/**
+	 *  走 `async` 而不是同步命令：剪贴板是全局单线程资源，Windows 上打开失败会重试，
+	 *  不该把可能的等待压在事件循环线程上。
+	 */
+	localClipboardWrite: (text: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_clipboard_write", { text })),
 	/**
 	 *  **必须是 `async`**：非 async 命令跑在事件循环线程上，而 `WebviewWindowBuilder::build()`
 	 *  会把建窗口这件事投递给事件循环再阻塞等回音——同一条线程等自己，一点就整窗卡死。

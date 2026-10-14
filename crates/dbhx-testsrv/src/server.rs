@@ -110,6 +110,22 @@ impl TestSession {
     }
 }
 
+/// 登录横幅。形状照真 sshd + pam_motd：先系统欢迎词，再 `Last login`。
+///
+/// 加它的唯一目的是复现一类客户端 bug——这段字节只在登录那一瞬间写进 pty，
+/// 服务端**永远不会重画**。渲染层只要在它到达时还没把终端建起来，
+/// 用户看到的就是一个空提示符，而且再也找不回这段信息。
+fn motd() -> Vec<u8> {
+    "Welcome to Ubuntu 26.04.1 LTS (GNU/Linux 7.0.0-38-generic x86_64)\r\n\
+     \r\n\
+       * Documentation:  https://docs.ubuntu.com\r\n\
+       * Management:     https://landscape.canonical.com\r\n\
+     \r\n\
+    Last login: Wed Oct 14 12:25:52 2026 from 10.0.0.1\r\n"
+        .as_bytes()
+        .to_vec()
+}
+
 /// 提示符。`OSC 7;file://<host><path>` + BEL 终止，正是 xterm 与主流 shell 的写法。
 fn prompt(cwd: &str) -> Vec<u8> {
     format!("\x1b]7;file://dbhx-test{cwd}\x07\r\ndbhx-test:{cwd}$ ").into_bytes()
@@ -176,6 +192,8 @@ impl russh::server::Handler for TestSession {
     async fn shell_request(&mut self, channel: ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
         let cwd = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_else(|| self.shared.spec.home.clone());
+        // 真 sshd 也是这个顺序：横幅先落 pty，再交给 shell 打提示符
+        session.data(channel, motd())?;
         session.data(channel, prompt(&cwd))?;
         Ok(())
     }

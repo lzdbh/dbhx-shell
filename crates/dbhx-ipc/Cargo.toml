@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "唯一允许 use tauri:: 的 crate：dbhx plugin + 命令契约 + TS 绑定生成"
 
 [dependencies]
+arboard.workspace = true
 dbhx-model.workspace = true
 dbhx-pty.workspace = true
 dbhx-session.workspace = true

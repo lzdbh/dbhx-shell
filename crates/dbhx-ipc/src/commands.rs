@@ -4,6 +4,7 @@
 //! `#[tauri::command]` 那层负责解 `State`、转参数、把错误翻成 [`IpcError`]。
 //! 拆两层的唯一目的是**能在没有 webview 的测试里跑完全部命令**。
 
+pub mod clipboard;
 pub mod local;
 pub mod session;
 pub mod sftp;

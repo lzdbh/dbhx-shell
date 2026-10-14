@@ -20,7 +20,7 @@ use dbhx_ipc::commands::session::{close_impl as close_session_impl, open_remote_
 use dbhx_ipc::commands::sftp::{browse_impl, chmod_impl, close_impl as close_panel_impl, create_file_impl, mkdir_impl, open_for_session_impl, rename_impl, set_following_impl};
 use dbhx_ipc::commands::transfer::download_impl;
 use dbhx_ipc::commands::vault::{HostDraft, UserReply, reply_impl, set_password_impl, upsert_host_impl};
-use dbhx_ipc::events::{BusEvent, FollowHold};
+use dbhx_ipc::events::{BusEvent, FollowHold, TermData};
 use dbhx_ipc::hub;
 use dbhx_ipc::state::{BUS_QUEUE, Core};
 use dbhx_model::{AuthMode, Endpoint, ErrorCode, FileKind, KnownHost, KnownHostSource, Protocol, PtySize, TerminalEncoding};
@@ -349,4 +349,42 @@ async fn create_file_and_chmod_act_on_the_browsed_dir() {
     assert_eq!(bad.err().map(|e| e.code), Some(ErrorCode::InvalidInput), "越界权限位必须挡下来");
 
     server.shutdown().await;
+}
+
+/// 登录横幅必须原样顺着 `term_data` 送到渲染层。
+///
+/// 这一段（`Welcome to Ubuntu …` + `Last login: …`）服务端只在登录那一瞬间打一次，
+/// 之后**永远不会重画**。所以只要它在渲染层还没把终端建起来之前就到达，用户看到的
+/// 就是一个凭空少了一屏的窗口——前端为此把「挂入格子之前」的输出先攒着，而攒的前提
+/// 是后端确实把它发出来了。这条测试守住的是那个前提。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_login_banner_arrives_as_terminal_output() {
+    let server = started_server().await;
+    let (core, mut rx) = live_core("banner");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
+        .await
+        .expect("远端 shell 应当开起来");
+
+    let contains_banner = |event: &BusEvent| match event {
+        BusEvent::TermData(data) => banner_text(data).contains("Welcome to Ubuntu"),
+        _ => false,
+    };
+    let arrived = await_event(&core, &mut rx, "登录横幅", contains_banner).await;
+    let BusEvent::TermData(data) = arrived else {
+        panic!("等待横幅时收到了别的事件：{arrived:?}")
+    };
+    assert_eq!(data.session, session.id, "横幅要落在刚开的那个会话上");
+    let text = banner_text(&data);
+    assert!(text.contains("Last login: "), "横幅该连同上次登录时间一起到：{text}");
+
+    server.shutdown().await;
+}
+
+/// 事件里的 base64 解回文本。解不开就按空串算，让断言去报「没收到」。
+fn banner_text(data: &TermData) -> String {
+    let bytes = data.data.to_bytes().unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
