@@ -248,23 +248,40 @@ impl ExecOutput {
     }
 }
 
-/// 等 `Success`。`Failure` / `Close` / 超时都翻译成可区分的错误，
+/// 等 `Success`。`Failure` / `Close` / 超时翻译成可区分的错误，
 /// 让上层能分辨「服务器不支持这个 subsystem」和「网络断了」。
+///
+/// 必须**循环**而不是只看一条消息：sshd 常在 `want_reply` 的 `Success` 之前先把
+/// `WINDOW_ADJUST`（它上调我们的发送窗口，属纯流控、不携带字节）塞进队列。
+/// 若像最初那样「收到非 Success 就判定被拒」，就会把正常开着的 shell 误杀——
+/// 症状是会话刚建立就 self-teardown、前端显示「连接已关闭」。
+/// 因此这里对不携带数据的流控消息（[`ChannelMsg::WindowAdjusted`] 等）继续等，
+/// 只有明确的拒绝/关闭/超时才收手；其余异常消息记下来后同样继续，宁可让
+/// [`REQUEST_TIMEOUT`] 兜底，也不主动掐断一条活的通道。
 pub(crate) async fn confirm(
     channel: &mut WireChannel,
     request: &'static str,
 ) -> Result<(), SshError> {
-    match timeout(REQUEST_TIMEOUT, channel.wait()).await {
-        Err(_elapsed) => Err(SshError::Timeout),
-        Ok(None) => Err(SshError::Closed),
-        Ok(Some(ChannelMsg::Success)) => Ok(()),
-        Ok(Some(ChannelMsg::Failure)) | Ok(Some(ChannelMsg::Close)) => {
-            Err(SshError::refused(request))
-        }
-        Ok(Some(other)) => {
-            // 服务器先塞数据再回 Success 的可能性极低，但真遇到要能诊断
-            tracing::debug!(?other, request, "等待通道确认时收到其它消息");
-            Err(SshError::refused(request))
+    loop {
+        match timeout(REQUEST_TIMEOUT, channel.wait()).await {
+            Err(_elapsed) => return Err(SshError::Timeout),
+            Ok(None) => return Err(SshError::Closed),
+            Ok(Some(ChannelMsg::Success)) => return Ok(()),
+            Ok(Some(ChannelMsg::Failure)) | Ok(Some(ChannelMsg::Close)) => {
+                return Err(SshError::refused(request))
+            }
+            Ok(Some(ChannelMsg::OpenFailure(f))) => {
+                return Err(SshError::Russh(russh::Error::ChannelOpenFailure(f)))
+            }
+            // 不携带字节的流控消息：跳过，继续等真正的 Success
+            Ok(Some(other @ (ChannelMsg::WindowAdjusted { .. } | ChannelMsg::XonXoff { .. }))) => {
+                tracing::debug!(?other, request, "通道确认前收到流控消息，继续等待 Success");
+            }
+            Ok(Some(other)) => {
+                // 理论上 Success 先于数据；真遇到数据抢在前面也别急着判死，
+                // 记下来继续等——丢了 Success 才真没法区分「被拒」和「卡住」。
+                tracing::debug!(?other, request, "等待通道确认时收到其它消息，继续等待 Success");
+            }
         }
     }
 }
