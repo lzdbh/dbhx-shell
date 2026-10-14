@@ -16,6 +16,8 @@ pub mod commands;
 pub mod events;
 // `pub` 只为集成测试：真服务器的端到端用例要自己起唯一的会话事件读者。
 pub mod hub;
+/// 会话日志落点表。`pub` 是为了让 `hub` 与命令层共用同一份类型，不是给外部的入口。
+pub mod logsink;
 mod plansrc;
 pub mod state;
 #[cfg(test)]
@@ -48,6 +50,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "session_resize",
     "session_close",
     "session_list",
+    "session_log_start",
+    "session_log_stop",
     "vault_hosts",
     "vault_upsert_host",
     "vault_remove_host",
@@ -114,6 +118,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::session::session_resize,
             commands::session::session_close,
             commands::session::session_list,
+            commands::log::session_log_start,
+            commands::log::session_log_stop,
             commands::vault::vault_hosts,
             commands::vault::vault_upsert_host,
             commands::vault::vault_remove_host,
@@ -164,6 +170,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             events::TermData,
             events::SessionCwd,
             events::SessionEnded,
+            events::SessionLogStopped,
             events::HostKeyPending,
             events::HostKeyConflict,
             events::PassphraseRequest,

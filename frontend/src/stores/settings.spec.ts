@@ -100,4 +100,15 @@ describe('关键字高亮规则', () => {
     expect(rules[1]).toMatchObject({ pattern: 'warn', background: DEFAULT_HIGHLIGHT_COLOR })
     expect(rules[0].id).not.toBe(rules[1].id)
   })
+
+  it('日志目录留空就是「不指定」，填了要原样记住', async () => {
+    const settings = useSettingsStore()
+    expect(settings.logDir).toBe('')
+    // 会话那边把空串翻译成 null 交给后端默认目录，所以这里绝不能存成别的东西
+    settings.logDir = '  D:\\会话日志  '
+    await nextTick()
+    setActivePinia(createPinia())
+    // 首尾空格是复制粘贴时最容易带上的，Windows 上它会变成另一个打不开的目录
+    expect(useSettingsStore().logDir).toBe('D:\\会话日志')
+  })
 })

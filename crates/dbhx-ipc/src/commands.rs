@@ -6,6 +6,7 @@
 
 pub mod clipboard;
 pub mod local;
+pub mod log;
 pub mod session;
 pub mod sftp;
 pub mod transfer;

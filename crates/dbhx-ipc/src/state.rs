@@ -250,6 +250,8 @@ pub struct Core {
     /// 用 `Arc<AtomicBool>` 而非 `Core` 字段，是因为凭据来源闭包在 `Core` 之前就要建好。
     pub locked: Arc<AtomicBool>,
     batches: Mutex<HashMap<BatchId, LiveBatch>>,
+    /// 正在记录日志的会话。写只在 hub 那一个读者里顺路发生，命令层负责开与关。
+    pub logs: crate::logsink::LogRegistry,
     /// 传输进度汇聚队列的发送端，交给 `Engine::start`
     progress: mpsc::Sender<dbhx_model::TransferProgress>,
 }
@@ -308,6 +310,7 @@ impl Core {
             bus,
             locked,
             batches: Mutex::new(HashMap::new()),
+            logs: crate::logsink::LogRegistry::default(),
             progress: progress_tx,
         });
         spawn_progress_forward(Arc::downgrade(&core), progress_rx);

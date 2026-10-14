@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { message } from 'ant-design-vue'
 
 import { fileWindowApi } from '@/lib/ipc/client'
@@ -50,6 +50,21 @@ async function openPanel(): Promise<void> {
     messageApi.error(err instanceof Error ? err.message : '打开文件管理窗口失败')
   }
 }
+
+async function toggleLog(): Promise<void> {
+  const tab = activeTab.value
+  if (tab === undefined) return
+  const result = await sessions.toggleLog(tab.id)
+  if (result.ok) messageApi.success(result.text)
+  else messageApi.error(result.text)
+}
+
+// 日志写不下去 ⇒ 后端自己收了灯。这条只在这一处出现，所以取完就清，不重复弹
+watch(() => sessions.logNotice, (text) => {
+  if (text === null) return
+  sessions.takeLogNotice()
+  messageApi.warning(text)
+})
 </script>
 
 <template>
@@ -64,6 +79,8 @@ async function openPanel(): Promise<void> {
         @click="sessions.activate(tab.id)"
       >
         <span class="dot" :class="tab.status" />
+        <!-- 正在记录的那一格自己带灯：多标签时不用切过去看按钮状态 -->
+        <span v-if="tab.logPath" class="rec" :title="`正在记录：${tab.logPath}`" />
         <span class="label">{{ tab.label }}</span>
         <span v-if="tab.cwd" class="cwd">{{ tab.cwd }}</span>
         <span v-if="tab.error" class="error" :title="tab.error">!</span>
@@ -94,6 +111,18 @@ async function openPanel(): Promise<void> {
       <a-button size="small" :disabled="sessions.activeId === null" @click="void openPanel()">
         文件面板
       </a-button>
+      <a-tooltip
+        :title="activeTab?.logPath ? '停止记录会话日志' : '把当前会话的输出原样抄进本地文件（口令也会被抄进去）'"
+      >
+        <a-button
+          size="small"
+          :type="activeTab?.logPath ? 'primary' : 'default'"
+          :disabled="activeTab === undefined"
+          @click="void toggleLog()"
+        >
+          日志
+        </a-button>
+      </a-tooltip>
       <a-tag v-if="activeTab" :color="activeTab.status === 'connected' ? 'green' : 'default'">
         {{ STATUS_TEXT[activeTab.status] ?? '' }}
       </a-tag>
@@ -163,6 +192,34 @@ async function openPanel(): Promise<void> {
 .dot.closed {
   background: transparent;
   border: 1px solid #8c8c8c;
+}
+
+/* 录制中的红点。和状态点同尺寸，靠颜色和呼吸区分：多标签时一眼看出哪一格在写文件 */
+.rec {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ff4d4f;
+  flex: none;
+  animation: rec-breathe 1.8s ease-in-out infinite;
+}
+
+@keyframes rec-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* 前庭敏感的用户不该被一个 blinking 的点折磨，指示灯灭成常亮就行 */
+@media (prefers-reduced-motion: reduce) {
+  .rec {
+    animation: none;
+  }
 }
 
 .label {

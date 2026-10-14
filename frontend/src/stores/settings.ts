@@ -65,6 +65,13 @@ export const useSettingsStore = defineStore('settings', () => {
   const fontSize = ref(DEFAULT_FONT_SIZE)
   /** 面板宽度（px）。拖过一次就记住，省得每次开应用重新调。 */
   const panelWidth = ref(360)
+  /**
+   * 会话日志的目录。空串表示「不指定」，由后端落在应用数据目录的 `logs` 下。
+   *
+   * 放在前端而不是让后端记住：换一个目录是一次纯偏好改动，不该为了它动 vault。
+   * 后端只接受**绝对路径**，所以这里存什么就原样传什么，不做任何拼接。
+   */
+  const logDir = ref('')
   /** 关键字高亮规则，顺序即优先级：重叠时排在前面的赢。 */
   const highlightRules = ref<HighlightRule[]>([...DEFAULT_HIGHLIGHTS])
 
@@ -111,8 +118,9 @@ export const useSettingsStore = defineStore('settings', () => {
     const raw = localStorage.getItem(KEY)
     if (!raw) return
     try {
-      const saved = JSON.parse(raw) as Partial<{ downloadDir: string, fontSize: number, panelWidth: number, highlightRules: unknown }>
+      const saved = JSON.parse(raw) as Partial<{ downloadDir: string, logDir: string, fontSize: number, panelWidth: number, highlightRules: unknown }>
       if (typeof saved.downloadDir === 'string') downloadDir.value = saved.downloadDir
+      if (typeof saved.logDir === 'string') logDir.value = saved.logDir.trim()
       // 字号夹回区间：手工改过的 localStorage 不该让终端一开屏就是 200px
       if (typeof saved.fontSize === 'number') {
         fontSize.value = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, Math.round(saved.fontSize)))
@@ -127,14 +135,15 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   load()
-  watch([downloadDir, fontSize, panelWidth, highlightRules], () => {
+  watch([downloadDir, logDir, fontSize, panelWidth, highlightRules], () => {
     localStorage.setItem(KEY, JSON.stringify({
       downloadDir: downloadDir.value,
+      logDir: logDir.value,
       fontSize: fontSize.value,
       panelWidth: panelWidth.value,
       highlightRules: highlightRules.value,
     }))
   }, { deep: true })
 
-  return { downloadDir, fontSize, panelWidth, highlightRules, addHighlightRule, removeHighlightRule, zoom, resetZoom, zoomPercent }
+  return { downloadDir, logDir, fontSize, panelWidth, highlightRules, addHighlightRule, removeHighlightRule, zoom, resetZoom, zoomPercent }
 })

@@ -33,6 +33,10 @@ export async function startEventBridge(): Promise<() => void> {
     events.sessionEnded.listen(({ payload }) => {
       sessions.markEnded(payload.session, payload.exit_status, payload.signal)
     }),
+    // 日志只有「写不下去」才会自己停：灯要跟着灭，理由要交给用户，否则一份断掉的日志看起来像在记
+    events.sessionLogStopped.listen(({ payload }) => {
+      sessions.markLogStopped(payload.session, payload.path, payload.reason)
+    }),
     events.sftpFollowed.listen(({ payload }) => {
       files.onFollowed(payload)
     }),

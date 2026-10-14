@@ -41,6 +41,18 @@ pub struct SessionEnded {
     pub signal: Option<String>,
 }
 
+/// 日志停了，但不是用户按的停。
+///
+/// 只有「写不下去」才发这一条：用户手动停止由命令的返回值交代，会话结束则整个
+/// 标签都要消失，发事件只是多此一举。前端据此把「正在记录」的指示灯收回，
+/// 否则它会一直亮着骗人。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct SessionLogStopped {
+    pub session: SessionId,
+    pub path: String,
+    pub reason: String,
+}
+
 /// 首次见到这台主机的工作密钥，等用户确认。
 ///
 /// `request` 是回话句柄：用户点「信任并保存」要把它带回 `hostkey_reply`。
@@ -132,6 +144,7 @@ pub enum BusEvent {
     TermData(TermData),
     SessionCwd(SessionCwd),
     SessionEnded(SessionEnded),
+    SessionLogStopped(SessionLogStopped),
     HostKeyPending(HostKeyPending),
     HostKeyConflict(HostKeyConflict),
     PassphraseRequest(PassphraseRequest),
@@ -150,6 +163,7 @@ impl BusEvent {
             Self::TermData(_) => TermData::NAME,
             Self::SessionCwd(_) => SessionCwd::NAME,
             Self::SessionEnded(_) => SessionEnded::NAME,
+            Self::SessionLogStopped(_) => SessionLogStopped::NAME,
             Self::HostKeyPending(_) => HostKeyPending::NAME,
             Self::HostKeyConflict(_) => HostKeyConflict::NAME,
             Self::PassphraseRequest(_) => PassphraseRequest::NAME,
@@ -167,6 +181,7 @@ impl BusEvent {
             Self::TermData(e) => e.emit(app),
             Self::SessionCwd(e) => e.emit(app),
             Self::SessionEnded(e) => e.emit(app),
+            Self::SessionLogStopped(e) => e.emit(app),
             Self::HostKeyPending(e) => e.emit(app),
             Self::HostKeyConflict(e) => e.emit(app),
             Self::PassphraseRequest(e) => e.emit(app),

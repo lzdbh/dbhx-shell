@@ -228,6 +228,14 @@ function splitPattern(pattern: string): { host: string, port: number } {
         <!-- 没接系统保存对话框：目录由用户写死，下载按钮才知道往哪放 -->
         <a-input v-model:value="settings.downloadDir" placeholder="D:\Downloads 或 /home/dong/Downloads" />
       </a-form-item>
+      <a-form-item label="日志目录">
+        <!-- 留空 = 应用数据目录下的 logs。目录由后端创建，这里只存一个绝对路径 -->
+        <a-input v-model:value="settings.logDir" placeholder="留空则用应用数据目录下的 logs" />
+      </a-form-item>
+      <p class="hint-line">
+        日志抄的是终端收到的原始字节，包括被回显出来的口令与密钥片段。只写在本机，
+        要发给别人之前先自己看一遍。
+      </p>
 
       <a-divider orientation="left">
         应用锁

@@ -42,6 +42,14 @@ export const sessionApi = {
   resize: (session: SessionId, pty: PtySize) => unwrap(commands.sessionResize(session, pty)),
   close: (session: SessionId) => unwrap(commands.sessionClose(session)),
   list: () => unwrap(commands.sessionList()),
+  /**
+   * 开始抄录某个会话的输出。`dir` 传 null 时落在后端应用数据目录的 `logs` 下；
+   * `fileName` 必须是一个**纯名字**，带分隔符或盘符的会被后端拒绝。
+   */
+  logStart: (session: SessionId, dir: string | null, fileName: string) =>
+    unwrap(commands.sessionLogStart(session, dir, fileName)),
+  /** 停止抄录，回落点与已写字节数。没在记时后端报 not_found。 */
+  logStop: (session: SessionId) => unwrap(commands.sessionLogStop(session)),
 }
 
 export const vaultApi = {

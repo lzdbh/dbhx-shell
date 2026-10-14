@@ -1,4 +1,4 @@
-//! 会话事件 ⇒ 前端事件 + 文件面板跟随。
+//! 会话事件 ⇒ 前端事件 + 文件面板跟随 + 日志抄一份。
 //!
 //! 这一层是**胶水**，刻意不写业务判断：目录该不该跳、跳到哪儿，全部是
 //! `dbhx-sftp::follow::FollowGate` 的决定（那边有完整的离线单测）。
@@ -14,7 +14,7 @@ use dbhx_session::SessionEvent;
 use dbhx_sftp::CwdSource;
 use tokio::sync::mpsc;
 
-use crate::events::{BusEvent, FollowHold, SessionCwd, SessionEnded, TermData};
+use crate::events::{BusEvent, FollowHold, SessionCwd, SessionEnded, SessionLogStopped, TermData};
 use crate::state::Core;
 
 /// 唯一的会话事件读者。跑在 tauri 的异步运行时上，直到事件流自己结束。
@@ -29,12 +29,26 @@ pub async fn run_hub(core: Arc<Core>, mut rx: mpsc::Receiver<SessionEvent>) {
                     tracing::warn!("事件总线已关闭，会话输出无处可去");
                     return;
                 }
+                // 抄日志放在**发完之后**：一次写几 KB、跑在 tokio 的阻塞线程池上，
+                // 正常终端流量下等它的时间可以忽略。真要图快也不能改成丢弃——日志漏一段
+                // 比终端慢一点严重得多。写不下去时只断这一份副本，顺带告诉前端开关该复位。
+                if let Err(failure) = core.logs.tee(id, bytes.as_ref()).await {
+                    tracing::warn!(session = id.0, path = %failure.summary.path, "会话日志写入失败：{}", failure.reason);
+                    let reason = failure.message();
+                    core.emit(BusEvent::SessionLogStopped(SessionLogStopped {
+                        session: id,
+                        path: failure.summary.path,
+                        reason,
+                    }));
+                }
             }
             SessionEvent::Cwd { id, path } => {
                 core.emit(BusEvent::SessionCwd(SessionCwd { session: id, path: path.clone() }));
                 follow_cwd(&core, id, &path).await;
             }
             SessionEvent::Ended { id, info } => {
+                // tab 没了，日志也就没有下一个字节：在这里收尾，而不是等前端记得来点「停止」
+                core.logs.close_quietly(id).await;
                 core.emit(BusEvent::SessionEnded(SessionEnded {
                     session: id,
                     exit_status: info.exit_status,

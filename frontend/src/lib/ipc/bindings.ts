@@ -28,6 +28,8 @@ export const commands = {
 	sessionResize: (session: SessionId, pty: PtySize) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|session_resize", { session, pty })),
 	sessionClose: (session: SessionId) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|session_close", { session })),
 	sessionList: () => typedError<SessionInfo[], IpcError>(__TAURI_INVOKE("plugin:dbhx|session_list")),
+	sessionLogStart: (session: SessionId, dir: string | null, fileName: string) => typedError<LogSummary, IpcError>(__TAURI_INVOKE("plugin:dbhx|session_log_start", { session, dir, fileName })),
+	sessionLogStop: (session: SessionId) => typedError<LogSummary, IpcError>(__TAURI_INVOKE("plugin:dbhx|session_log_stop", { session })),
 	vaultHosts: () => typedError<HostInfo[], IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_hosts")),
 	/**  新建或修改主机。**不会改动已存的口令**，改口令是另一条命令。 */
 	vaultUpsertHost: (draft: HostDraft) => typedError<HostId, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_upsert_host", { draft })),
@@ -101,6 +103,7 @@ export const events = {
 	passphraseRequest: makeEvent<PassphraseRequest>("plugin:dbhx:passphrase-request"),
 	sessionCwd: makeEvent<SessionCwd>("plugin:dbhx:session-cwd"),
 	sessionEnded: makeEvent<SessionEnded>("plugin:dbhx:session-ended"),
+	sessionLogStopped: makeEvent<SessionLogStopped>("plugin:dbhx:session-log-stopped"),
 	sftpCwdChanged: makeEvent<SftpCwdChanged>("plugin:dbhx:sftp-cwd-changed"),
 	sftpFollowed: makeEvent<SftpFollowed>("plugin:dbhx:sftp-followed"),
 	termData: makeEvent<TermData>("plugin:dbhx:term-data"),
@@ -371,6 +374,12 @@ export type LockStatus = {
 	has_pin: boolean,
 };
 
+/**  停止记录之后回给前端的结果。 */
+export type LogSummary = {
+	path: string,
+	bytes: number,
+};
+
 /**  打开面板的结果。 */
 export type PanelInfo = {
 	connection: number,
@@ -441,6 +450,19 @@ export type SessionInfo = {
 	live_endpoint: LiveEndpoint | null,
 	pty: PtySize,
 	encoding: TerminalEncoding,
+};
+
+/**
+ *  日志停了，但不是用户按的停。
+ * 
+ *  只有「写不下去」才发这一条：用户手动停止由命令的返回值交代，会话结束则整个
+ *  标签都要消失，发事件只是多此一举。前端据此把「正在记录」的指示灯收回，
+ *  否则它会一直亮着骗人。
+ */
+export type SessionLogStopped = {
+	session: SessionId,
+	path: string,
+	reason: string,
 };
 
 export type SessionStatus = "connecting" | "connected" | "closed" | "error";

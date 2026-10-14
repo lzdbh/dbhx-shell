@@ -6,7 +6,9 @@ import type { LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo, SessionSt
 import { sessionApi } from '../lib/ipc/client'
 import { utf8Array } from '../lib/bytes'
 import { destroyTerminal } from '../lib/terminal/registry'
+import { logFileName } from '../lib/terminal/logName'
 import { describeIpcError, normalizeIpcError } from '../lib/ipc/errors'
+import { useSettingsStore } from './settings'
 
 /**
  * 一个标签页。
@@ -26,13 +28,30 @@ export interface SessionTab {
   cwd: string | null
   /** 出错时的中文说明，标签页上以角标提示，正文不进状态栏 */
   error: string | null
+  /** 正在记录的日志文件全路径；`null` 表示这个会话没在记。 */
+  logPath: string | null
 }
 
 const DEFAULT_PTY: PtySize = { rows: 30, cols: 110 }
 
+/** 一次日志开关的结果，直接是给 UI 看的那句话。 */
+export interface LogToggleResult {
+  ok: boolean
+  text: string
+}
+
 export const useSessionsStore = defineStore('sessions', () => {
   const tabs = ref<SessionTab[]>([])
   const activeId = ref<SessionId | null>(null)
+  /**
+   * 日志**自己**停了的那次说明。
+   *
+   * 只有一处会写它：后端写到一半失败（磁盘满是常见的一种）。组件读它弹提示，
+   * 弹完立刻清空——放在 store 里是为了让「指示灯复位」和「给用户一句话」出自同一个事实，
+   * 不至于指示灯灭了、用户却不知道为什么会了。
+   */
+  const logNotice = ref<string | null>(null)
+  const settings = useSettingsStore()
 
   function tab(id: SessionId): SessionTab | undefined {
     return tabs.value.find(t => t.id === id)
@@ -54,6 +73,7 @@ export const useSessionsStore = defineStore('sessions', () => {
       pty: info.pty,
       cwd: null,
       error: null,
+      logPath: null,
     }
     tabs.value.push(created)
     return created
@@ -120,7 +140,67 @@ export const useSessionsStore = defineStore('sessions', () => {
     }
   }
 
-  /* 下面三个是事件入口，由 lib/ipc/bus.ts 调用 */
+  /* 下面是事件入口与日志开关，事件那一组由 lib/ipc/bus.ts 调用 */
+
+  /**
+   * 后端自己停了日志（写不下去）。灯必须跟着灭，理由留给 UI 说一句。
+   *
+   * 按会话号清，不按路径核对：事件说的是「这个会话不再写了」，这就是权威结论。
+   * 前端手上那个路径就算和它对不上，也只会让提示里的路径旧一格，不值得为它整体重取。
+   */
+  function markLogStopped(id: SessionId, path: string, reason: string): void {
+    const target = tab(id)
+    if (!target) return
+    target.logPath = null
+    logNotice.value = `${reason}，日志已停在 ${path}`
+  }
+
+  function takeLogNotice(): string | null {
+    const text = logNotice.value
+    logNotice.value = null
+    return text
+  }
+
+  /**
+   * 开始记录某个会话的输出。`dir` 留空时后端落在自己的应用数据目录下。
+   *
+   * 文件名在这里按**标签页标题 + 本地时刻**生成：同一个会话反复开关会攒出多份日志，
+   * 只有秒级时间戳能把它们分开；标题让用户不必打开文件就知道是哪一屏。
+   */
+  async function startLog(id: SessionId): Promise<LogToggleResult> {
+    const target = tab(id)
+    if (!target) return { ok: false, text: '会话已经不在了' }
+    // 首尾空白是粘路径时带进来的，后端会当成另一个目录，这里先收掉；全空才是「不指定」
+    const dir = settings.logDir.trim()
+    try {
+      const summary = await sessionApi.logStart(id, dir === '' ? null : dir, logFileName(target.label, new Date()))
+      target.logPath = summary.path
+      return { ok: true, text: `正在记录到 ${summary.path}` }
+    } catch (err) {
+      return { ok: false, text: describeIpcError(normalizeIpcError(err)) }
+    }
+  }
+
+  async function stopLog(id: SessionId): Promise<LogToggleResult> {
+    const target = tab(id)
+    try {
+      const summary = await sessionApi.logStop(id)
+      if (target) target.logPath = null
+      return { ok: true, text: `日志已写入 ${summary.path}（${summary.bytes} 字节）` }
+    } catch (err) {
+      const error = normalizeIpcError(err)
+      // 后端说「没在记」⇒ 前端的亮灯是错的，就地灭掉，别让下一次点击变成「开始」
+      if (error.code === 'not_found' && target) target.logPath = null
+      return { ok: false, text: describeIpcError(error) }
+    }
+  }
+
+  /** 标签页上的开关：没在记就开始，正在记就停。 */
+  async function toggleLog(id: SessionId): Promise<LogToggleResult> {
+    const target = tab(id)
+    if (!target) return { ok: false, text: '会话已经不在了' }
+    return target.logPath === null ? startLog(id) : stopLog(id)
+  }
 
   function setCwd(id: SessionId, path: string): void {
     const target = tab(id)
@@ -168,7 +248,25 @@ export const useSessionsStore = defineStore('sessions', () => {
     activeId.value = id
   }
 
-  return { tabs, activeId, tab, openRemote, openLocal, close, send, reportResize, setCwd, setStatus, markEnded, refresh, activate }
+  return {
+    tabs,
+    activeId,
+    logNotice,
+    tab,
+    openRemote,
+    openLocal,
+    close,
+    send,
+    reportResize,
+    setCwd,
+    setStatus,
+    markEnded,
+    markLogStopped,
+    takeLogNotice,
+    toggleLog,
+    refresh,
+    activate,
+  }
 })
 
 function describeExit(exitStatus: number | null, signal: string | null): string {

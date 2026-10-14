@@ -18,6 +18,8 @@ fn main() {
                     "session_resize",
                     "session_close",
                     "session_list",
+                    "session_log_start",
+                    "session_log_stop",
                     "vault_hosts",
                     "vault_upsert_host",
                     "vault_remove_host",

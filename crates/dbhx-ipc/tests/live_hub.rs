@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dbhx_ipc::commands::log::{start_impl as start_log_impl, stop_impl as stop_log_impl};
 use dbhx_ipc::commands::session::{close_impl as close_session_impl, open_remote_impl, write_impl};
 use dbhx_ipc::commands::sftp::{browse_impl, chmod_impl, close_impl as close_panel_impl, create_file_impl, mkdir_impl, open_for_session_impl, rename_impl, set_following_impl};
 use dbhx_ipc::commands::transfer::download_impl;
@@ -353,6 +354,63 @@ async fn create_file_and_chmod_act_on_the_browsed_dir() {
     assert_eq!(bad.err().map(|e| e.code), Some(ErrorCode::InvalidInput), "越界权限位必须挡下来");
 
     server.shutdown().await;
+}
+
+/// 会话日志抄的是经过 hub 的那一份**原始字节**。
+///
+/// 只有对着真服务器才验得出意义：日志挂在唯一读者顺路抄，抄错会话、少抄一段、
+/// 停止之后还在写，这些都是离线单测碰不到的接缝。抄的必须是**原始字节**（这里用
+/// 终端的 CRLF 行尾做见证）——把转义序列洗掉之后，`top`、`vim` 那类全屏程序的日志
+/// 就是一堆叠在一起的残骸，比留着更难读。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_log_copies_what_the_terminal_received_and_stops_when_told() {
+    let server = started_server().await;
+    let (core, mut rx) = live_core("logging");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
+        .await
+        .expect("远端 shell 应当开起来");
+    await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
+
+    let started = start_log_impl(core.as_ref(), session.id, None, "现场日志.log").await.expect("日志应当开起来");
+    write_impl(core.as_ref(), session.id, b"echo dbhx-log-marker\r".to_vec()).await.unwrap();
+
+    let text = wait_for_file_text(&started.path, "echo dbhx-log-marker").await;
+    assert!(text.contains("dbhx-log-marker"), "命令与其回显都要落进日志：{text}");
+    assert!(text.contains("\r\n"), "抄的是原始字节流，行尾不该被改成 \\n：{text:?}");
+
+    let stopped = stop_log_impl(core.as_ref(), session.id).await.unwrap();
+    assert_eq!(stopped.path, started.path, "停止回的路径必须就是开始那一个");
+    assert!(stopped.bytes > 0, "已经抄到的字节数要如实报出来");
+    let before = std::fs::read(&started.path).unwrap();
+
+    write_impl(core.as_ref(), session.id, b"echo after-the-stop\r".to_vec()).await.unwrap();
+    // 先把这条输出真正等到 hub 那儿走一趟，再回头看文件——否则「没写」只是因为还没到
+    await_event(&core, &mut rx, "停止之后的输出", |e| match e {
+        BusEvent::TermData(d) => d.session == session.id && String::from_utf8_lossy(&d.data.to_bytes().unwrap_or_default()).contains("after-the-stop"),
+        _ => false,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(std::fs::read(&started.path).unwrap(), before, "停止之后一个字都不该再多写");
+
+    close_session_impl(core.as_ref(), session.id).await.unwrap();
+    server.shutdown().await;
+}
+
+/// 轮询等文件里出现某段文本。日志是 hub 顺路写的，没有事件可等。
+async fn wait_for_file_text(path: &str, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "等「{needle}」落进 {path} 超时");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// 登录横幅必须原样顺着 `term_data` 送到渲染层。
