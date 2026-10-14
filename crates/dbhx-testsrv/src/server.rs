@@ -29,6 +29,12 @@ pub struct TestSpec {
     pub banner: Option<String>,
     /// 公钥认证是否一律接受。关掉它才能测「只有密码对」的分支。
     pub accept_publickey: bool,
+    /// 登录横幅写在 `shell` 的 `Success` **之前**。
+    ///
+    /// 真 sshd 就是这种形状：发确认与 fork 出来的子进程往 pty 里写横幅是两条并行的路，
+    /// 谁先到只看那一瞬间的调度。客户端如果在「等 Success」时把先到的 `Data` 扔掉，
+    /// 症状就是连上主机后横幅时有时无——而且这段字节永远不会重发。
+    pub banner_before_success: bool,
 }
 
 impl TestSpec {
@@ -45,7 +51,14 @@ impl TestSpec {
             })),
             banner: None,
             accept_publickey: true,
+            banner_before_success: false,
         }
+    }
+
+    /// 让登录横幅抢在 `shell` 的 `Success` 之前发出，模拟真 sshd 的那个竞争。
+    pub fn with_banner_before_success(mut self) -> Self {
+        self.banner_before_success = true;
+        self
     }
 
     /// 换掉整棵目录树。测试要的场景（符号链接、大文件、只读目录）由调用方搭。
@@ -190,10 +203,16 @@ impl russh::server::Handler for TestSession {
     }
 
     async fn shell_request(&mut self, channel: ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
         let cwd = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_else(|| self.shared.spec.home.clone());
         // 真 sshd 也是这个顺序：横幅先落 pty，再交给 shell 打提示符
-        session.data(channel, motd())?;
+        if self.shared.spec.banner_before_success {
+            // 抢在确认前面，复刻真服务器上「fork 子进程」与「发 Success」并行赛跑的那种时序
+            session.data(channel, motd())?;
+            session.channel_success(channel)?;
+        } else {
+            session.channel_success(channel)?;
+            session.data(channel, motd())?;
+        }
         session.data(channel, prompt(&cwd))?;
         Ok(())
     }

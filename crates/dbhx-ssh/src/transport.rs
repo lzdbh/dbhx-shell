@@ -409,10 +409,10 @@ async fn open_shell(
     channel
         .request_pty(true, term, u32::from(pty.cols), u32::from(pty.rows), 0, 0, &[])
         .await?;
-    confirm(&mut channel, "pty-req").await?;
+    let mut early = confirm(&mut channel, "pty-req").await?;
     channel.request_shell(true).await?;
-    confirm(&mut channel, "shell").await?;
-    Ok(SplitChannel::new(channel))
+    early.extend(confirm(&mut channel, "shell").await?);
+    Ok(SplitChannel::with_early(channel, early))
 }
 
 /// 无 PTY 的 exec：留给 SFTP 之外的探测（`pwd`、版本号）。
@@ -423,8 +423,8 @@ async fn open_exec(
 ) -> Result<SplitChannel, SshError> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, command.as_bytes()).await?;
-    confirm(&mut channel, "exec").await?;
-    Ok(SplitChannel::new(channel))
+    let early = confirm(&mut channel, "exec").await?;
+    Ok(SplitChannel::with_early(channel, early))
 }
 
 async fn open_subsystem(
@@ -434,7 +434,12 @@ async fn open_subsystem(
     let mut channel = handle.channel_open_session().await?;
     channel.request_subsystem(true, name).await?;
     // 老服务器（某些 Cisco 跳板）根本没装 sftp-server，这里会是 Failure
-    confirm(&mut channel, "subsystem").await?;
+    // sftp 是纯请求驱动的：服务器在收到第一个报文之前不会写任何字节，
+    // 所以确认阶段不可能有输出要接管。真出现了就是协议异常，留一条日志好查。
+    let early = confirm(&mut channel, "subsystem").await?;
+    if !early.is_empty() {
+        tracing::warn!(name, count = early.len(), "子系统确认前收到意外数据，已丢弃");
+    }
     Ok(channel.into_stream())
 }
 

@@ -121,7 +121,11 @@ fn register_host(core: &Arc<Core>, server: &TestServer) -> dbhx_model::HostId {
 }
 
 async fn started_server() -> TestServer {
-    TestServer::start(TestSpec::new().with_fs(sample_fs())).await.expect("测试服务器起不来")
+    server_running(TestSpec::new().with_fs(sample_fs())).await
+}
+
+async fn server_running(spec: TestSpec) -> TestServer {
+    TestServer::start(spec).await.expect("测试服务器起不来")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -387,4 +391,45 @@ async fn the_login_banner_arrives_as_terminal_output() {
 fn banner_text(data: &TermData) -> String {
     let bytes = data.data.to_bytes().unwrap_or_default();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// 横幅抢在 `shell` 的 `Success` 之前到达时，也必须一个字节都不少。
+///
+/// 真 sshd 里「回确认」和「fork 子进程往 pty 写横幅」是两条并行的路，谁先到纯看调度。
+/// 客户端等 `Success` 的循环如果把先到的 `Data` 记条日志就扔掉，症状是连上主机后
+/// 横幅时有时无，而且这段输出服务器只发一次，丢了永远补不回来。
+/// 上面那条测试走的是「确认先到」的顺利时序，抓不住这个 bug。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_banner_arriving_before_the_success_is_not_swallowed() {
+    let server = server_running(TestSpec::new().with_fs(sample_fs()).with_banner_before_success()).await;
+    let (core, mut rx) = live_core("banner-race");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
+        .await
+        .expect("远端 shell 应当开起来");
+
+    // 攒到提示符出现，再整段比对：少一块、错一位都过不了
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let event = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("等提示符超时")
+            .expect("事件总线已关闭");
+        match event {
+            BusEvent::TermData(data) if data.session == session.id => {
+                got.extend_from_slice(&data.data.to_bytes().unwrap_or_default());
+                if String::from_utf8_lossy(&got).contains("dbhx-test:") {
+                    break;
+                }
+            }
+            // OSC 7 的目录事件与结束事件都可能插进来，本用例只清点字节流
+            _ => {}
+        }
+    }
+    let text = String::from_utf8_lossy(&got).into_owned();
+    assert!(text.starts_with("Welcome to Ubuntu"), "横幅必须完整地排在最前面：{text}");
+    assert!(text.contains("Last login: "), "横幅该连同上次登录时间一起到：{text}");
 }
