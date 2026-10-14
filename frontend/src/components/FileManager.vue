@@ -6,11 +6,12 @@ import { theme } from 'ant-design-vue'
 import type { FileEntry } from '@/lib/ipc/bindings'
 import { localApi } from '@/lib/ipc/client'
 import { startEventBridge } from '@/lib/ipc/bus'
-import { formatSize, formatTime, localJoin, localParent, parentPath } from '@/lib/format'
+import { localJoin, localParent, parentPath } from '@/lib/format'
 import { useFilesStore } from '@/stores/files'
 import { useHostsStore } from '@/stores/hosts'
 import { useThemeStore } from '@/stores/theme'
 import { useTransfersStore } from '@/stores/transfers'
+import FilePane from '@/components/FilePane.vue'
 import TransferTray from '@/components/TransferTray.vue'
 
 const props = defineProps<{ hostId: string }>()
@@ -63,25 +64,20 @@ async function loadLocal(path: string | null): Promise<void> {
   }
 }
 
-async function localUp(): Promise<void> {
+/** 资源管理器的地址栏就是「敲一个路径过去」，本机栏要接受盘符根、UNC 之外的任意绝对路径。 */
+function localGo(target: string): void {
+  void loadLocal(target)
+}
+
+function localUp(): void {
   const parent = localParent(local.path)
-  if (parent !== null) await loadLocal(parent)
+  if (parent !== null) void loadLocal(parent)
 }
 
-function localEnter(entry: FileEntry): void {
-  if (entry.kind === 'dir') void loadLocal(entry.path)
-}
-
-const localMkdirOpen = ref(false)
-const localMkdirName = ref('')
-
-async function submitLocalMkdir(): Promise<void> {
-  const name = localMkdirName.value.trim()
-  localMkdirOpen.value = false
-  localMkdirName.value = ''
-  if (!name) return
+async function localCreate(name: string, kind: 'dir' | 'file'): Promise<void> {
   try {
-    await localApi.mkdir(localJoin(local.path, name))
+    if (kind === 'dir') await localApi.mkdir(localJoin(local.path, name))
+    else await localApi.createFile(localJoin(local.path, name))
     await loadLocal(local.path)
   }
   catch (err) {
@@ -89,32 +85,23 @@ async function submitLocalMkdir(): Promise<void> {
   }
 }
 
-async function localRemove(raw: unknown): Promise<void> {
-  const entry = raw as FileEntry
-  try {
-    await localApi.remove(entry.path, entry.kind === 'dir')
-    await loadLocal(local.path)
+async function localRemoveMany(entries: FileEntry[]): Promise<void> {
+  let failure: string | null = null
+  for (const entry of entries) {
+    try {
+      await localApi.remove(entry.path, entry.kind === 'dir')
+    }
+    catch (err) {
+      failure = `${entry.name}：${message(err)}`
+      break
+    }
   }
-  catch (err) {
-    local.error = message(err)
-  }
+  await loadLocal(local.path)
+  // loadLocal 成功会把 error 清掉，所以这条要补在它后面
+  if (failure !== null) local.error = failure
 }
 
-const localRename = reactive({ open: false, from: null as FileEntry | null, to: '' })
-
-function startLocalRename(raw: unknown): void {
-  const entry = raw as FileEntry
-  localRename.from = entry
-  localRename.to = entry.name
-  localRename.open = true
-}
-
-async function submitLocalRename(): Promise<void> {
-  const from = localRename.from
-  const name = localRename.to.trim()
-  localRename.open = false
-  localRename.from = null
-  if (!from || !name) return
+async function localRename(from: FileEntry, name: string): Promise<void> {
   const parent = localParent(from.path)
   if (parent === null) return
   try {
@@ -126,6 +113,12 @@ async function submitLocalRename(): Promise<void> {
   }
 }
 
+/** 双击：目录就进去，文件交给系统关联程序。 */
+function localOpen(entry: FileEntry): void {
+  if (entry.kind === 'dir') void loadLocal(entry.path)
+  else void localApi.open(entry.path).catch((err: unknown) => { local.error = message(err) })
+}
+
 /* ── 远端栏 ────────────────────────────────────────────── */
 
 const conn = ref<number | null>(null)
@@ -133,9 +126,10 @@ const remoteError = ref<string | null>(null)
 const remoteSelected = ref<string[]>([])
 
 const panel = computed(() => (conn.value === null ? undefined : files.panel(conn.value)))
-const remoteLoading = computed(() => panel.value?.loading ?? false)
 const remotePath = computed(() => panel.value?.path ?? '')
 const remoteEntries = computed<FileEntry[]>(() => panel.value?.entries ?? [])
+const remoteLoading = computed(() => panel.value?.loading ?? false)
+const remoteBusy = computed(() => panel.value?.busy ?? null)
 
 async function openRemote(): Promise<void> {
   const opened = await files.openForHost(props.hostId)
@@ -149,48 +143,40 @@ async function browseRemote(target: string | null): Promise<void> {
   remoteSelected.value = []
 }
 
-async function remoteUp(): Promise<void> {
-  if (remotePath.value === '/') return
-  await browseRemote(parentPath(remotePath.value))
-}
-
-function remoteEnter(entry: FileEntry): void {
-  if (entry.kind === 'dir') void browseRemote(entry.path)
-}
-
-const remoteMkdirOpen = ref(false)
-const remoteMkdirName = ref('')
-
-async function submitRemoteMkdir(): Promise<void> {
-  const name = remoteMkdirName.value.trim()
-  remoteMkdirOpen.value = false
-  remoteMkdirName.value = ''
-  if (!name || conn.value === null) return
+async function remoteMkdir(name: string): Promise<void> {
+  if (conn.value === null) return
   if (!(await files.mkdir(conn.value, name))) remoteError.value = panel.value?.error ?? '新建目录失败'
 }
 
-async function remoteRemove(raw: unknown): Promise<void> {
+async function remoteCreateFile(name: string): Promise<void> {
   if (conn.value === null) return
-  const entry = raw as FileEntry
-  if (!(await files.remove(conn.value, entry))) remoteError.value = panel.value?.error ?? '删除失败'
+  if (!(await files.createFile(conn.value, name))) remoteError.value = panel.value?.error ?? '新建文件失败'
 }
 
-const remoteRename = reactive({ open: false, from: null as FileEntry | null, to: '' })
-
-function startRemoteRename(raw: unknown): void {
-  const entry = raw as FileEntry
-  remoteRename.from = entry
-  remoteRename.to = entry.name
-  remoteRename.open = true
-}
-
-async function submitRemoteRename(): Promise<void> {
-  const from = remoteRename.from
-  const name = remoteRename.to.trim()
-  remoteRename.open = false
-  remoteRename.from = null
-  if (!from || !name || conn.value === null) return
+async function remoteRename(from: FileEntry, name: string): Promise<void> {
+  if (conn.value === null) return
   if (!(await files.rename(conn.value, from, name))) remoteError.value = panel.value?.error ?? '重命名失败'
+}
+
+async function remoteRemoveMany(entries: FileEntry[]): Promise<void> {
+  if (conn.value === null) return
+  if (!(await files.removeMany(conn.value, entries))) remoteError.value = panel.value?.error ?? '删除失败'
+}
+
+async function remoteChmod(entry: FileEntry, mode: number): Promise<void> {
+  if (conn.value === null) return
+  if (!(await files.chmod(conn.value, entry, mode))) remoteError.value = panel.value?.error ?? '改权限失败'
+}
+
+/** 填名字期间压住目录跟随，否则用户敲一半面板被终端拽走。 */
+function remoteEditing(editing: boolean): void {
+  if (conn.value !== null) void files.setEditing(conn.value, editing)
+}
+
+function remoteOpen(entry: FileEntry): void {
+  if (conn.value === null) return
+  if (entry.kind === 'dir') void browseRemote(entry.path)
+  else void files.editRemote(conn.value, entry)
 }
 
 /* ── 两栏之间传输 ──────────────────────────────────────── */
@@ -207,18 +193,12 @@ const canDownload = computed(() => conn.value !== null && remoteSelected.value.l
  */
 const pendingRefresh = ref<(() => Promise<void>) | null>(null)
 
-watch(() => transfers.runningBatches.length, async (remaining) => {
-  if (remaining > 0) return
-  const job = pendingRefresh.value
-  pendingRefresh.value = null
-  await job?.()
-})
-
-async function refreshWhenBatchEnds(job: () => Promise<void>): Promise<void> {
-  if (transfers.runningBatches.length === 0) await job()
-  else pendingRefresh.value = job
-}
-
+/**
+ * 发起传输。
+ *
+ * 这里刻意不 `await` 传输本身：批次可能搬几百兆，把界面挂在上面等于禁用整个窗口。
+ * 「什么时候刷新」交给 `runningBatches` 归零那一刻，见 onMounted 里那个订阅。
+ */
 async function uploadSelected(): Promise<void> {
   if (conn.value === null || local.selected.length === 0) return
   const result = await files.upload(conn.value, [...local.selected])
@@ -233,23 +213,10 @@ async function downloadSelected(): Promise<void> {
   else await refreshWhenBatchEnds(() => loadLocal(local.path))
 }
 
-/* ── 表格列与选择 ──────────────────────────────────────── */
-
-const columns = [
-  { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
-  { title: '大小', dataIndex: 'size', key: 'size', width: 84, align: 'right' as const },
-  { title: '修改时间', dataIndex: 'mtime_ms', key: 'mtime', width: 120 },
-  { title: '', key: 'actions', width: 108 },
-]
-
-const localSelection = computed(() => ({
-  selectedRowKeys: local.selected,
-  onChange: (keys: (string | number)[]) => { local.selected = keys.map(String) },
-}))
-const remoteSelection = computed(() => ({
-  selectedRowKeys: remoteSelected.value,
-  onChange: (keys: (string | number)[]) => { remoteSelected.value = keys.map(String) },
-}))
+async function refreshWhenBatchEnds(job: () => Promise<void>): Promise<void> {
+  if (transfers.runningBatches.length === 0) await job()
+  else pendingRefresh.value = job
+}
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -257,8 +224,22 @@ function message(err: unknown): string {
 
 let stopBridge: (() => void) | null = null
 
+/**
+ * 两个栏的刷新只挂一个订阅。
+ *
+ * 上传与下载都只回批次号，收尾时刻由 `runningBatches` 归零来说；分成两个 watcher
+ * 会在同一瞬间刷两次，所以谁发起的传输由 `pendingRefresh` 那一个槽位记住。
+ */
+let stopWatch: (() => void) | null = null
+
 onMounted(async () => {
   stopBridge = await startEventBridge()
+  stopWatch = watch(() => transfers.runningBatches.length, (remaining) => {
+    if (remaining > 0) return
+    const job = pendingRefresh.value
+    pendingRefresh.value = null
+    void job?.()
+  })
   await Promise.all([hosts.refresh(), void transfers.refresh()])
   home.value = await localApi.home().catch(() => '')
   drives.value = await localApi.drives().catch(() => [])
@@ -267,7 +248,9 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  stopWatch?.()
   stopBridge?.()
+  // close 里会把这台主机的编辑往返一起收掉：窗口没了还留一个轮询在改远端文件是不能接受的
   if (conn.value !== null) void files.close(conn.value)
 })
 </script>
@@ -286,12 +269,31 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="panes">
-        <!-- 本机栏 -->
-        <section class="pane">
-          <div class="toolbar">
+        <FilePane
+          side="local"
+          :path="local.path"
+          :entries="local.entries"
+          :loading="local.loading"
+          :error="local.error"
+          :selected="local.selected"
+          :enabled="true"
+          :can-go-up="localParent(local.path) !== null"
+          :busy="null"
+          @update:selected="v => { local.selected = v }"
+          @go="localGo"
+          @up="localUp"
+          @refresh="() => loadLocal(local.path)"
+          @mkdir="name => void localCreate(name, 'dir')"
+          @create-file="name => void localCreate(name, 'file')"
+          @remove="entries => void localRemoveMany(entries)"
+          @rename="(from, name) => void localRename(from, name)"
+          @open="localOpen"
+          @dismiss="local.error = null"
+        >
+          <template #tools>
             <a-select
               size="small"
-              style="width: 96px"
+              style="width: 92px"
               :value="drives.includes(local.path) ? local.path : undefined"
               placeholder="盘符"
               @change="v => void loadLocal(String(v))"
@@ -299,55 +301,9 @@ onBeforeUnmount(() => {
               <a-select-option v-for="d in drives" :key="d" :value="d">{{ d }}</a-select-option>
             </a-select>
             <a-button size="small" @click="void loadLocal(home || null)">主目录</a-button>
-            <a-button size="small" :disabled="localParent(local.path) === null" @click="void localUp()">上级</a-button>
-            <a-button size="small" @click="void loadLocal(local.path)">刷新</a-button>
-            <a-button size="small" @click="localMkdirOpen = true">新建目录</a-button>
-          </div>
-          <a-input
-            v-if="localMkdirOpen"
-            v-model:value="localMkdirName"
-            size="small"
-            placeholder="新目录名，回车创建"
-            autofocus
-            @press-enter="void submitLocalMkdir()"
-            @blur="localMkdirOpen = false"
-          />
-          <div class="path" :title="local.path">本机 · {{ local.path }}</div>
-          <a-alert v-if="local.error" :message="local.error" type="error" show-icon closable @close="local.error = null" />
-          <a-table
-            class="grid"
-            :columns="columns"
-            :data-source="local.entries"
-            :loading="local.loading"
-            :pagination="false"
-            :row-selection="localSelection"
-            row-key="path"
-            size="small"
-            :custom-row="(record: FileEntry) => ({ onDblclick: () => localEnter(record) })"
-          >
-            <template #bodyCell="{ column, record }">
-              <template v-if="column.key === 'name'">
-                <span :class="{ dir: record.kind === 'dir' }">{{ record.name }}</span>
-              </template>
-              <template v-else-if="column.key === 'size'">
-                <span v-if="record.kind === 'dir'">-</span>
-                <span v-else>{{ formatSize(record.size) }}</span>
-              </template>
-              <template v-else-if="column.key === 'mtime'">{{ formatTime(record.mtime_ms) }}</template>
-              <template v-else-if="column.key === 'actions'">
-                <a-space :size="2">
-                  <a-button size="small" type="text" @click.stop="startLocalRename(record)">改名</a-button>
-                  <a-popconfirm title="删除这个条目？" ok-text="删除" cancel-text="取消" @confirm="void localRemove(record)">
-                    <a-button size="small" type="text" danger @click.stop>删除</a-button>
-                  </a-popconfirm>
-                </a-space>
-              </template>
-            </template>
-            <template #emptyText><a-empty :image-style="{ height: '40px' }" description="空目录" /></template>
-          </a-table>
-        </section>
+          </template>
+        </FilePane>
 
-        <!-- 传输按钮 -->
         <div class="transfer">
           <a-tooltip title="把左栏选中的文件上传到右栏当前目录">
             <a-button size="small" type="primary" :disabled="!canUpload" @click="void uploadSelected()">
@@ -361,68 +317,32 @@ onBeforeUnmount(() => {
           </a-tooltip>
         </div>
 
-        <!-- 远端栏 -->
-        <section class="pane">
-          <div class="toolbar">
-            <a-button size="small" :disabled="remotePath === '/'" @click="void remoteUp()">上级</a-button>
-            <a-button size="small" @click="void browseRemote(null)">刷新</a-button>
-            <a-button size="small" :disabled="conn === null" @click="remoteMkdirOpen = true">新建目录</a-button>
-          </div>
-          <a-input
-            v-if="remoteMkdirOpen"
-            v-model:value="remoteMkdirName"
-            size="small"
-            placeholder="新目录名，回车创建"
-            @press-enter="void submitRemoteMkdir()"
-            @blur="remoteMkdirOpen = false"
-          />
-          <div class="path" :title="remotePath">远端 · {{ remotePath }}</div>
-          <a-alert v-if="remoteError" :message="remoteError" type="error" show-icon closable @close="remoteError = null" />
-          <a-table
-            class="grid"
-            :columns="columns"
-            :data-source="remoteEntries"
-            :loading="remoteLoading"
-            :pagination="false"
-            :row-selection="remoteSelection"
-            row-key="path"
-            size="small"
-            :custom-row="(record: FileEntry) => ({ onDblclick: () => remoteEnter(record) })"
-          >
-            <template #bodyCell="{ column, record }">
-              <template v-if="column.key === 'name'">
-                <span :class="{ dir: record.kind === 'dir' }">{{ record.name }}</span>
-                <a-tag v-if="record.kind === 'symlink'" color="blue">链接</a-tag>
-              </template>
-              <template v-else-if="column.key === 'size'">
-                <span v-if="record.kind === 'dir'">-</span>
-                <span v-else>{{ formatSize(record.size) }}</span>
-              </template>
-              <template v-else-if="column.key === 'mtime'">{{ formatTime(record.mtime_ms) }}</template>
-              <template v-else-if="column.key === 'actions'">
-                <a-space :size="2">
-                  <a-button size="small" type="text" @click.stop="startRemoteRename(record)">改名</a-button>
-                  <a-popconfirm title="删除这个条目？" ok-text="删除" cancel-text="取消" @confirm="void remoteRemove(record)">
-                    <a-button size="small" type="text" danger @click.stop>删除</a-button>
-                  </a-popconfirm>
-                </a-space>
-              </template>
-            </template>
-            <template #emptyText><a-empty :image-style="{ height: '40px' }" description="空目录" /></template>
-          </a-table>
-        </section>
+        <FilePane
+          side="remote"
+          :path="remotePath"
+          :entries="remoteEntries"
+          :loading="remoteLoading"
+          :error="remoteError"
+          :selected="remoteSelected"
+          :enabled="conn !== null"
+          :can-go-up="remotePath !== '' && remotePath !== '/'"
+          :busy="remoteBusy"
+          @update:selected="v => { remoteSelected = v }"
+          @go="target => void browseRemote(target)"
+          @up="() => void browseRemote(parentPath(remotePath))"
+          @refresh="() => browseRemote(null)"
+          @mkdir="name => void remoteMkdir(name)"
+          @create-file="name => void remoteCreateFile(name)"
+          @remove="entries => void remoteRemoveMany(entries)"
+          @rename="(from, name) => void remoteRename(from, name)"
+          @chmod="(entry, mode) => void remoteChmod(entry, mode)"
+          @open="remoteOpen"
+          @editing="remoteEditing"
+          @dismiss="remoteError = null"
+        />
       </div>
 
       <TransferTray />
-
-      <a-modal :open="localRename.open" title="重命名（本机）" ok-text="确定" cancel-text="取消"
-        @update:open="localRename.open = false" @ok="void submitLocalRename()" @cancel="localRename.open = false">
-        <a-input v-model:value="localRename.to" placeholder="新名称" @press-enter="void submitLocalRename()" />
-      </a-modal>
-      <a-modal :open="remoteRename.open" title="重命名（远端）" ok-text="确定" cancel-text="取消"
-        @update:open="remoteRename.open = false" @ok="void submitRemoteRename()" @cancel="remoteRename.open = false">
-        <a-input v-model:value="remoteRename.to" placeholder="新名称" @press-enter="void submitRemoteRename()" />
-      </a-modal>
     </a-layout>
   </a-config-provider>
 </template>
@@ -460,40 +380,6 @@ onBeforeUnmount(() => {
   min-height: 0;
   gap: 8px;
   padding: 8px;
-}
-
-.pane {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-}
-
-.toolbar {
-  display: flex;
-  gap: 6px;
-  flex: none;
-  flex-wrap: wrap;
-}
-
-.path {
-  font-size: 12px;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  opacity: 0.85;
-}
-
-.grid {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-
-.dir {
-  font-weight: 600;
 }
 
 .transfer {

@@ -72,22 +72,7 @@ fn list_dir(path: &Path) -> Result<DirListing, IpcError> {
         };
         // 断链、竞态删除都会让 metadata 失败；那种情况按「未知大小 / 未知时间」显示。
         let meta = item.metadata().ok();
-        let size = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
-        let mtime_ms = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64);
-        entries.push(FileEntry {
-            name: item.file_name().to_string_lossy().into_owned(),
-            path: item.path().display().to_string(),
-            kind,
-            size,
-            mtime_ms,
-            mode: None,
-            owner: None,
-            group: None,
-        });
+        entries.push(entry_of(&item.path(), kind, meta.as_ref()));
     }
     entries.sort_by(|a, b| {
         let dir_rank = |k: FileKind| if k == FileKind::Dir { 0 } else { 1 };
@@ -96,6 +81,26 @@ fn list_dir(path: &Path) -> Result<DirListing, IpcError> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(DirListing { path: path.display().to_string(), entries })
+}
+
+/// 把本机路径拼成条目。`meta` 缺省时大小/时间留空而不是填 0——
+/// 「服务端没给」与「真的是 0」在 UI 上是两回事，本机同理。
+fn entry_of(target: &Path, kind: FileKind, meta: Option<&std::fs::Metadata>) -> FileEntry {
+    let size = meta.map(std::fs::Metadata::len).unwrap_or(0);
+    let mtime_ms = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    FileEntry {
+        name: target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| target.display().to_string()),
+        path: target.display().to_string(),
+        kind,
+        size,
+        mtime_ms,
+        mode: None,
+        owner: None,
+        group: None,
+    }
 }
 
 /// 本机家目录路径。前端「主目录」按钮与初始定位都问它。
@@ -133,6 +138,94 @@ pub fn remove_impl(path: String, is_dir: bool) -> Result<(), IpcError> {
 /// 本机改名/移动。`to` 是完整目标路径，交给 OS 决定跨卷等边界。
 pub fn rename_impl(from: String, to: String) -> Result<(), IpcError> {
     std::fs::rename(&from, &to).map_err(|e| io_err("rename", e))
+}
+
+/// 单个路径的元数据。外部编辑流程靠它轮询临时副本有没有被别的程序改过。
+///
+/// 与目录列举不同，这里**跟随符号链接**：用户要编辑的是链接指向的真实文件，
+/// 拿链接自身的元数据轮询会永远看不到大小变化。
+pub fn stat_impl(path: String) -> Result<FileEntry, IpcError> {
+    let target = Path::new(&path);
+    let meta = std::fs::metadata(target).map_err(|e| io_err("stat", e))?;
+    let kind = if meta.is_dir() { FileKind::Dir } else if meta.is_file() { FileKind::File } else { FileKind::Other };
+    Ok(entry_of(target, kind, Some(&meta)))
+}
+
+/// 本机新建空文件。
+///
+/// 存在性判断与创建之间有一个 TOCTOU 窗口（本机同一时刻只有一个文件窗口在动，
+/// 外部程序挤进来的概率极低），真撞上了 `File::create` 会覆盖——那是并发写同一文件
+/// 的通用后果，不是这里能兜住的，兜它要付出的是每次建文件都多一次打开。
+pub fn create_file_impl(path: String) -> Result<(), IpcError> {
+    if Path::new(&path).exists() {
+        return Err(IpcError::new(ErrorCode::InvalidInput, "该名称已存在", false));
+    }
+    std::fs::File::create(&path).map(|_| ()).map_err(|e| io_err("create_file", e))
+}
+
+/// 编辑副本的「还算在用」期限。前端一次编辑最多监听三十分钟，留一倍余量：
+/// 超过它的必然是被丢下的那份。
+const EDIT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 外部编辑用的临时目录（`<系统临时目录>/dbhx-edit`），不存在就建出来。
+///
+/// 远端文件的副本放这儿，编辑完由文件窗口比对 mtime/大小后回传。刻意不放下载目录——
+/// 那是用户挑来收文件的地方，塞一堆编辑副本进去等于污染。
+pub fn edit_dir_impl() -> Result<String, IpcError> {
+    let dir = std::env::temp_dir().join("dbhx-edit");
+    std::fs::create_dir_all(&dir).map_err(|e| io_err("edit_dir", e))?;
+    prune_stale_edits(&dir, EDIT_STALE_AFTER);
+    Ok(dir.display().to_string())
+}
+
+/// 扫掉上一次被丢下的编辑副本。
+///
+/// 正常的收尾是前端在 `finally` 里删临时文件的，但用户直接关掉文件窗口时 webview
+/// 连同 store 一起销毁，那个 `finally` 根本没机会跑完——副本就长留在临时目录里。
+/// 前端没有可靠的地方补这一刀（它自己也一起死了），只能靠这个「下次再编辑时先打扫」
+/// 的后端入口。按 mtime 设期限，正在编辑的那份还年轻，不会被误删。
+///
+/// 全程尽力而为：读目录失败、某个文件删不掉，一律忽略——清理是附带好处，
+/// 不该让它挡住「拿到编辑目录」这件正事。
+fn prune_stale_edits(dir: &Path, max_age: std::time::Duration) {
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let now = std::time::SystemTime::now();
+    for entry in read.flatten() {
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| now.duration_since(mtime).ok());
+        if matches!(age, Some(a) if a > max_age) {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                tracing::debug!(%e, "编辑副本没删掉");
+            }
+        }
+    }
+}
+
+/// 交给系统关联的程序打开（记事本、VS Code、图片查看器……）。
+///
+/// Windows 走 `explorer.exe <路径>` 而不是 `cmd /C start`：后者会把命令行再解析一遍，
+/// 文件名里的 `&` 和引号就成了命令片段。explorer 成功时也常回非零码，所以只看
+/// 「进程有没有起来」，不判状态码。
+pub fn open_with_impl(path: String) -> Result<(), IpcError> {
+    let spawned = {
+        #[cfg(windows)]
+        let it = std::process::Command::new("explorer.exe").arg(&path).spawn();
+        #[cfg(target_os = "macos")]
+        let it = std::process::Command::new("open").arg(&path).spawn();
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let it = std::process::Command::new("xdg-open").arg(&path).spawn();
+        it
+    };
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::debug!(%e, "调用系统关联程序失败");
+            Err(IpcError::new(ErrorCode::Internal, "无法启动打开该文件的程序", false))
+        }
+    }
 }
 
 /// 弹出（或聚焦）某台主机的文件管理窗口。
@@ -195,6 +288,32 @@ pub async fn local_remove(path: String, is_dir: bool) -> Result<(), IpcError> {
 #[specta::specta]
 pub async fn local_rename(from: String, to: String) -> Result<(), IpcError> {
     rename_impl(from, to)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn local_stat(path: String) -> Result<FileEntry, IpcError> {
+    stat_impl(path)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn local_create_file(path: String) -> Result<(), IpcError> {
+    create_file_impl(path)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn local_edit_dir() -> Result<String, IpcError> {
+    edit_dir_impl()
+}
+
+/// 同样是**必须 `async`**：这条会把 spawn 出去的进程交给阻塞线程池，事件循环线程上
+/// 不该出现任何「等外部程序」的动作。
+#[tauri::command]
+#[specta::specta]
+pub async fn local_open(path: String) -> Result<(), IpcError> {
+    open_with_impl(path)
 }
 
 /// **必须是 `async`**：非 async 命令跑在事件循环线程上，而 `WebviewWindowBuilder::build()`
@@ -262,5 +381,76 @@ mod tests {
         remove_impl(sub.display().to_string(), true).unwrap();
         assert!(!sub.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新建空文件最该守住的一条：同名时**报错**，不是静默截断。
+    #[test]
+    fn create_file_refuses_to_truncate_an_existing_one() {
+        let dir = tempdir("newfile");
+        let file = dir.join("note.txt");
+
+        create_file_impl(file.display().to_string()).unwrap();
+        assert!(file.is_file(), "建出来的要真是普通文件");
+        std::fs::write(&file, b"keep me").unwrap();
+
+        let err = create_file_impl(file.display().to_string()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.message, "该名称已存在");
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep me", "已存在的文件一个字节都不能少");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_reads_one_entry_back_without_the_whole_directory() {
+        let dir = tempdir("stat");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"12345").unwrap();
+
+        let entry = stat_impl(file.display().to_string()).unwrap();
+        assert_eq!((entry.name.as_str(), entry.kind, entry.size), ("a.txt", FileKind::File, 5));
+        assert!(entry.mtime_ms.is_some(), "本机文件该带修改时间，编辑流程就靠它比对");
+
+        let err = stat_impl(dir.join("gone.txt").display().to_string()).unwrap_err();
+        assert_eq!(err.message, "路径不存在", "OS 的英文说明不外泄");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_dir_lives_under_the_system_temp() {
+        let dir = edit_dir_impl().unwrap();
+        assert!(std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()), "外部编辑的临时目录要真的存在：{dir}");
+        assert!(dir.replace('\\', "/").ends_with("dbhx-edit"), "临时副本集中放一处，好认也好清：{dir}");
+    }
+
+    /// 关窗会把前端 `finally` 的清理一起带走，所以过期副本要由后端扫掉——
+    /// 但只扫过期的，正在编辑的那份碰不得。
+    #[test]
+    fn prune_removes_only_past_the_deadline() {
+        let dir = tempdir("prune");
+        let fresh = dir.join("editing.txt");
+        let stale = dir.join("leftover.txt");
+        std::fs::write(&fresh, b"new").unwrap();
+        std::fs::write(&stale, b"old").unwrap();
+
+        // 期限设成 0：两个都算「过期」，全清
+        prune_stale_edits(&dir, std::time::Duration::ZERO);
+        assert!(!fresh.exists() && !stale.exists(), "过期的编辑副本一个都不该留");
+
+        // 期限放开一小时：刚写出来的还年轻，动它就会毁掉用户正在编辑的文件
+        std::fs::write(&fresh, b"new").unwrap();
+        prune_stale_edits(&dir, EDIT_STALE_AFTER);
+        assert!(fresh.exists(), "正在编辑的副本不能被误删");
+
+        // 目录本身删不掉（remove_file 对目录报错），但清理不该因此把正事挡下
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        prune_stale_edits(&dir, std::time::Duration::ZERO);
+        assert!(dir.join("sub").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_on_a_missing_directory_is_silent() {
+        // 第一次用这个应用时目录还没建过，打扫必须是空操作而不是 panic 或报错
+        prune_stale_edits(Path::new("Z:\\dbhx-no-such-dir"), std::time::Duration::ZERO);
     }
 }

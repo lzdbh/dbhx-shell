@@ -18,6 +18,7 @@ use russh_sftp::protocol::FileAttributes;
 
 use crate::error::SftpError;
 use crate::path;
+use crate::transfer::remote_io;
 
 /// 会话建连参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +163,44 @@ impl SftpClient {
             }
         }
         Ok(())
+    }
+
+    /// 建一个空文件。
+    ///
+    /// **已存在时报错，绝不截断**：`create` 的语义是 WRITE|CREATE|TRUNCATE，直接把名字
+    /// 丢过去会把同名文件清成 0 字节，而用户在面板上敲错一个名字是常事。
+    pub async fn create_file(&self, target: &str) -> Result<(), SftpError> {
+        if self.exists(target).await? {
+            return Err(SftpError::AlreadyExists(target.to_string()));
+        }
+        let file = self
+            .session
+            .create(target.to_string())
+            .await
+            .map_err(|e| SftpError::classify(e, target.to_string()))?;
+        // 显式 close 而不是靠 Drop：Drop 里的 CLOSE 是 nowait 投递，
+        // 命令层紧接着就 browse，那条新文件可能还没在服务端落稳
+        file.close().await.map_err(|e| remote_io(e, target))?;
+        Ok(())
+    }
+
+    /// 改权限位（SETATTRS），等价于 chmod。
+    ///
+    /// 先 `stat` 一次拿回现有属性，只替换低 12 位：`permissions` 里高位是类型位
+    /// （目录/符号链接/普通文件），整段覆盖过去会让服务端把 `a.log` 变成「没有类型」的条目。
+    pub async fn set_mode(&self, target: &str, mode: u32) -> Result<(), SftpError> {
+        let current = self
+            .session
+            .metadata(target.to_string())
+            .await
+            .map_err(|e| SftpError::classify(e, target.to_string()))?;
+        let kept = current.permissions.unwrap_or(0) & !0o7777;
+        let mut attrs = FileAttributes::default();
+        attrs.permissions = Some(kept | (mode & 0o7777));
+        self.session
+            .set_metadata(target.to_string(), attrs)
+            .await
+            .map_err(|e| SftpError::classify(e, target.to_string()))
     }
 
     pub async fn remove_file(&self, target: &str) -> Result<(), SftpError> {

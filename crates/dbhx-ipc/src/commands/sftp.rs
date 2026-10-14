@@ -1,4 +1,4 @@
-//! 文件面板命令：开面板、列目录、建目录、删、改名，以及跟随开关。
+//! 文件面板命令：开面板、列目录、建目录/建文件、删、改名、改权限，以及跟随开关。
 //!
 //! 「开面板」是本应用最难也最有价值的一条命令：它必须在**不重新登录**的前提下
 //! 拿到一条 SFTP subsystem 通道。做法是拿终端会话的 `TransportKey` 向池要第二个
@@ -131,6 +131,22 @@ pub async fn mkdir_impl(core: &Core, connection: u32, target: String, recursive:
     Ok(())
 }
 
+pub async fn create_file_impl(core: &Core, connection: u32, target: String) -> Result<(), IpcError> {
+    // 与 mkdir 同一口径：裸名字按面板正在显示的目录拼，否则会建到会话初始目录去。
+    let (client, shown) = core.panel_at(connection)?;
+    client.create_file(&path::join(&shown, &target)).await.map_err(Into::into)
+}
+
+/// 改远端权限位。`mode` 是 `0o000..=0o7777` 的整数，越界直接拒——悄悄取模会让用户
+/// 以为改完了，实际服务端收到的是另一个值。
+pub async fn chmod_impl(core: &Core, connection: u32, target: String, mode: u32) -> Result<(), IpcError> {
+    if mode > 0o7777 {
+        return Err(IpcError::new(ErrorCode::InvalidInput, "权限位只能是 0 到 7777 的八进制数", false));
+    }
+    let (client, _) = core.panel_at(connection)?;
+    client.set_mode(&target, mode).await.map_err(Into::into)
+}
+
 pub async fn remove_impl(core: &Core, connection: u32, target: String, is_dir: bool) -> Result<(), IpcError> {
     let client = core.panel_client(connection)?;
     if is_dir { client.remove_dir(&target).await? } else { client.remove_file(&target).await? };
@@ -209,6 +225,18 @@ pub async fn sftp_browse(core: State<'_>, connection: u32, path: Option<String>)
 #[specta::specta]
 pub async fn sftp_mkdir(core: State<'_>, connection: u32, path: String, recursive: bool) -> Result<(), IpcError> {
     mkdir_impl(&core, connection, path, recursive).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn sftp_create_file(core: State<'_>, connection: u32, path: String) -> Result<(), IpcError> {
+    create_file_impl(&core, connection, path).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn sftp_chmod(core: State<'_>, connection: u32, path: String, mode: u32) -> Result<(), IpcError> {
+    chmod_impl(&core, connection, path, mode).await
 }
 
 #[tauri::command]

@@ -69,6 +69,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "sftp_open_for_host",
     "sftp_browse",
     "sftp_mkdir",
+    "sftp_create_file",
+    "sftp_chmod",
     "sftp_remove",
     "sftp_rename",
     "sftp_close",
@@ -82,8 +84,12 @@ pub const COMMAND_NAMES: &[&str] = &[
     "local_drives",
     "local_list",
     "local_mkdir",
+    "local_create_file",
     "local_remove",
     "local_rename",
+    "local_stat",
+    "local_open",
+    "local_edit_dir",
     "open_file_window",
 ];
 
@@ -127,6 +133,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::sftp::sftp_open_for_host,
             commands::sftp::sftp_browse,
             commands::sftp::sftp_mkdir,
+            commands::sftp::sftp_create_file,
+            commands::sftp::sftp_chmod,
             commands::sftp::sftp_remove,
             commands::sftp::sftp_rename,
             commands::sftp::sftp_close,
@@ -140,8 +148,12 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::local::local_drives,
             commands::local::local_list,
             commands::local::local_mkdir,
+            commands::local::local_create_file,
             commands::local::local_remove,
             commands::local::local_rename,
+            commands::local::local_stat,
+            commands::local::local_open,
+            commands::local::local_edit_dir,
             commands::local::open_file_window,
         ])
         .events(collect_events![

@@ -275,7 +275,9 @@ async fn finish_remote(mut remote: russh_sftp::client::fs::File) {
 
 /// 远端 IO 错误只按 `kind` 归类，**不带** `Display` 文本：
 /// russh-sftp 把协议错误包成 `io::Error` 时那句英文就在 Display 里。
-fn remote_io(err: std::io::Error, target: &str) -> SftpError {
+/// 文件句柄上的方法（`close`/`flush`）走的是 `std::io` 而不是协议 `Error`，
+/// 客户端层的元数据操作也要用同一套分类，所以这一处对全 crate 开放。
+pub(crate) fn remote_io(err: std::io::Error, target: &str) -> SftpError {
     match err.kind() {
         std::io::ErrorKind::NotFound => SftpError::NotFound(target.to_string()),
         std::io::ErrorKind::PermissionDenied => SftpError::PermissionDenied(target.to_string()),

@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dbhx_ipc::commands::session::{close_impl as close_session_impl, open_remote_impl, write_impl};
-use dbhx_ipc::commands::sftp::{browse_impl, close_impl as close_panel_impl, mkdir_impl, open_for_session_impl, rename_impl, set_following_impl};
+use dbhx_ipc::commands::sftp::{browse_impl, chmod_impl, close_impl as close_panel_impl, create_file_impl, mkdir_impl, open_for_session_impl, rename_impl, set_following_impl};
 use dbhx_ipc::commands::transfer::download_impl;
 use dbhx_ipc::commands::vault::{HostDraft, UserReply, reply_impl, set_password_impl, upsert_host_impl};
 use dbhx_ipc::events::{BusEvent, FollowHold};
 use dbhx_ipc::hub;
 use dbhx_ipc::state::{BUS_QUEUE, Core};
-use dbhx_model::{AuthMode, Endpoint, ErrorCode, KnownHost, KnownHostSource, Protocol, PtySize, TerminalEncoding};
+use dbhx_model::{AuthMode, Endpoint, ErrorCode, FileKind, KnownHost, KnownHostSource, Protocol, PtySize, TerminalEncoding};
 use dbhx_ssh::pattern_of;
 use dbhx_testsrv::{HOST_KEY_ALGO, HOST_KEY_B64, TestServer, TestSpec, sample_fs};
 use tokio::sync::mpsc;
@@ -304,6 +304,49 @@ async fn bare_names_resolve_against_the_browsed_dir() {
         assert!(!parent.contains(&leaked.to_string()), "「{leaked}」被建到了上一级目录，说明裸名字没按显示目录解析：{parent:?}");
     }
     assert!(parent.contains(&"logs".to_string()), "上一级本来该有的东西不能被弄丢：{parent:?}");
+
+    server.shutdown().await;
+}
+
+/// 新建空文件与改权限都作用在**面板正显示的目录**上，且属性真的写进了服务端。
+///
+/// 建文件最容易写错的一处是「拿 create 的截断语义去建同名文件」——用户敲错一次名字
+/// 就把别人的文件清成 0 字节。夹具里 644→600 的回读则证明 chmod 走通了 SETATTRS，
+/// 而不是客户端自己以为改了。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_file_and_chmod_act_on_the_browsed_dir() {
+    let server = started_server().await;
+    let (core, _rx) = live_core("editing");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 }).await.expect("远端 shell 应当开起来");
+    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
+    browse_impl(core.as_ref(), panel.connection, Some("logs".into())).await.unwrap();
+
+    create_file_impl(core.as_ref(), panel.connection, "note.txt".into()).await.expect("空文件应当建起来");
+
+    let here = browse_impl(core.as_ref(), panel.connection, None).await.unwrap();
+    let note = here.entries.iter().find(|e| e.name == "note.txt").expect("新建的文件要出现在正看着的这一栏");
+    assert_eq!((note.kind, note.size, note.mode), (FileKind::File, 0, Some(0o644)), "新文件该是 0 字节的普通文件");
+
+    // 同名再建必须是「已存在」，绝不能走截断
+    let again = create_file_impl(core.as_ref(), panel.connection, "note.txt".into()).await;
+    assert_eq!(again.err().map(|e| e.code), Some(ErrorCode::AlreadyExists), "同名文件被清空了");
+
+    // 上层不该凭空多出这个名字——又一次证明裸名字必须按显示目录拼
+    let upper = browse_impl(core.as_ref(), panel.connection, Some("/home/app".into())).await.unwrap();
+    assert!(!upper.entries.iter().any(|e| e.name == "note.txt"), "文件被建到了会话初始目录：{upper:?}");
+
+    chmod_impl(core.as_ref(), panel.connection, note.path.clone(), 0o600).await.expect("改权限应当落进服务端");
+    // 上面那次检查把面板带到了上层目录，这里必须显式跳回来，否则读的是另一个目录
+    let after = browse_impl(core.as_ref(), panel.connection, Some(here.path.clone())).await.unwrap();
+    let changed = after.entries.iter().find(|e| e.name == "note.txt").expect("改完文件还在原处");
+    assert_eq!(changed.mode, Some(0o600), "SETATTRS 没生效的话这里仍然是 644");
+
+    // 越界的权限位是非法输入，不能被悄悄取模之后回一个成功
+    let bad = chmod_impl(core.as_ref(), panel.connection, note.path.clone(), 0o10000).await;
+    assert_eq!(bad.err().map(|e| e.code), Some(ErrorCode::InvalidInput), "越界权限位必须挡下来");
 
     server.shutdown().await;
 }

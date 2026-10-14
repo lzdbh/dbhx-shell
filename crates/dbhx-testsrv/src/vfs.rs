@@ -384,7 +384,7 @@ impl Vfs {
         Ok(())
     }
 
-    /// `SSH_FXP_SETSTAT` 里带 size 时的截断。其余属性本夹具不建模。
+    /// `SSH_FXP_SETSTAT` 里带 size 时的截断。
     pub fn set_size(&mut self, path: &str, size: u64) -> Result<(), FsError> {
         let want = size as usize;
         let mtime = self.tick();
@@ -394,6 +394,16 @@ impl Vfs {
         }
         node.data.resize(want, 0);
         node.mtime = mtime;
+        Ok(())
+    }
+
+    /// `SSH_FXP_SETSTAT` 里带 permissions 时的 chmod。
+    ///
+    /// 只收低 12 位：类型位由 `kind` 决定，客户端就算把它发过来也不该改动节点性质
+    /// ——真实服务端同样只认权限位。时间戳本夹具不建模。
+    pub fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), FsError> {
+        let node = self.nodes.get_mut(path).ok_or(FsError::NotFound)?;
+        node.mode = mode & 0o7777;
         Ok(())
     }
 

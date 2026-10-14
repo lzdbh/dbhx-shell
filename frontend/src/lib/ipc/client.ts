@@ -88,6 +88,10 @@ export const sftpApi = {
   browse: (connection: number, path: string | null) =>
     unwrap(commands.sftpBrowse(connection, path)),
   mkdir: (connection: number, path: string, recursive: boolean) => unwrap(commands.sftpMkdir(connection, path, recursive)),
+  /** 建空文件。`path` 可以是裸名字——后端按面板正在显示的目录拼，同名会报「已存在」而不是截断。 */
+  createFile: (connection: number, path: string) => unwrap(commands.sftpCreateFile(connection, path)),
+  /** `mode` 是八进制权限位（0o600 这种），后端越界会拒。 */
+  chmod: (connection: number, path: string, mode: number) => unwrap(commands.sftpChmod(connection, path, mode)),
   remove: (connection: number, path: string, isDir: boolean) => unwrap(commands.sftpRemove(connection, path, isDir)),
   rename: (connection: number, from: string, to: string, overwrite: boolean) =>
     unwrap(commands.sftpRename(connection, from, to, overwrite)),
@@ -116,8 +120,16 @@ export const localApi = {
   drives: () => commands.localDrives(),
   list: (path: string | null) => unwrap(commands.localList(path)),
   mkdir: (path: string) => unwrap(commands.localMkdir(path)),
+  /** 建空文件；同名会拒，绝不截断已有内容。 */
+  createFile: (path: string) => unwrap(commands.localCreateFile(path)),
   remove: (path: string, isDir: boolean) => unwrap(commands.localRemove(path, isDir)),
   rename: (from: string, to: string) => unwrap(commands.localRename(from, to)),
+  /** 单个条目的属性，跟随符号链接（外部编辑器要的是真实文件的修改时间）。 */
+  stat: (path: string) => unwrap(commands.localStat(path)),
+  /** 交给系统关联程序打开。进程起得来就算成功，不等它退出。 */
+  open: (path: string) => unwrap(commands.localOpen(path)),
+  /** 外部编辑器往返用的临时目录（后端保证存在）。 */
+  editDir: () => unwrap(commands.localEditDir()),
 }
 
 /** 让 Rust 侧弹出（或聚焦）某台主机的文件管理窗口。 */

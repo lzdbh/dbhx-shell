@@ -56,6 +56,8 @@ export const commands = {
 	sftpOpenForHost: (hostId: HostId) => typedError<PanelInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_open_for_host", { hostId })),
 	sftpBrowse: (connection: number, path: string | null) => typedError<DirListing, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_browse", { connection, path })),
 	sftpMkdir: (connection: number, path: string, recursive: boolean) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_mkdir", { connection, path, recursive })),
+	sftpCreateFile: (connection: number, path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_create_file", { connection, path })),
+	sftpChmod: (connection: number, path: string, mode: number) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_chmod", { connection, path, mode })),
 	sftpRemove: (connection: number, path: string, isDir: boolean) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_remove", { connection, path, isDir })),
 	sftpRename: (connection: number, from: string, to: string, overwrite: boolean) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_rename", { connection, from, to, overwrite })),
 	sftpClose: (connection: number) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_close", { connection })),
@@ -69,8 +71,16 @@ export const commands = {
 	localDrives: () => __TAURI_INVOKE<string[]>("plugin:dbhx|local_drives"),
 	localList: (path: string | null) => typedError<DirListing, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_list", { path })),
 	localMkdir: (path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_mkdir", { path })),
+	localCreateFile: (path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_create_file", { path })),
 	localRemove: (path: string, isDir: boolean) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_remove", { path, isDir })),
 	localRename: (from: string, to: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_rename", { from, to })),
+	localStat: (path: string) => typedError<FileEntry, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_stat", { path })),
+	/**
+	 *  同样是**必须 `async`**：这条会把 spawn 出去的进程交给阻塞线程池，事件循环线程上
+	 *  不该出现任何「等外部程序」的动作。
+	 */
+	localOpen: (path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_open", { path })),
+	localEditDir: () => typedError<string, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_edit_dir")),
 	/**
 	 *  **必须是 `async`**：非 async 命令跑在事件循环线程上，而 `WebviewWindowBuilder::build()`
 	 *  会把建窗口这件事投递给事件循环再阻塞等回音——同一条线程等自己，一点就整窗卡死。

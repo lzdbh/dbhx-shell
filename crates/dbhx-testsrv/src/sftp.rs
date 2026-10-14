@@ -244,16 +244,26 @@ impl russh_sftp::server::Handler for SftpHandler {
 
     async fn setstat(&mut self, id: u32, path: String, attrs: FileAttributes) -> Result<Status, Self::Error> {
         let abs = self.abs(&path)?;
+        // 两个字段各管各的：只带 permissions 的 SETATTRS 就是 chmod，只带 size 就是截断，
+        // 缺的那个字段绝不能顺手改动（客户端改权限时把 mtime 报成 0 就是这么来的）
+        let mut fs = self.lock();
+        if let Some(mode) = attrs.permissions {
+            fs.set_mode(&abs, mode).map_err(to_status)?;
+        }
         if let Some(size) = attrs.size {
-            self.lock().set_size(&abs, size).map_err(to_status)?;
+            fs.set_size(&abs, size).map_err(to_status)?;
         }
         Ok(ok(id))
     }
 
     async fn fsetstat(&mut self, id: u32, handle: String, attrs: FileAttributes) -> Result<Status, Self::Error> {
         let path = self.take_file(&handle)?;
+        let mut fs = self.lock();
+        if let Some(mode) = attrs.permissions {
+            fs.set_mode(&path, mode).map_err(to_status)?;
+        }
         if let Some(size) = attrs.size {
-            self.lock().set_size(&path, size).map_err(to_status)?;
+            fs.set_size(&path, size).map_err(to_status)?;
         }
         Ok(ok(id))
     }

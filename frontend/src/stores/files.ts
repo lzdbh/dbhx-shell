@@ -2,9 +2,10 @@ import { computed, reactive, ref } from 'vue'
 
 import { defineStore } from 'pinia'
 
-import type { DirListing, FileEntry, FollowHold, PanelInfo, SessionId, SftpFollowed } from '../lib/ipc/bindings'
-import { sftpApi } from '../lib/ipc/client'
+import type { DirListing, FileEntry, FollowHold, PanelInfo, SessionId, SftpFollowed, TransferBatchEnded } from '../lib/ipc/bindings'
+import { localApi, sftpApi, transferApi } from '../lib/ipc/client'
 import { describeIpcError, normalizeIpcError } from '../lib/ipc/errors'
+import { localJoin, parentPath } from '../lib/format'
 import { useSettingsStore } from './settings'
 import { useTransfersStore } from './transfers'
 
@@ -25,6 +26,8 @@ export interface FilePanel {
   hold: FollowHold | null
   loading: boolean
   error: string | null
+  /** 后台正在这栏里做什么（外部编辑器往返）。`null` 表示空闲。 */
+  busy: string | null
 }
 
 /** 门控的「停在这里」原因翻成用户看得懂的话。 */
@@ -38,6 +41,14 @@ export const HOLD_TEXT: Record<FollowHold, string> = {
   stale_generation: '这是一次过期的目录报告',
   weaker_source: '已有更可靠的目录来源',
 }
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+/** 外部编辑器轮询节奏：0.7 秒一次，连续 3 次没再变就当它写完了。 */
+const TICK_MS = 700
+const QUIET_TICKS = 3
+/** 单次编辑会话最多盯半小时，之后静默收摊（不追一个一直没关的记事本）。 */
+const WATCH_TICKS = Math.floor(30 * 60 * 1000 / TICK_MS)
 
 export const useFilesStore = defineStore('files', () => {
   // 传输进度条要知道批次属于哪个面板，下载目录又归设置管，所以这两个 store 在这里组合
@@ -84,6 +95,7 @@ export const useFilesStore = defineStore('files', () => {
         hold: null,
         loading: false,
         error: null,
+        busy: null,
       } satisfies FilePanel)
       if (existing) applyListing(created, info.listing)
       panels.set(info.connection, created)
@@ -109,6 +121,7 @@ export const useFilesStore = defineStore('files', () => {
         hold: null,
         loading: false,
         error: null,
+        busy: null,
       } satisfies FilePanel)
       if (panels.has(info.connection)) applyListing(created, info.listing)
       panels.set(info.connection, created)
@@ -218,6 +231,186 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   /**
+   * 批量删除。
+   *
+   * 逐项执行而不是让后端做递归：面板上选中的是一个「混合集合」，一个非空目录失败
+   * 不该把后面已经能删的条目连带放弃，但也不能默默跳过——所以停在第一个错误上，
+   * 并把是哪个条目说清楚。
+   */
+  async function removeMany(connection: number, entries: FileEntry[]): Promise<boolean> {
+    const p = panels.get(connection)
+    if (!p) return false
+    let failure: string | null = null
+    for (const entry of entries) {
+      try {
+        await sftpApi.remove(connection, entry.path, entry.kind === 'dir')
+      } catch (err) {
+        failure = `${entry.name}：${lastError(err)}`
+        break
+      }
+    }
+    await browse(connection, null)
+    // browse 成功会把 error 清空，所以这条必须补在它后面
+    if (failure !== null) p.error = failure
+    return failure === null
+  }
+
+  /** 在面板正显示的目录里建一个空文件（裸名字，后端按显示目录拼）。 */
+  async function createFile(connection: number, name: string): Promise<boolean> {
+    const p = panels.get(connection)
+    if (!p) return false
+    try {
+      await sftpApi.createFile(connection, name)
+      await browse(connection, null)
+      return true
+    } catch (err) {
+      p.error = lastError(err)
+      return false
+    }
+  }
+
+  /** 改远端权限位。`mode` 是八进制值（0o600 这种），后端越界会拒。 */
+  async function chmod(connection: number, entry: FileEntry, mode: number): Promise<boolean> {
+    const p = panels.get(connection)
+    if (!p) return false
+    try {
+      await sftpApi.chmod(connection, entry.path, mode)
+      await browse(connection, null)
+      return true
+    } catch (err) {
+      p.error = lastError(err)
+      return false
+    }
+  }
+
+  /* ── 外部编辑器往返 ──────────────────────────────────── */
+
+  /**
+   * 正在编辑的远端路径 → 取消标记。
+   *
+   * 键用远端路径而不是本机临时路径：同名文件在不同目录里编辑是两回事，
+   * 而临时目录只有一个，用本机路径当键会让第二次编辑「抢」掉第一个的临时文件。
+   */
+  const edits = new Map<string, { connection: number, cancelled: boolean }>()
+
+  /**
+   * 用系统关联程序编辑远端文件：取到本机临时目录 → 打开 → 盯着它保存 → 存回原处。
+   *
+   * 为什么在前端编排而不是后端：编辑器是外部进程，我们既拿不到它的退出时机，
+   * 也不该为了「等它保存」在后端起一个跨会话的任务队列。轮询本机那份拷贝的
+   * mtime/size 足够，而且回传走的是上传引擎既有的 create 语义，天然就地覆盖。
+   *
+   * 收尾会把临时文件删掉：那是本机目录，不留垃圾。
+   */
+  async function editRemote(connection: number, entry: FileEntry): Promise<void> {
+    const p = panels.get(connection)
+    if (!p || entry.kind === 'dir') return
+    if (edits.has(entry.path)) {
+      p.error = `${entry.name} 还在编辑中，先等那一次收尾`
+      return
+    }
+    const token = { connection, cancelled: false }
+    edits.set(entry.path, token)
+    const note = (text: string | null): void => { p.busy = text }
+    let temp = ''
+    try {
+      const dir = await localApi.editDir()
+      temp = localJoin(dir, entry.name)
+      note(`正在取 ${entry.name} 到本机…`)
+      const down = await sftpApi.download(connection, [entry.path], dir)
+      transfers.noteStart(down, connection)
+      const taken = await waitBatchEnd(down)
+      if (taken && taken.failed > 0) throw new Error(taken.error ?? '取到本机失败')
+      if (token.cancelled) return
+      note('已交给系统编辑器，保存后自动传回')
+      await localApi.open(temp)
+      let seen = await localApi.stat(temp)
+      while (!token.cancelled) {
+        const saved = await waitForSave(temp, seen, token)
+        if (saved === null) break
+        seen = saved
+        note(`正在回传 ${entry.name}…`)
+        const up = await sftpApi.upload(connection, [temp], parentPath(entry.path))
+        transfers.noteStart(up, connection)
+        const sent = await waitBatchEnd(up)
+        if (sent && sent.failed > 0) note(`回传失败：${sent.error ?? '未知原因'}`)
+        else note('已传回远端，继续监听保存')
+        await browse(connection, null)
+      }
+    } catch (err) {
+      p.error = lastError(err)
+    } finally {
+      edits.delete(entry.path)
+      note(null)
+      if (temp !== '') await localApi.remove(temp, false).catch(() => undefined)
+    }
+  }
+
+  /**
+   * 等本机那份拷贝「变过并且稳下来」。
+   *
+   * 连续 QUIET_TICKS 轮属性不再变化才回，避免编辑器分几次写（先截断再写全）时
+   * 把半成品传回远端。`stat` 偶发失败（文件正被独占写）只跳过这一轮，不算取消。
+   */
+  async function waitForSave(target: string, from: FileEntry, token: { cancelled: boolean }): Promise<FileEntry | null> {
+    let seen = from
+    let changed = false
+    let quiet = 0
+    for (let tick = 0; tick < WATCH_TICKS; tick += 1) {
+      await sleep(TICK_MS)
+      if (token.cancelled) return null
+      let now: FileEntry
+      try {
+        now = await localApi.stat(target)
+      } catch {
+        continue
+      }
+      if (now.mtime_ms !== seen.mtime_ms || now.size !== seen.size) {
+        seen = now
+        changed = true
+        quiet = 0
+        continue
+      }
+      if (changed) {
+        quiet += 1
+        if (quiet >= QUIET_TICKS) return seen
+      }
+    }
+    return null
+  }
+
+  /**
+   * 等一个传输批次收尾。
+   *
+   * 只能轮询后端：命令只回批次号，而极快完成时 `transfer-batch-ended` 可能比前端
+   * 登记更早到，那时候挂事件就永远等不到。返回 `null` 表示「已经不跑了，但没拿到
+   * 收尾详情」或「等超时」，调用侧两种都按「继续往下走、别把用户卡住」处理。
+   */
+  async function waitBatchEnd(batch: number): Promise<TransferBatchEnded | null> {
+    for (let tick = 0; tick < 9000; tick += 1) {
+      const ended = transfers.batches.get(batch)?.ended ?? null
+      if (ended) return ended
+      const running = await transferApi.running().catch(() => null)
+      if (running !== null && !running.some(info => info.batch === batch)) {
+        await sleep(120)
+        return transfers.batches.get(batch)?.ended ?? null
+      }
+      await sleep(200)
+    }
+    return transfers.batches.get(batch)?.ended ?? null
+  }
+
+  /** 关掉文件窗口或面板时收摊：正在等的编辑循环下一轮就会退出。 */
+  function cancelEdits(connection?: number): void {
+    for (const [path, token] of edits) {
+      if (connection === undefined || token.connection === connection) {
+        token.cancelled = true
+        edits.delete(path)
+      }
+    }
+  }
+
+  /**
    * 下载远端条目到指定目录。
    *
    * `dir` 省略时落到设置里的下载目录（内嵌面板的老行为）；双栏文件窗口会显式传本机栏
@@ -260,6 +453,7 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   async function close(connection: number): Promise<void> {
+    cancelEdits(connection)
     panels.delete(connection)
     for (const [session, value] of bySession) {
       if (value === connection) bySession.delete(session)
@@ -305,8 +499,13 @@ export const useFilesStore = defineStore('files', () => {
     toggleFollow,
     setEditing,
     mkdir,
+    createFile,
     remove,
+    removeMany,
     rename,
+    chmod,
+    editRemote,
+    cancelEdits,
     download,
     upload,
     close,
