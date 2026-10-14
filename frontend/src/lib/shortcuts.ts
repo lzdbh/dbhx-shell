@@ -23,6 +23,7 @@ export interface ShortcutHandlers {
   toggleSplit: () => void
   focusNext: () => void
   openSettings: () => void
+  find: () => void
 }
 
 /** 事件对象里我们真正用得上的三个字段——单测直接造这个形状就够了。 */
@@ -84,6 +85,9 @@ export function match(
       case 'w': return h => { h.closeActive() }
       case 'e': return h => { h.toggleSplit() }
       case ',': return h => { h.openSettings() }
+      // readline 里 Ctrl+F 是「光标前移一格」，但同类客户端一律把它给了查找——
+      // 单字符移动没人用 Alt 替代，查找却是每次都靠鼠标点菜单的事。
+      case 'f': return h => { h.find() }
       default: break
     }
     if (event.code === 'Tab') {

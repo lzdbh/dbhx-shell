@@ -1,5 +1,6 @@
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { SearchAddon } from '@xterm/addon-search'
 // xterm 的骨架样式：视口滚动条、隐藏输入框、宽度测量容器全靠它定位。
 // 漏掉它不会报错，但那些辅助元素会直接显示在终端上方（输入框的缩放手柄、
 // 一行用于测宽度的重复字符），而且 `.xterm-viewport` 高度塌成 0、滚轮翻不了历史。
@@ -32,11 +33,45 @@ export interface TerminalHandlers {
 interface Entry {
   term: Terminal
   fit: FitAddon
+  search: SearchAddon
   element: HTMLDivElement
   resizeObserver: ResizeObserver | null
+  /** 最近一次查找的命中情况，由搜索插件的事件回填；没查过就是 null。 */
+  found: FindHit | null
 }
 
 const entries = new Map<SessionId, Entry>()
+
+/** 查找条件，与 xterm 搜索插件的开关一一对应。 */
+export interface FindOptions {
+  caseSensitive: boolean
+  wholeWord: boolean
+  regex: boolean
+}
+
+/** 一次查找的落点：`index` 是活动那条（0 起，`-1` = 没落点），`total` 是缓冲区里的全部命中数。 */
+export interface FindHit {
+  index: number
+  total: number
+}
+
+/**
+ * 命中高亮的配色。
+ *
+ * 非活动的命中只描边不填充：填充色要么跟着主题走（深色底上压深色字、浅色底上压浅色字，
+ * 两种里总有一种糊成一团），要么写死（另一个主题下等于看不见）。描边在两边都读得出来。
+ *
+ * `activeMatchBackground` 只有 canvas 渲染器会画；我们现在用的是默认的 DOM 渲染器，
+ * 它只认 `outline`。所以当前那一条实际靠两件事认出来：搜索插件顺手把它 `select` 了
+ * （主题的选择底色），以及描边换了更深的 `activeMatchBorder`。
+ */
+const FIND_DECORATIONS = {
+  matchBorder: '#e0a800',
+  matchOverviewRuler: '#e0a800',
+  activeMatchBackground: '#ffd54f',
+  activeMatchBorder: '#8a6d00',
+  activeMatchColorOverviewRuler: '#ff8f00',
+}
 
 /**
  * 还没人认领的会话，输出先在这儿排着。
@@ -107,6 +142,14 @@ export function ensureTerminal(
   })
   const fit = new FitAddon()
   term.loadAddon(fit)
+  const search = new SearchAddon()
+  term.loadAddon(search)
+  // 计数只在「有命中」时发事件，所以 `runFind` 里先归零、这里只负责回填。
+  // 事件是同步发的（就在 findNext 返回之前），因此那一步能读到当次的值。
+  search.onDidChangeResults(result => {
+    const held = entries.get(id)
+    if (held) held.found = { index: result.resultIndex, total: result.resultCount }
+  })
   term.onData(data => { handlers.onData(data) })
   term.onResize(({ rows, cols }) => { handlers.onResize(rows, cols) })
   const element = document.createElement('div')
@@ -118,7 +161,7 @@ export function ensureTerminal(
     if (term.hasSelection()) void copyText(term.getSelection())
     else void pasteInto(term)
   })
-  const entry: Entry = { term, fit, element, resizeObserver: null }
+  const entry: Entry = { term, fit, search, element, resizeObserver: null, found: null }
   entries.set(id, entry)
   term.open(element)
   const early = takePending(id)
@@ -157,6 +200,49 @@ export function focusTerminal(id: SessionId | null): void {
 
 export function lookup(id: SessionId): Terminal | undefined {
   return entries.get(id)?.term
+}
+
+/**
+ * 在当前会话的输出里找下一处（`forward` 为假时找上一处）。
+ *
+ * 返回 `null` 只有一种情况：这个会话还没有终端。空串按「取消高亮」处理——
+ * 查找条一边打字一边调用它，删空时不该把上一次的高亮留在屏上。
+ */
+export function findText(id: SessionId, text: string, options: FindOptions, forward: boolean): FindHit | null {
+  const entry = entries.get(id)
+  if (!entry) return null
+  if (text === '') {
+    clearFind(id)
+    return null
+  }
+  // 先归零：搜索插件在「一条都没中」时不发事件，不重置就会把上一次的计数留在屏上
+  entry.found = { index: -1, total: 0 }
+  const searchOptions = {
+    caseSensitive: options.caseSensitive,
+    wholeWord: options.wholeWord,
+    regex: options.regex,
+    decorations: FIND_DECORATIONS,
+  }
+  try {
+    if (forward) entry.search.findNext(text, searchOptions)
+    else entry.search.findPrevious(text, searchOptions)
+  } catch (err) {
+    // 正则写到一半（`ite(m`）时插件里的 `RegExp()` 会直接抛，而且抛在它「清空上一次
+    // 的高亮、但还没记下新关键词」中间——不清干净，接下来重打同一个词会因为命中缓存
+    // 而只挪动当前那条，计数永远停在 0。异常也绝不能逃出去：查找条的计数会卡旧值。
+    entry.search.clearDecorations()
+    console.warn('查找表达式求值失败', err)
+  }
+  return entry.found
+}
+
+/** 抹掉查找高亮。关掉查找条时必须调，否则黄色那格会一直留在屏上。 */
+export function clearFind(id: SessionId): void {
+  const entry = entries.get(id)
+  if (!entry) return
+  entry.search.clearDecorations()
+  entry.search.clearActiveDecoration()
+  entry.found = null
 }
 
 /** 一段 base64 输出写进终端；终端还没建时先进暂存区，建好即补写，一个字节都不丢。 */

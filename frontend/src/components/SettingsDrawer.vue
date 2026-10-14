@@ -40,6 +40,7 @@ const SHORTCUTS = [
   { keys: 'Ctrl/Cmd + Tab', what: '切到下一个标签，Shift 反向' },
   { keys: 'Ctrl/Cmd + 1…9', what: '跳到第 N 个标签' },
   { keys: 'Ctrl/Cmd + ,', what: '打开设置' },
+  { keys: 'Ctrl/Cmd + F', what: '在当前终端查找，Enter 下一条、Shift+Enter 上一条，Esc 关闭' },
   { keys: 'Alt + ←/→', what: '分屏时在两格之间移焦点' },
 ]
 

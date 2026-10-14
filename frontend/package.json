@@ -15,6 +15,7 @@
     "@tauri-apps/api": "^2.12.3",
     "@vueuse/core": "^15.0.0",
     "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.16.0",
     "@xterm/xterm": "^5.5.0",
     "ant-design-vue": "^4.2.6",
     "pinia": "^4.0.3",

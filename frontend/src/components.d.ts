@@ -49,6 +49,7 @@ declare module 'vue' {
     FileIcon: typeof import('./components/FileIcon.vue')['default']
     FileManager: typeof import('./components/FileManager.vue')['default']
     FilePane: typeof import('./components/FilePane.vue')['default']
+    FindBar: typeof import('./components/FindBar.vue')['default']
     HostFormModal: typeof import('./components/HostFormModal.vue')['default']
     HostTree: typeof import('./components/HostTree.vue')['default']
     LockOverlay: typeof import('./components/LockOverlay.vue')['default']

@@ -31,6 +31,7 @@ function fired(event: KeyEvent, options = ctx): string | null {
     toggleSplit: () => { calls.push('toggleSplit') },
     focusNext: () => { calls.push('focusNext') },
     openSettings: () => { calls.push('openSettings') },
+    find: () => { calls.push('find') },
   })
   return calls[0] ?? null
 }
@@ -48,6 +49,11 @@ describe('快捷键判定', () => {
   it('Ctrl+E 切分屏，Ctrl+, 开设置', () => {
     expect(fired(key({ key: 'e', ctrlKey: true, code: 'KeyE' }))).toBe('toggleSplit')
     expect(fired(key({ key: ',', ctrlKey: true, code: 'Comma' }))).toBe('openSettings')
+  })
+
+  it('Ctrl+F 开查找条：bash 里它是光标前移，但找东西的诉求强得多', () => {
+    expect(fired(key({ key: 'f', ctrlKey: true, code: 'KeyF' }))).toBe('find')
+    expect(fired(key({ key: 'f', metaKey: true, code: 'KeyF' }))).toBe('find')
   })
 
   it('Ctrl+1..9 选标签，Ctrl+0 不抢', () => {
@@ -104,6 +110,7 @@ describe('installShortcuts 总开关', () => {
       toggleSplit: () => {},
       focusNext: () => {},
       openSettings: () => {},
+      find: () => {},
     }
   }
 

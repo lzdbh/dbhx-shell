@@ -47,6 +47,56 @@ vi.mock('@xterm/addon-fit', () => ({
   },
 }))
 
+/**
+ * 假搜索插件。真实插件要读终端缓冲区才能定位命中，而我们要验的是自己那两条约定：
+ * 「计数取插件回填的值」和「关掉查找条要抹掉高亮」。
+ *
+ * 关键是时机：真插件在 `findNext` 返回**之前**同步发事件，且**零命中时不发**。
+ * 所以这里由测试摆好 `result`，非空才发——照这个时机写成异步的话，登记处的
+ * 「先归零再查」就永远测不出它存在的意义了。
+ */
+interface FakeSearch {
+  calls: { text: string, forward: boolean, options: Record<string, unknown> }[]
+  cleared: number
+}
+
+const searchState = vi.hoisted(() => ({
+  instances: [] as FakeSearch[],
+  result: null as { resultIndex: number, resultCount: number } | null,
+}))
+
+vi.mock('@xterm/addon-search', () => ({
+  SearchAddon: class {
+    changes: ((result: { resultIndex: number, resultCount: number }) => void)[] = []
+    calls: { text: string, forward: boolean, options: Record<string, unknown> }[] = []
+    cleared = 0
+
+    constructor() {
+      searchState.instances.push(this as unknown as FakeSearch)
+    }
+
+    dispose(): void {}
+    onDidChangeResults(cb: (result: { resultIndex: number, resultCount: number }) => void): { dispose: () => void } {
+      this.changes.push(cb)
+      return { dispose() {} }
+    }
+
+    findNext(text: string, options: Record<string, unknown>): void { this.lookup(text, true, options) }
+    findPrevious(text: string, options: Record<string, unknown>): void { this.lookup(text, false, options) }
+    clearDecorations(): void { this.cleared += 1 }
+    clearActiveDecoration(): void { this.cleared += 1 }
+
+    private lookup(text: string, forward: boolean, options: Record<string, unknown>): void {
+      this.calls.push({ text, forward, options })
+      // 真插件在 regex 模式下直接 `RegExp(关键词)`：写到一半就抛。
+      // 照抄这一步，才能测出登记处有没有把异常接住。
+      if (options.regex) RegExp(text)
+      if (searchState.result === null) return
+      for (const cb of this.changes) cb(searchState.result)
+    }
+  },
+}))
+
 // happy-dom 不提供 ResizeObserver；登记处只用它触发重新 fit，测试里不需要真观察
 globalThis.ResizeObserver ??= class {
   observe(): void {}
@@ -300,5 +350,79 @@ describe('终端剪贴板', () => {
     await flush()
     expect(term.pasted).toEqual([])
     clip.state.denied = false
+  })
+})
+
+describe('终端查找', () => {
+  const options = { caseSensitive: false, wholeWord: false, regex: false }
+
+  /** 每建一个终端就多一个插件实例，测试都只用刚建的那一个。 */
+  function lastSearch(): FakeSearch {
+    return searchState.instances[searchState.instances.length - 1]!
+  }
+
+  beforeEach(() => {
+    searchState.result = null
+  })
+
+  it('还没建终端的会话：查不到也不抛', () => {
+    expect(registry.findText(9998, 'err', options, true)).toBeNull()
+    expect(() => { registry.clearFind(9998) }).not.toThrow()
+  })
+
+  it('空串是取消而不是查找：清高亮、不给插件发一次查找', () => {
+    registry.ensureTerminal(30, theme, 13, handlers)
+    const addon = lastSearch()
+    expect(registry.findText(30, '', options, true)).toBeNull()
+    expect(addon.calls).toHaveLength(0)
+    expect(addon.cleared).toBeGreaterThan(0)
+  })
+
+  it('方向决定用 findNext 还是 findPrevious，高亮配色一并交出去', () => {
+    registry.ensureTerminal(31, theme, 13, handlers)
+    const addon = lastSearch()
+    registry.findText(31, 'error', options, true)
+    registry.findText(31, 'error', { ...options, caseSensitive: true }, false)
+    expect(addon.calls.map(c => [c.text, c.forward])).toEqual([['error', true], ['error', false]])
+    expect(addon.calls[0]!.options.decorations).toBeDefined()
+    expect(addon.calls[1]!.options.caseSensitive).toBe(true)
+  })
+
+  it('命中时报「第几条共几条」，插件给的下标是 0 起的', () => {
+    registry.ensureTerminal(32, theme, 13, handlers)
+    searchState.result = { resultIndex: 2, resultCount: 5 }
+    expect(registry.findText(32, 'warn', options, true)).toEqual({ index: 2, total: 5 })
+  })
+
+  it('一条都没中时停在 0 条：不能把上一次的计数留在屏上', () => {
+    registry.ensureTerminal(33, theme, 13, handlers)
+    searchState.result = { resultIndex: 0, resultCount: 3 }
+    expect(registry.findText(33, 'warn', options, true)).toEqual({ index: 0, total: 3 })
+    // 换个不存在的词：真插件零命中时不发事件，登记处必须自己归零
+    searchState.result = null
+    expect(registry.findText(33, 'nothing', options, true)).toEqual({ index: -1, total: 0 })
+  })
+
+  it('非法正则不许把异常抛给调用方：按「无匹配」收场，并把高亮收干净', () => {
+    registry.ensureTerminal(35, theme, 13, handlers)
+    const addon = lastSearch()
+    // 用户边打字边查，`ite(m` 这种半截正则是必经之路，不是异常情况
+    expect(registry.findText(35, 'ite(m', { ...options, regex: true }, true)).toEqual({ index: -1, total: 0 })
+    // 插件抛在它已经清过高亮、却还没记下新关键词的地方；不跟着清一次，
+    // 重打同一个词会命中它的缓存，只剩当前那一格、计数永远停在 0
+    expect(addon.cleared).toBeGreaterThan(0)
+    expect(registry.findText(35, 'ite(m)', { ...options, regex: true }, true)).toEqual({ index: -1, total: 0 })
+  })
+
+  it('clearFind 抹掉高亮并把计数收回 null', () => {
+    registry.ensureTerminal(34, theme, 13, handlers)
+    const addon = lastSearch()
+    searchState.result = { resultIndex: 0, resultCount: 1 }
+    registry.findText(34, 'warn', options, true)
+    registry.clearFind(34)
+    // 描边和当前命中那条是两次调用，少一次就还剩一格黄留在屏上
+    expect(addon.cleared).toBe(2)
+    searchState.result = null
+    expect(registry.findText(34, 'warn', options, true)).toEqual({ index: -1, total: 0 })
   })
 })

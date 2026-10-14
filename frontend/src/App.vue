@@ -8,6 +8,7 @@ import { applyFontSizeAll, applyTheme, focusTerminal } from '@/lib/terminal/regi
 import { installShortcuts, type ShortcutHandlers } from '@/lib/shortcuts'
 import { clearSaved, resolve, save, savedSessions } from '@/lib/session-restore'
 import AskModal from '@/components/AskModal.vue'
+import FindBar from '@/components/FindBar.vue'
 import HostTree from '@/components/HostTree.vue'
 import LockOverlay from '@/components/LockOverlay.vue'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
@@ -30,6 +31,7 @@ const themeStore = useThemeStore()
 const transfers = useTransfersStore()
 
 const drawerOpen = ref(false)
+const findOpen = ref(false)
 
 let stopBridge: (() => void) | null = null
 let stopShortcuts: (() => void) | null = null
@@ -135,6 +137,7 @@ const shortcuts: ShortcutHandlers = {
   toggleSplit,
   focusNext: cycleFocus,
   openSettings: () => { drawerOpen.value = true },
+  find: () => { findOpen.value = true },
 }
 
 /**
@@ -236,6 +239,8 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
             </a-button>
           </div>
           <div class="terminal-area" :class="{ split: splitActive }">
+            <!-- 查找条浮在格子上，不挤布局：一挤就要重新 fit，画面会跳一下 -->
+            <FindBar v-model:open="findOpen" :session="focusedSession" />
             <!-- 焦点格高亮不用 :focus-within：用户点了文件面板之后焦点离开了终端，
                  但键盘下一条输入仍然属于这一格 -->
             <TerminalPane
@@ -308,6 +313,8 @@ watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
 }
 
 .terminal-area {
+  /* 查找条以它为定位基准，改成 absolute 的 containing block 就靠这一句 */
+  position: relative;
   display: flex;
   flex: 1;
   min-height: 0;
