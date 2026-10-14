@@ -184,6 +184,31 @@ function splitPattern(pattern: string): { host: string, port: number } {
       </a-form-item>
 
       <a-divider orientation="left">
+        关键字高亮
+      </a-divider>
+      <!-- 命中判定在 lib/terminal/highlight.ts，这里只填规则表。顺序即优先级：一行里
+           两个词撞上时，排在前面的那条赢，所以列表自上而下读就是「越靠前越重要」 -->
+      <p class="hint-line">
+        命中的关键字在终端里涂上底色；只涂底色不改字色，DOM 渲染器画不出后者。
+      </p>
+      <div v-for="rule in settings.highlightRules" :key="rule.id" class="hl-row">
+        <a-input v-model:value="rule.pattern" size="small" class="hl-pattern" placeholder="关键字，勾上正则后按正则写" />
+        <!-- AntDV 4.2 没有 ColorPicker，用原生取色框：它给出的永远是 `#rrggbb`，
+             正好是编译环节认的格式，省得再让用户手敲十六进制 -->
+        <input v-model="rule.background" type="color" class="hl-color" title="命中底色" aria-label="命中底色">
+        <a-checkbox v-model:checked="rule.regex">正则</a-checkbox>
+        <a-checkbox v-model:checked="rule.caseSensitive">区分大小写</a-checkbox>
+        <a-checkbox v-model:checked="rule.bell">响铃</a-checkbox>
+        <a-checkbox v-model:checked="rule.enabled">启用</a-checkbox>
+        <a-button size="small" type="text" danger @click="settings.removeHighlightRule(rule.id)">
+          删除
+        </a-button>
+      </div>
+      <a-button size="small" @click="settings.addHighlightRule()">
+        新增规则
+      </a-button>
+
+      <a-divider orientation="left">
         快捷键
       </a-divider>
       <!-- 只做展示：判定逻辑在 lib/shortcuts.ts，这里写错了不会影响行为，但会误导用户，
@@ -338,5 +363,34 @@ function splitPattern(pattern: string): { host: string, port: number } {
 .dim {
   opacity: 0.6;
   margin-left: 6px;
+}
+
+.hint-line {
+  margin: 0 0 8px;
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+.hl-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.hl-pattern {
+  width: 220px;
+}
+
+/* 原生取色框默认带一圈内边距，压成和旁边小控件同高 */
+.hl-color {
+  width: 34px;
+  height: 24px;
+  padding: 0 2px;
+  border: 1px solid rgba(128, 128, 128, 0.45);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
 }
 </style>

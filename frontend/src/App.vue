@@ -4,7 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { theme } from 'ant-design-vue'
 
 import { startEventBridge } from '@/lib/ipc/bus'
-import { applyFontSizeAll, applyTheme, focusTerminal } from '@/lib/terminal/registry'
+import { applyFontSizeAll, applyTheme, focusTerminal, setHighlightRules } from '@/lib/terminal/registry'
 import { installShortcuts, type ShortcutHandlers } from '@/lib/shortcuts'
 import { clearSaved, resolve, save, savedSessions } from '@/lib/session-restore'
 import AskModal from '@/components/AskModal.vue'
@@ -197,6 +197,9 @@ watch(() => themeStore.terminalTheme, next => {
 })
 
 watch(() => settings.fontSize, size => { applyFontSizeAll(size) })
+
+// 关键字规则是全局偏好：改一条，所有已经开着的终端立刻重画
+watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { deep: true })
 </script>
 
 <template>

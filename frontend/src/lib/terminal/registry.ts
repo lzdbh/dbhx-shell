@@ -1,4 +1,5 @@
 import { Terminal } from '@xterm/xterm'
+import type { IDecoration, IMarker } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { SearchAddon } from '@xterm/addon-search'
 // xterm 的骨架样式：视口滚动条、隐藏输入框、宽度测量容器全靠它定位。
@@ -10,6 +11,8 @@ import type { SessionId } from '../ipc/bindings'
 import { clipboardApi } from '../ipc/client'
 import { decodeBase64 } from '../bytes'
 import type { TerminalTheme } from '../../stores/theme'
+import { beep } from './beep'
+import { compile, scanLine, type CompiledRule, type HighlightRule } from './highlight'
 
 /**
  * xterm 实例的登记处。
@@ -45,6 +48,12 @@ interface Entry {
   resizeObserver: ResizeObserver | null
   /** 最近一次查找的命中情况，由搜索插件的事件回填；没查过就是 null。 */
   found: FindHit | null
+  /** 关键字高亮：一处命中一份（标记 + 装饰），内容、视口或规则一变就整批重来。 */
+  highlights: { marker: IMarker, decoration: IDecoration }[]
+  /** 上一次重画时光标停在哪一行。绝对行号比它靠后的，都是这一轮才写出来的行。 */
+  lastCursorLine: number
+  /** 上一次重画时那一行的文本。光标会先跳到下一行、内容才落到上一行，光看行号分不出「刚敲完的命令」和「刚打出的报错」。 */
+  lastCursorText: string
 }
 
 const entries = new Map<SessionId, Entry>()
@@ -78,6 +87,91 @@ const FIND_DECORATIONS = {
   activeMatchBackground: '#ffd54f',
   activeMatchBorder: '#8a6d00',
   activeMatchColorOverviewRuler: '#ff8f00',
+}
+
+/**
+ * 关键字高亮的规则，全局一份：这是「我看日志时什么算扎眼」的偏好，
+ * 不是每会话属性——同一台机器上开十个终端，盯的是同一批词。
+ */
+let highlightRules: CompiledRule[] = []
+
+/** 换成半透明：装饰元素盖在文字上面画，不透明就把字整个吃掉了。 */
+function tint(hex: string): string {
+  const value = Number.parseInt(hex.slice(1), 16)
+  return `rgba(${(value >> 16) & 0xff}, ${(value >> 8) & 0xff}, ${value & 0xff}, 0.45)`
+}
+
+/**
+ * 换一批关键字规则，所有终端立刻重画。
+ *
+ * 设置页每改一个字符都会走到这里，所以它必须便宜且不抛：编译失败的规则在
+ * `compile()` 里已经降级成「不参与匹配」，重画只是把旧的装饰摘掉再挂一批。
+ */
+export function setHighlightRules(rules: HighlightRule[]): void {
+  highlightRules = compile(rules)
+  entries.forEach((_, id) => { repaintHighlights(id) })
+}
+
+/**
+ * 重画当前视口里的关键字底色。
+ *
+ * 只画视口，不画整个回滚缓冲：装饰要占一个锚定标记，八千行全画会在滚动时
+ * 拖住渲染；而滚出去的部分本来也看不见，滚回来时 `onScroll` 会再画一次。
+ */
+function repaintHighlights(id: SessionId): void {
+  const entry = entries.get(id)
+  if (!entry) return
+  for (const held of entry.highlights) {
+    held.decoration.dispose()
+    held.marker.dispose()
+  }
+  entry.highlights = []
+  const term = entry.term
+  const buffer = term.buffer.active
+  // 标记的偏移是相对光标行算的，先拿到这个基准
+  const anchor = buffer.baseY + buffer.cursorY
+  const cursorRow = buffer.getLine(anchor)
+  const cursorText = cursorRow ? cursorRow.translateToString(true) : ''
+  if (highlightRules.length === 0) {
+    entry.lastCursorLine = anchor
+    entry.lastCursorText = cursorText
+    return
+  }
+  let shouldRing = false
+  // 第一次重画面对的是建实例时攒下来的那批输出（登录横幅、暂存区补写），
+  // 内容对用户来说全是「旧的」，不该因为里面恰好有个 error 就吵人。
+  const first = entry.lastCursorLine < 0
+  for (let row = 0; row < term.rows; row += 1) {
+    const lineIndex = buffer.viewportY + row
+    const line = buffer.getLine(lineIndex)
+    if (!line) continue
+    const text = line.translateToString(true)
+    const hits = scanLine(text, highlightRules)
+    // 光标会先跳到下一行、内容才落进上一行，所以「行号大于上次的光标行」并不足以
+    // 判定这一行是新写的：回车之后那一行往往已经等于上次的光标行。补一条文本比对，
+    // 就能把「用户刚敲完的命令回显」（文本没变）和「刚打出来的报错」（文本变了）分开。
+    const fresh = lineIndex > entry.lastCursorLine
+      || (lineIndex === entry.lastCursorLine && text !== entry.lastCursorText)
+    for (const hit of hits) {
+      const marker = term.registerMarker(lineIndex - anchor)
+      // 已经掉出缓冲区的行（标记 line 为 -1）不值得再挂装饰
+      if (marker.line < 0) continue
+      const decoration = term.registerDecoration({ marker, x: hit.start, width: hit.end - hit.start })
+      if (!decoration) continue
+      const rule = highlightRules[hit.rule].rule
+      decoration.onRender(element => { element.style.backgroundColor = tint(rule.background) })
+      entry.highlights.push({ marker, decoration })
+      // 响铃只认「这一轮刚刚写完的整行」：行要新（上面算的 fresh），又要已经换行收尾
+      // （行号小于这次的光标行）。判据不能用视口底行——报错行后面还跟着提示符，
+      // 永远不是最后一行，实测一条铃都响不起来。而光标那一行很可能正是用户正在敲的
+      // 命令，敲到 `echo FATAL` 的最后一个字母就响等于自己吓自己。
+      if (rule.bell && !first && fresh && lineIndex < anchor) shouldRing = true
+    }
+  }
+  if (shouldRing) beep()
+  // 无条件跟进：清屏或回滚区被截断时绝对行号会倒退，停在旧值会把之后的真输出当成历史
+  entry.lastCursorLine = anchor
+  entry.lastCursorText = cursorText
 }
 
 /**
@@ -175,9 +269,14 @@ export function ensureTerminal(
     event.preventDefault()
     handlers.onZoom(event.deltaY < 0 ? 1 : -1)
   }, { passive: false })
-  const entry: Entry = { term, fit, search, element, resizeObserver: null, found: null }
+  const entry: Entry = { term, fit, search, element, resizeObserver: null, found: null, highlights: [], lastCursorLine: -1, lastCursorText: '' }
   entries.set(id, entry)
   term.open(element)
+  // 关键字高亮跟着三件事重画：内容变了、视口滚了、格子改大小了。屏幕上的行只在这
+  // 三个时刻会变，别去 `onRender` 里每帧重扫一遍。
+  term.onWriteParsed(() => { repaintHighlights(id) })
+  term.onScroll(() => { repaintHighlights(id) })
+  term.onResize(() => { repaintHighlights(id) })
   const early = takePending(id)
   if (early) term.write(early)
   // 格子大小由 CSS 决定（分屏比例、侧栏拖动都会改它），ResizeObserver 是唯一

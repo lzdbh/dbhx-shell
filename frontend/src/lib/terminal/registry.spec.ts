@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionId } from '../ipc/bindings'
 import type { TerminalTheme } from '../../stores/theme'
+import type { HighlightRule } from './highlight'
 
 /**
  * 登记处的测试重点是**元素归属**，不是 xterm 本身。
@@ -10,6 +11,25 @@ import type { TerminalTheme } from '../../stores/theme'
  * 渲染与回滚缓冲是 xterm 的事，不该由我们测；真正会咬人的是我们自己的两条承诺——
  * 「同一会话不会有两个 DOM 副本」和「换格子不丢日志」。
  */
+class FakeMarker {
+  disposed = false
+
+  constructor(readonly line: number) {}
+
+  dispose(): void { this.disposed = true }
+}
+
+/** 真装饰要等渲染那一帧才发 `onRender`，假的一建好就发：测试关心的是底色有没有落上去。 */
+class FakeDecoration {
+  readonly element = document.createElement('div')
+  disposed = false
+
+  constructor(readonly options: Record<string, unknown>) {}
+
+  onRender(cb: (element: HTMLElement) => void): void { cb(this.element) }
+  dispose(): void { this.disposed = true }
+}
+
 class FakeTerminal {
   options: Record<string, unknown>
   rows = 0
@@ -23,6 +43,21 @@ class FakeTerminal {
   keyHandler: ((event: KeyboardEvent) => boolean) | null = null
   /** 被 fit 了几次。字号变化后必须重算行列，验的就是这个数。 */
   fitCount = 0
+  /** 关键字高亮要读缓冲区：几行文本 + 视口位置，够喂扫描逻辑就行。 */
+  lines: string[] = []
+  markers: FakeMarker[] = []
+  decorations: FakeDecoration[] = []
+  buffer = {
+    active: {
+      baseY: 0,
+      cursorY: 0,
+      viewportY: 0,
+      getLine: (index: number) => {
+        const text = this.lines[index]
+        return text === undefined ? undefined : { translateToString: () => text }
+      },
+    },
+  }
 
   constructor(options: Record<string, unknown>) {
     this.options = options
@@ -35,6 +70,19 @@ class FakeTerminal {
   open(element: HTMLElement): void { this.openedIn = element }
   onData(): { dispose: () => void } { return { dispose() {} } }
   onResize(): { dispose: () => void } { return { dispose() {} } }
+  onScroll(): { dispose: () => void } { return { dispose() {} } }
+  onWriteParsed(): { dispose: () => void } { return { dispose() {} } }
+  /** 真 xterm 的标记锚在「光标行 + 偏移」上，行号随滚动/裁剪变动，这里照抄这个算法。 */
+  registerMarker(offset: number): FakeMarker {
+    const marker = new FakeMarker(this.buffer.active.baseY + this.buffer.active.cursorY + offset)
+    this.markers.push(marker)
+    return marker
+  }
+  registerDecoration(options: Record<string, unknown>): FakeDecoration {
+    const decoration = new FakeDecoration(options)
+    this.decorations.push(decoration)
+    return decoration
+  }
   write(data: Uint8Array): void { this.writes.push(data) }
   focus(): void { this.focusCount += 1 }
   dispose(): void { this.disposed = true }
@@ -147,6 +195,13 @@ const clip = vi.hoisted(() => {
 })
 
 vi.mock('../ipc/client', () => ({ clipboardApi: clip }))
+
+/** 响铃走 Web Audio，测试环境既没有设备也不该真出声；这里只数它被敲了几次。 */
+const rings = vi.hoisted(() => ({ count: 0 }))
+
+vi.mock('./beep', () => ({
+  beep: () => { rings.count += 1 },
+}))
 
 /** 复制/粘贴都挂在 promise 上，`void` 掉了就要给事件循环一次机会才能看到结果。 */
 function flush(): Promise<void> {
@@ -474,5 +529,156 @@ describe('终端查找', () => {
     expect(addon.cleared).toBe(2)
     searchState.result = null
     expect(registry.findText(34, 'warn', options, true)).toEqual({ index: -1, total: 0 })
+  })
+})
+
+describe('关键字高亮', () => {
+  function keyword(over: Partial<HighlightRule> = {}): HighlightRule {
+    return { id: 'r', pattern: 'error', regex: false, caseSensitive: false, background: '#ff0000', bell: false, enabled: true, ...over }
+  }
+
+  afterEach(() => {
+    // 规则是模块级的全局状态，不清掉会串到下一条用例的终端上
+    registry.setHighlightRules([])
+    // 更要紧的是把终端拆掉：`setHighlightRules` 会重画**所有**已存在的会话，
+    // 上一个用例留下的终端会跟着响铃、把计数算到当前用例头上
+    for (const id of [40, 41, 42, 43, 44, 45, 46, 47]) registry.destroyTerminal(id)
+    rings.count = 0
+  })
+
+  /** 假终端的 `decorations` 是创建流水账，还活着的才是屏上的底色。 */
+  function live(term: FakeTerminal): FakeDecoration[] {
+    return term.decorations.filter(decoration => !decoration.disposed)
+  }
+
+  it('命中处挂装饰：列位置与宽度按字符下标算，底色落在元素上', () => {
+    registry.ensureTerminal(40, theme, 13, handlers)
+    const term = fake(40)
+    if (!term) throw new Error('终端没建出来')
+    term.rows = 2
+    term.lines = ['a error here', 'nothing']
+    registry.setHighlightRules([keyword()])
+    expect(live(term)).toHaveLength(1)
+    expect(term.decorations[0].options).toMatchObject({ x: 2, width: 5 })
+    expect(term.decorations[0].element.style.backgroundColor).toContain('255, 0, 0')
+  })
+
+  it('标记落在它该落的缓冲区行上：偏移以光标所在行为基准', () => {
+    registry.ensureTerminal(41, theme, 13, handlers)
+    const term = fake(41)
+    if (!term) throw new Error('终端没建出来')
+    const buffer = term.buffer.active
+    buffer.baseY = 10
+    buffer.cursorY = 3
+    buffer.viewportY = 6
+    term.rows = 2
+    // 视口两行是缓冲区的第 6、7 行，只有后者有关键字
+    term.lines = ['', '', '', '', '', '', 'nothing', 'error here']
+    registry.setHighlightRules([keyword()])
+    expect(term.markers.map(m => m.line)).toEqual([7])
+  })
+
+  it('规则换第二批时旧装饰全部释放，不留残影', () => {
+    registry.ensureTerminal(42, theme, 13, handlers)
+    const term = fake(42)
+    if (!term) throw new Error('终端没建出来')
+    term.rows = 1
+    term.lines = ['error error']
+    registry.setHighlightRules([keyword()])
+    const first = term.decorations.slice()
+    expect(first).toHaveLength(2)
+    registry.setHighlightRules([keyword({ id: 'r2', pattern: 'nothing' })])
+    expect(first.every(d => d.disposed)).toBe(true)
+    expect(live(term)).toHaveLength(0)
+  })
+
+  it('清空规则等于把屏上所有底色收掉', () => {
+    registry.ensureTerminal(43, theme, 13, handlers)
+    const term = fake(43)
+    if (!term) throw new Error('终端没建出来')
+    term.rows = 1
+    term.lines = ['error']
+    registry.setHighlightRules([keyword()])
+    const held = term.decorations.slice()
+    registry.setHighlightRules([])
+    expect(held.every(d => d.disposed)).toBe(true)
+    expect(live(term)).toHaveLength(0)
+  })
+
+  /** 把假终端摆成「缓冲区有 n 行、光标停在第 n-1 行」的样子，再让登记处重画一次。 */
+  function paint(term: FakeTerminal, lines: string[], cursorLine: number, viewportY = 0): void {
+    term.rows = 3
+    term.lines = lines
+    const buffer = term.buffer.active
+    buffer.baseY = 0
+    buffer.cursorY = cursorLine
+    buffer.viewportY = viewportY
+  }
+
+  it('响铃只在新命中行写出来时响一次：同一行反复重画不能一直响', () => {
+    registry.ensureTerminal(44, theme, 13, handlers)
+    const term = fake(44)
+    if (!term) throw new Error('终端没建出来')
+    // 建实例时补写的那批（登录横幅、提示符）对用户来说是旧内容，一条都不该响
+    paint(term, ['', 'make: error 1', 'prompt$ '], 2)
+    registry.setHighlightRules([keyword({ bell: true })])
+    expect(rings.count).toBe(0)
+    // 新输出的报错行落在第 3 行，光标走到第 4 行、视口跟着滚到底（只画视口内的三行）
+    paint(term, ['', 'make: error 1', 'prompt$ ', 'npm error code 1', 'prompt$ '], 4, 2)
+    registry.setHighlightRules([keyword({ bell: true })])
+    expect(rings.count).toBe(1)
+    // 同一屏上因为滚动或改字号再画一次：报错还是那一行，不该再响
+    registry.setHighlightRules([keyword({ bell: true })])
+    expect(rings.count).toBe(1)
+  })
+
+  it('光标那一行不算写完：敲 `echo FATAL` 敲到一半不响，换行收尾才响', () => {
+    registry.ensureTerminal(45, theme, 13, handlers)
+    const term = fake(45)
+    if (!term) throw new Error('终端没建出来')
+    const rules = [keyword({ pattern: 'FATAL', bell: true })]
+    paint(term, ['', ''], 1)
+    registry.setHighlightRules(rules)
+    expect(rings.count).toBe(0)
+    // 用户正在提示符上打这条命令，回显落在光标行
+    paint(term, ['', 'C:\\>echo FATAL', ''], 1)
+    registry.setHighlightRules(rules)
+    expect(rings.count).toBe(0)
+    // 回车：光标先跳到下一行，这一行的命令回显文本一个字没变 → 还是不该响
+    paint(term, ['', 'C:\\>echo FATAL', '', ''], 2)
+    registry.setHighlightRules(rules)
+    expect(rings.count).toBe(0)
+    // 输出落到那一行上，光标又往前走了一行：这一下才是「刚打完的一行」
+    paint(term, ['', 'C:\\>echo FATAL', 'FATAL', ''], 3)
+    registry.setHighlightRules(rules)
+    expect(rings.count).toBe(1)
+    // 同一屏再画一次（滚动、改字号）：文本没变，不会跟着补响
+    registry.setHighlightRules(rules)
+    expect(rings.count).toBe(1)
+  })
+
+  it('翻回滚区翻到去年的报错不该被吵到', () => {
+    registry.ensureTerminal(46, theme, 13, handlers)
+    const term = fake(46)
+    if (!term) throw new Error('终端没建出来')
+    paint(term, ['old error here', '', '', '', '', '', '', 'prompt$ '], 7, 5)
+    registry.setHighlightRules([keyword({ bell: true })])
+    expect(rings.count).toBe(0)
+    // 向上滚到顶部：命中行的编号比上次的光标行还小，属于历史
+    paint(term, ['old error here', '', '', '', '', '', '', 'prompt$ '], 7, 0)
+    registry.setHighlightRules([keyword({ bell: true })])
+    expect(rings.count).toBe(0)
+  })
+
+  it('规则没开响铃时一声都不响', () => {
+    registry.ensureTerminal(47, theme, 13, handlers)
+    const term = fake(47)
+    if (!term) throw new Error('终端没建出来')
+    paint(term, ['', 'error'], 1)
+    registry.setHighlightRules([keyword()])
+    expect(live(term)).toHaveLength(1)
+    paint(term, ['', 'error', 'error'], 2)
+    registry.setHighlightRules([keyword()])
+    expect(rings.count).toBe(0)
   })
 })

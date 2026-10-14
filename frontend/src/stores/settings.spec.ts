@@ -2,7 +2,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { nextTick } from 'vue'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE, useSettingsStore } from './settings'
+import { DEFAULT_FONT_SIZE, DEFAULT_HIGHLIGHT_COLOR, MAX_FONT_SIZE, MIN_FONT_SIZE, useSettingsStore } from './settings'
 
 const KEY = 'dbhx:settings'
 
@@ -58,5 +58,46 @@ describe('settings store', () => {
     setActivePinia(createPinia())
     // 0 号字体不是「看不见」那么无害，xterm 会直接算不出行列
     expect(useSettingsStore().fontSize).toBe(MIN_FONT_SIZE)
+  })
+})
+
+describe('关键字高亮规则', () => {
+  it('新增的规则自带底色与 id，删掉后不再回来', async () => {
+    const settings = useSettingsStore()
+    expect(settings.highlightRules).toEqual([])
+    const first = settings.addHighlightRule()
+    expect(first.background).toBe(DEFAULT_HIGHLIGHT_COLOR)
+    expect(first.enabled).toBe(true)
+    const second = settings.addHighlightRule()
+    settings.removeHighlightRule(first.id)
+    expect(settings.highlightRules.map(item => item.id)).toEqual([second.id])
+    await nextTick()
+    expect(JSON.parse(localStorage.getItem(KEY) ?? '{}').highlightRules).toHaveLength(1)
+  })
+
+  it('两条规则的 id 不能撞：列表靠它做 key 和删除依据', () => {
+    const settings = useSettingsStore()
+    const ids = new Set([settings.addHighlightRule().id, settings.addHighlightRule().id, settings.addHighlightRule().id])
+    expect(ids.size).toBe(3)
+  })
+
+  it('盘上的坏规则整条丢掉，字段缺项回落默认', () => {
+    localStorage.setItem(KEY, JSON.stringify({
+      highlightRules: [
+        { pattern: 'error', background: '#00ff00', regex: true, bell: true },
+        { pattern: '' },
+        { background: '#00ff00' },
+        '不是对象',
+        { pattern: 'warn', background: 'red' },
+      ],
+    }))
+    setActivePinia(createPinia())
+    const rules = useSettingsStore().highlightRules
+    // 空串和缺 pattern 的两条会命中一切或什么都不命中，都不能留
+    expect(rules).toHaveLength(2)
+    expect(rules[0]).toMatchObject({ pattern: 'error', regex: true, bell: true, caseSensitive: false, enabled: true })
+    // 认不出的颜色回落到默认底色，而不是把 `red` 交给 xterm 去猜
+    expect(rules[1]).toMatchObject({ pattern: 'warn', background: DEFAULT_HIGHLIGHT_COLOR })
+    expect(rules[0].id).not.toBe(rules[1].id)
   })
 })
