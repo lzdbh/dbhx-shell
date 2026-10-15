@@ -25,3 +25,6 @@ Thumbs.db
 
 # 机器本地 cargo 镜像配置（公司网络下官方 crates.io 会停滞），不提交
 .cargo/
+
+# 云同步接口探测脚本：一次性脚手架，令牌从仓库外的文件读，不入库
+tools/sync-probe.mjs

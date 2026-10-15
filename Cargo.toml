@@ -48,6 +48,11 @@ portable-pty = "0.9"
 aes-gcm = "0.10"
 keyring = "4"
 
+# 云同步信封的 KDF。纯 Rust（blake2 是它的自带依赖，不引 C），
+# 选 Argon2id 而不是已经在树里的 ring/PBKDF2：云端那份密文要按「谁都能下载」设防，
+# 离线爆破没有速率限制，内存硬参数是把显卡优势打掉的那一道。
+argon2 = "0.5"
+
 # 系统剪贴板。前端用 `navigator.clipboard` 读写会在 WebView2 上弹出原生的
 # 「xx 想要查看复制到剪贴板的文本」授权气泡——桌面应用不该有这种交互，
 # 所以剪贴板访问下沉到 Rust。纯 Rust 实现（windows-sys / objc2 / x11rb），
