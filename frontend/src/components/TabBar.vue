@@ -174,6 +174,8 @@ watch(() => sessions.logNotice, (text) => {
       </button>
     </div>
     <div class="actions">
+      <!-- 三个开关只画图标，名字交给悬浮提示：这条栏优先把宽度让给标签页。
+           开/关状态不能只靠图标，所以留着 primary 高亮 -->
       <!-- 开关是全局的，栏子却是每格一条、各发各的会话。一个会话都没有时开了也只
            剩一条空栏，所以直接禁用，别让用户按了没反应去猜是不是坏了 -->
       <a-tooltip :title="quick.visible ? '收起快捷命令栏（Ctrl+Shift+K）' : '打开快捷命令栏（Ctrl+Shift+K）'">
@@ -186,15 +188,15 @@ watch(() => sessions.logNotice, (text) => {
           <template #icon>
             <ControlOutlined />
           </template>
-          命令栏
         </a-button>
       </a-tooltip>
-      <a-button size="small" :disabled="sessions.activeId === null" @click="void openPanel(activeTab)">
-        <template #icon>
-          <FolderOpenOutlined />
-        </template>
-        文件面板
-      </a-button>
+      <a-tooltip title="打开文件面板">
+        <a-button size="small" :disabled="sessions.activeId === null" @click="void openPanel(activeTab)">
+          <template #icon>
+            <FolderOpenOutlined />
+          </template>
+        </a-button>
+      </a-tooltip>
       <a-tooltip
         :title="activeTab?.logPath ? '停止记录会话日志' : '把当前会话的输出原样抄进本地文件（口令也会被抄进去）'"
       >
@@ -207,7 +209,6 @@ watch(() => sessions.logNotice, (text) => {
           <template #icon>
             <VideoCameraOutlined />
           </template>
-          日志
         </a-button>
       </a-tooltip>
       <!-- 状态自己画点：a-tag 的 green 是组件库预设色，和标签页里那个点是两套颜色，
