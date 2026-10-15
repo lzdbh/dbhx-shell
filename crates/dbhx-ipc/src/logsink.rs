@@ -104,10 +104,21 @@ impl LogRegistry {
     }
 
     /// 停止记录并回落点信息。没在记录时回 `NotFound`，让前端知道状态已经不一致。
+    ///
+    /// 返回之前先把落点 flush 一遍：tokio 的 `fs::File` 是「write 先收进自己的
+    /// 内部缓冲，真正的落盘丢给阻塞线程池补」，所以最后一个 `tee` 的 `write_all`
+    /// 返回时，文件里可能还没有那一段。不补这一记，用户点完停止立刻去开文件，
+    /// 会看到少一截的日志；而且最后一段写失败时也没有下一个调用能替它报错。
     pub async fn stop(&self, session: SessionId) -> Result<LogSummary, IpcError> {
         let mut map = self.inner.lock().await;
         match map.remove(&session) {
-            Some(log) => Ok(summary_of(&log)),
+            Some(mut log) => {
+                if let Err(e) = log.file.flush().await {
+                    let path = log.path.to_string_lossy().into_owned();
+                    return Err(IpcError::new(ErrorCode::Io, format!("写入 {path} 失败：{e}"), false));
+                }
+                Ok(summary_of(&log))
+            }
             None => Err(IpcError::new(ErrorCode::NotFound, "这个会话没有正在记录的日志", false)),
         }
     }
@@ -116,8 +127,13 @@ impl LogRegistry {
     ///
     /// 不发事件——tab 本身跟着消失了，前端的「正在记录」指示灯也一起没，
     /// 再发一条只是多此一举（见 [`crate::events::SessionLogStopped`] 的说明）。
+    /// 这里同样要 flush：没人可报错，但至少别让最后一段烂在缓冲里。
     pub async fn close_quietly(&self, session: SessionId) {
-        let Some(summary) = self.inner.lock().await.remove(&session).as_ref().map(summary_of) else { return };
+        let Some(mut log) = self.inner.lock().await.remove(&session) else { return };
+        if let Err(e) = log.file.flush().await {
+            tracing::warn!(path = %log.path.to_string_lossy(), error = %e, "会话结束，日志最后一段没写进去");
+        }
+        let summary = summary_of(&log);
         tracing::debug!(path = %summary.path, bytes = summary.bytes, "会话结束，日志已收尾");
     }
 }
