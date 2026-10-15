@@ -507,6 +507,7 @@ function onRemoveCancel(): void {
         @contextmenu.prevent.stop="onBlankContextmenu"
       >
         <span class="c name">
+          <FileIcon icon="folder" />
           <span class="label">...</span>
         </span>
         <span class="c mtime" />
@@ -742,7 +743,8 @@ function onRemoveCancel(): void {
   box-shadow: inset 0 0 0 1px var(--accent-line);
 }
 
-/* 「...」那一行不显示图标，字要比行名略宽一点，扫一眼就能认出它不是文件 */
+/* 「...」那行走的是和条目一样的「图标 + 文字」结构，只是图标换成文件夹、
+   字距拉开一点：资源管理器里上级也是这么颗图标，扫一眼就知道能进。 */
 .up-row .label {
   letter-spacing: 1px;
   color: var(--text-2);
