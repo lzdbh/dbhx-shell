@@ -144,6 +144,9 @@ fn prompt(cwd: &str) -> Vec<u8> {
     format!("\x1b]7;file://dbhx-test{cwd}\x07\r\ndbhx-test:{cwd}$ ").into_bytes()
 }
 
+/// 假 os-release。命令层的系统探测（`dbhx-ipc::osdetect`）要有稳定的远端答案可断言。
+const OS_RELEASE: &str = "NAME=\"Ubuntu\"\nVERSION=\"24.04.1 LTS (Noble Numbat)\"\nID=ubuntu\nID_LIKE=debian\n";
+
 impl russh::server::Handler for TestSession {
     type Error = russh::Error;
 
@@ -227,11 +230,13 @@ impl russh::server::Handler for TestSession {
         self.note(|o| o.execs.push(command.clone()));
         session.channel_success(channel)?;
         let cwd = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_else(|| self.shared.spec.home.clone());
-        // 只实现目录跟随探针可能用到的那两条，其余命令一律空输出 + 退出码 0
+        // 只实现目录跟随探针与系统探测可能用到的那几条，其余命令一律空输出 + 退出码 0
         let output = if command.starts_with("pwd") {
             format!("{cwd}\n")
         } else if let Some(rest) = command.strip_prefix("echo ") {
             format!("{}\n", rest.trim_matches('\''))
+        } else if command.starts_with("cat /etc/os-release") {
+            OS_RELEASE.to_string()
         } else {
             String::new()
         };

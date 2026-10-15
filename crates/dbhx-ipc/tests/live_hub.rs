@@ -117,7 +117,12 @@ fn draft(server: &TestServer) -> HostDraft {
 
 /// 主机记录 + 口令写进 vault；返回主机 id。
 fn register_host(core: &Arc<Core>, server: &TestServer) -> dbhx_model::HostId {
-    let id = upsert_host_impl(core.as_ref(), draft(server)).unwrap();
+    register_with(core, draft(server))
+}
+
+/// 按给定草案登记（口令统一用测试口令）。要试「未知系统」这类变体的用例走它。
+fn register_with(core: &Arc<Core>, draft: HostDraft) -> dbhx_model::HostId {
+    let id = upsert_host_impl(core.as_ref(), draft).unwrap();
     set_password_impl(core.as_ref(), id.clone(), Zeroizing::new("dbhx-test".to_string())).unwrap();
     id
 }
@@ -491,4 +496,36 @@ async fn a_banner_arriving_before_the_success_is_not_swallowed() {
     let text = String::from_utf8_lossy(&got).into_owned();
     assert!(text.starts_with("Welcome to Ubuntu"), "横幅必须完整地排在最前面：{text}");
     assert!(text.contains("Last login: "), "横幅该连同上次登录时间一起到：{text}");
+}
+
+/// 连上「未知系统」的主机后，探测要把远端真实系统落库，并推事件让图标自己换。
+///
+/// 两条接缝一起钉住：探测命令真的经由 exec 通道到了服务端；整段过程只发生一次
+/// 认证——探测借的是会话那条 transport，不是重新拨号。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connecting_an_unknown_host_learns_the_remote_os() {
+    let server = started_server().await;
+    let (core, mut rx) = live_core("os-probe");
+    trust_the_server(&core, &server);
+    // 与 `draft()` 只差一个字段：新建时没选系统，记录停在「未知」
+    let host_id = register_with(&core, HostDraft { os: OsType::Unknown, ..draft(&server) });
+
+    // 登记阶段自己发过变更事件；先清干净，下面等的必须是探测发的那一条
+    while rx.try_recv().is_ok() {}
+
+    open_remote_impl(core.as_ref(), host_id.clone(), PtySize::default())
+        .await
+        .expect("远端 shell 应当开起来");
+    await_event(&core, &mut rx, "探测落库", |e| matches!(e, BusEvent::VaultChanged(_))).await;
+
+    assert_eq!(server.observed().auth_attempts.len(), 1, "探测必须借会话的 transport，不能再登录一次");
+    assert!(
+        server.observed().execs.iter().any(|c| c == dbhx_ipc::osdetect::PROBE_COMMAND),
+        "服务端应当收到过探测命令：{:?}",
+        server.observed().execs
+    );
+    let os = core.vault.lock().unwrap_or_else(|p| p.into_inner()).host(&host_id).map(|r| r.os);
+    assert_eq!(os, Some(OsType::Ubuntu), "记录该照着远端报的系统更新");
+
+    server.shutdown().await;
 }

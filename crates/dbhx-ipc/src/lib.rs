@@ -18,6 +18,8 @@ pub mod events;
 pub mod hub;
 /// 会话日志落点表。`pub` 是为了让 `hub` 与命令层共用同一份类型，不是给外部的入口。
 pub mod logsink;
+/// 连接后自动探测远端系统。`pub` 只为集成测试能对着 `PROBE_COMMAND` 断言。
+pub mod osdetect;
 mod plansrc;
 pub mod state;
 #[cfg(test)]

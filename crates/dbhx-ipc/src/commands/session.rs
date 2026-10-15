@@ -5,7 +5,7 @@
 //! 是为了让逻辑测试不需要 Tauri 运行时：测试直接调 `*_impl`。
 
 use dbhx_model::{
-    ConnectSpec, ErrorCode, HostId, IpcError, LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo,
+    ConnectSpec, ErrorCode, HostId, IpcError, LiveEndpoint, OsType, Protocol, PtySize, SessionId, SessionInfo,
     TerminalEncoding,
 };
 use dbhx_pty::LocalSpec;
@@ -42,7 +42,13 @@ pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Res
         }
         Protocol::Ssh => {
             let key = key_of_record(&record);
-            core.sessions.open_remote(key, DEFAULT_TERM.to_string(), pty, encoding, label).await?
+            let session = core.sessions.open_remote(key.clone(), DEFAULT_TERM.to_string(), pty, encoding, label).await?;
+            // 记录是「未知」时顺手探测远端真实系统（见 `crate::osdetect`）：一次借道的
+            // exec，失败静默。手选过的不探测——省一次往返，也免得给「不覆盖」写两条路。
+            if record.os == OsType::Unknown {
+                crate::osdetect::spawn(core, host_id, key);
+            }
+            session
         }
         // 本机终端不该从「开远端」进来：它有自己的入口，且没有 host_id 可言
         Protocol::Local => return Err(IpcError::new(ErrorCode::InvalidInput, "本机终端不走远端打开入口", false)),

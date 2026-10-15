@@ -35,6 +35,8 @@ use crate::plan::PlanSource;
 pub enum LeaseKind {
     Shell,
     Sftp,
+    /// 连上后借道跑一条 exec 的系统探测（见 `dbhx-ipc` 的 `osdetect`）。几毫秒就还。
+    Probe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
