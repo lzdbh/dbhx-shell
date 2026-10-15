@@ -6,7 +6,7 @@ import type { AuthMode, HostDraft, HostId, HostInfo, Protocol, TerminalEncoding 
 import { vaultApi } from '@/lib/ipc/client'
 import { useHostsStore } from '@/stores/hosts'
 
-const props = defineProps<{ open: boolean, host: HostInfo | null }>()
+const props = defineProps<{ open: boolean, host: HostInfo | null, presetGroup?: string | null, seed?: HostInfo | null }>()
 const emit = defineEmits<{ 'update:open': [boolean], saved: [HostId] }>()
 
 const hosts = useHostsStore()
@@ -46,12 +46,24 @@ const needsPassword = computed(() => form.authMode === 'password' || form.authMo
 /** 需要远端地址的协议：SSH 与 telnet 都要 host/port，本机终端不要。 */
 const isRemote = computed(() => form.protocol === 'ssh' || form.protocol === 'telnet')
 
+/**
+ * 表单照着哪台机器灌。
+ *
+ * 三种来源共用这一条通道：编辑（`host`）、克隆（`seed`）、新建（都没有，
+ * 只有 `presetGroup` 带一个分组名）。克隆走 `seed` 而不是直接把记录塞进 `host`，
+ * 是为了让「保存时要不要带 id」这一个判断把编辑和克隆彻底分开——带 id 是改，
+ * 不带才是新增，混用会当场把源主机覆盖掉。
+ */
+const source = computed(() => props.host ?? props.seed ?? null)
+
 // 每次打开都从选中的主机重新灌一遍，避免上一次编辑的残留
-watch(() => [props.open, props.host] as const, ([open]) => {
+watch(() => [props.open, props.host, props.seed] as const, ([open]) => {
   if (!open) return
-  const host = props.host
-  form.label = host?.label ?? ''
-  form.group = host?.group ?? ''
+  const host = source.value
+  // 克隆出来的名字加「副本」后缀：同名的两台机器在树里根本分不出哪个是哪个
+  form.label = host ? (props.host ? host.label : `${host.label} 副本`) : ''
+  // 从分组节点「在这里新建主机」进来时，分组名先填好；编辑已有主机仍以记录为准
+  form.group = host?.group ?? props.presetGroup ?? ''
   form.favorite = host?.favorite ?? false
   form.protocol = host?.protocol ?? 'ssh'
   form.host = host?.endpoint.host ?? ''
@@ -94,7 +106,7 @@ async function submit(): Promise<void> {
     id: props.host?.id ?? null,
     label: form.label.trim(),
     group: form.group.trim() ? form.group.trim() : null,
-    tags: props.host?.tags ?? [],
+    tags: source.value?.tags ?? [],
     favorite: form.favorite,
     protocol: form.protocol,
     endpoint: {
@@ -120,12 +132,18 @@ async function submit(): Promise<void> {
   emit('update:open', false)
 }
 
-/** 编辑时按需取回已存明文口令填进输入框——用户显式点击，这是唯一一条明文回读入口。 */
+/**
+ * 编辑或克隆时按需取回源记录的明文口令填进输入框。
+ *
+ * 这是唯一一条明文回读入口，而且必须用户显式点击：克隆不会自动把口令复制过去，
+ * 因为「复制一条记录」不等于「授权把一把密钥的明文从保险库里搬到另一条记录上」。
+ * 点了这个按钮，就是用户自己决定要让新记录带上这份口令。
+ */
 async function revealStored(): Promise<void> {
-  if (!props.host) return
+  if (!source.value) return
   revealing.value = true
   try {
-    form.password = await vaultApi.revealPassword(props.host.id)
+    form.password = await vaultApi.revealPassword(source.value.id)
   }
   catch (e) {
     messageApi.error(e instanceof Error ? e.message : '读取口令失败')
@@ -139,7 +157,7 @@ async function revealStored(): Promise<void> {
 <template>
   <a-modal
     :open="open"
-    :title="host ? `编辑 ${host.label}` : '新建主机'"
+    :title="host ? `编辑 ${host.label}` : seed ? `克隆 ${seed.label}` : '新建主机'"
     :confirm-loading="submitting"
     ok-text="保存"
     cancel-text="取消"
@@ -186,8 +204,8 @@ async function revealStored(): Promise<void> {
           <a-form-item v-if="needsPassword" :label="host ? '口令（留空则不修改）' : '口令'">
             <a-input-password v-model:value="form.password" autocomplete="new-password" />
             <!-- 编辑且已存口令时，按需把明文取回填入：口令默认只进不出，这是唯一显式回读入口 -->
-            <a-button v-if="host?.has_credential" size="small" type="link" :loading="revealing" @click="void revealStored()">
-              查看已存口令
+            <a-button v-if="source?.has_credential" size="small" type="link" :loading="revealing" @click="void revealStored()">
+              取回已存口令
             </a-button>
           </a-form-item>
           <a-form-item label="保活间隔（秒）">

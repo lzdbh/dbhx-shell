@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-
-import { DownloadOutlined, UploadOutlined } from '@ant-design/icons-vue'
+import { message as antdMessage } from 'ant-design-vue'
 
 import type { FileEntry } from '@/lib/ipc/bindings'
 import { localApi } from '@/lib/ipc/client'
@@ -12,6 +11,7 @@ import { useFilesStore } from '@/stores/files'
 import { useHostsStore } from '@/stores/hosts'
 import { useThemeStore } from '@/stores/theme'
 import { useTransfersStore } from '@/stores/transfers'
+import ContextMenu from '@/components/ContextMenu.vue'
 import FilePane from '@/components/FilePane.vue'
 import TransferTray from '@/components/TransferTray.vue'
 
@@ -21,6 +21,9 @@ const files = useFilesStore()
 const hosts = useHostsStore()
 const themeStore = useThemeStore()
 const transfers = useTransfersStore()
+
+// 这个组件里 `message()` 已经是「把异常翻成中文」的那个小工具，别名导入免得撞名
+const [messageApi, msgHolder] = antdMessage.useMessage()
 
 const antTheme = computed(() => antdTheme(themeStore.dark, themeStore.colorPrimary))
 
@@ -179,8 +182,13 @@ function remoteOpen(entry: FileEntry): void {
 
 /* ── 两栏之间传输 ──────────────────────────────────────── */
 
-const canUpload = computed(() => conn.value !== null && local.selected.length > 0)
-const canDownload = computed(() => conn.value !== null && remoteSelected.value.length > 0)
+/**
+ * 传输入口只有两个：行上的右键「传到对侧」，和把行直接拖到对面那一栏。
+ *
+ * 原来中间那两根按钮先删了——它作用在「这一栏选中的东西」上，而两栏各自都能有选择，
+ * 于是按钮的宾语其实是一直在变的：刚在右栏点了两下，左栏那根按钮就变成「上传刚才
+ * 选中的那批」。右键和拖拽的宾语都在手边，不会有这种歧义。
+ */
 
 /**
  * 批次收尾后再刷那一栏。
@@ -197,18 +205,33 @@ const pendingRefresh = ref<(() => Promise<void>) | null>(null)
  * 这里刻意不 `await` 传输本身：批次可能搬几百兆，把界面挂在上面等于禁用整个窗口。
  * 「什么时候刷新」交给 `runningBatches` 归零那一刻，见 onMounted 里那个订阅。
  */
-async function uploadSelected(): Promise<void> {
-  if (conn.value === null || local.selected.length === 0) return
-  const result = await files.upload(conn.value, [...local.selected])
+async function uploadPaths(paths: string[]): Promise<void> {
+  if (conn.value === null || paths.length === 0) return
+  const result = await files.upload(conn.value, [...paths])
   if (!result.ok) remoteError.value = result.error ?? '上传失败'
-  await refreshWhenBatchEnds(() => browseRemote(null))
+  else {
+    messageApi.success(`已交给上传：${paths.length} 个 → ${remotePath.value || '~'}`)
+    await refreshWhenBatchEnds(() => browseRemote(null))
+  }
 }
 
-async function downloadSelected(): Promise<void> {
-  if (conn.value === null || remoteSelected.value.length === 0) return
-  const result = await files.download(conn.value, [...remoteSelected.value], local.path)
+async function downloadPaths(paths: string[]): Promise<void> {
+  if (conn.value === null || paths.length === 0) return
+  const result = await files.download(conn.value, [...paths], local.path)
   if (!result.ok) remoteError.value = result.error ?? '下载失败'
-  else await refreshWhenBatchEnds(() => loadLocal(local.path))
+  else {
+    messageApi.success(`已交给下载：${paths.length} 个 → ${local.path}`)
+    await refreshWhenBatchEnds(() => loadLocal(local.path))
+  }
+}
+
+/** 本机栏交出来的东西一律往远端送，远端栏反过来。 */
+function transferFromLocal(entries: FileEntry[]): void {
+  void uploadPaths(entries.map(e => e.path))
+}
+
+function transferFromRemote(entries: FileEntry[]): void {
+  void downloadPaths(entries.map(e => e.path))
 }
 
 async function refreshWhenBatchEnds(job: () => Promise<void>): Promise<void> {
@@ -277,6 +300,7 @@ onBeforeUnmount(() => {
           :selected="local.selected"
           :enabled="true"
           :can-go-up="localParent(local.path) !== null"
+          :can-transfer="conn !== null"
           :busy="null"
           @update:selected="v => { local.selected = v }"
           @go="localGo"
@@ -287,6 +311,8 @@ onBeforeUnmount(() => {
           @remove="entries => void localRemoveMany(entries)"
           @rename="(from, name) => void localRename(from, name)"
           @open="localOpen"
+          @transfer="transferFromLocal"
+          @drop="paths => void downloadPaths(paths)"
           @dismiss="local.error = null"
         >
           <template #tools>
@@ -303,25 +329,6 @@ onBeforeUnmount(() => {
           </template>
         </FilePane>
 
-        <div class="transfer">
-          <a-tooltip title="把左栏选中的文件上传到右栏当前目录">
-            <a-button size="small" type="primary" :disabled="!canUpload" @click="void uploadSelected()">
-              <template #icon>
-                <UploadOutlined />
-              </template>
-              {{ local.selected.length > 0 ? `上传 ${local.selected.length} 个` : '上传' }}
-            </a-button>
-          </a-tooltip>
-          <a-tooltip title="把右栏选中的文件下载到左栏当前目录">
-            <a-button size="small" type="primary" :disabled="!canDownload" @click="void downloadSelected()">
-              <template #icon>
-                <DownloadOutlined />
-              </template>
-              {{ remoteSelected.length > 0 ? `下载 ${remoteSelected.length} 个` : '下载' }}
-            </a-button>
-          </a-tooltip>
-        </div>
-
         <FilePane
           side="remote"
           :path="remotePath"
@@ -331,6 +338,7 @@ onBeforeUnmount(() => {
           :selected="remoteSelected"
           :enabled="conn !== null"
           :can-go-up="remotePath !== '' && remotePath !== '/'"
+          :can-transfer="conn !== null"
           :busy="remoteBusy"
           @update:selected="v => { remoteSelected = v }"
           @go="target => void browseRemote(target)"
@@ -342,12 +350,18 @@ onBeforeUnmount(() => {
           @rename="(from, name) => void remoteRename(from, name)"
           @chmod="(entry, mode) => void remoteChmod(entry, mode)"
           @open="remoteOpen"
+          @transfer="transferFromRemote"
+          @drop="paths => void uploadPaths(paths)"
           @editing="remoteEditing"
           @dismiss="remoteError = null"
         />
       </div>
 
       <TransferTray />
+      <!-- 右键菜单的浮层：文件窗口是另一个 webview，`App.vue` 里那个实例在这儿不存在，
+           所以这一窗自己挂一个。 -->
+      <ContextMenu />
+      <msgHolder />
     </a-layout>
   </a-config-provider>
 </template>
@@ -413,13 +427,5 @@ onBeforeUnmount(() => {
   min-height: 0;
   gap: 8px;
   padding: 8px;
-}
-
-.transfer {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 8px;
-  flex: none;
 }
 </style>

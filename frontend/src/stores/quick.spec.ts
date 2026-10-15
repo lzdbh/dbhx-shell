@@ -57,6 +57,15 @@ describe('快捷命令栏 store', () => {
     expect(list).not.toContain('cmd 0')
   })
 
+  it('清空只清本栏那一份：分屏时不该顺手抹掉另一台机器的历史', () => {
+    const quick = useQuickStore()
+    quick.remember('local', 'dir')
+    quick.remember('host:h1', 'ls')
+    quick.clear('local')
+    expect(quick.entries('local')).toEqual([])
+    expect(quick.entries('host:h1')).toEqual(['ls'])
+  })
+
   it('历史不落盘：命令里可能带着一次性口令', () => {
     const quick = useQuickStore()
     quick.remember('local', 'mysql -u root -psecret')

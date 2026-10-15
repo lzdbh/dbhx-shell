@@ -1,4 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia'
+import { nextTick } from 'vue'
+
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HostDraft, HostInfo } from '../lib/ipc/bindings'
@@ -56,6 +58,8 @@ function draft(id: string | null): HostDraft {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // 分组名单落在 localStorage 里，不清的话上一条测试存的组会混进下一条的树
+  localStorage.clear()
   setActivePinia(createPinia())
 })
 
@@ -96,5 +100,51 @@ describe('hosts store', () => {
     await hosts.refresh()
     expect(hosts.error).toContain('vault 未解锁')
     expect(hosts.hosts).toEqual([])
+  })
+
+  it('新建的空分组也要出现在树上，否则「新建分组」点完看着像没反应', () => {
+    const hosts = useHostsStore()
+    expect(hosts.addGroup('测试环境')).toBeNull()
+    const grouped = hosts.groupsOf([host('a', { group: '生产' })])
+    expect(grouped.map(g => g.name)).toEqual(['测试环境', '生产'])
+    expect(grouped[0].hosts).toEqual([])
+  })
+
+  it('分组名挡住空、挡住「未分组」、挡住重名（不分大小写）', () => {
+    const hosts = useHostsStore()
+    hosts.hosts = [host('a', { group: 'Prod' })]
+    expect(hosts.addGroup('   ')).toContain('不能为空')
+    expect(hosts.addGroup('未分组')).toContain('没有分组')
+    expect(hosts.addGroup('prod')).toContain('已经有叫')
+    expect(hosts.addGroup('Dev')).toBeNull()
+  })
+
+  it('有主机的分组不给改名、不给删除：改一半会把这个组劈成两半', () => {
+    const hosts = useHostsStore()
+    hosts.hosts = [host('a', { group: '生产' })]
+    expect(hosts.isEmptyGroup('生产')).toBe(false)
+    expect(hosts.renameGroup('生产', '预发')).toContain('还有主机')
+    expect(hosts.removeGroup('生产')).toContain('还有主机')
+  })
+
+  it('空分组改名后名单跟着换，删除只动自己那一个', () => {
+    const hosts = useHostsStore()
+    hosts.addGroup('旧名')
+    hosts.addGroup('别的')
+    expect(hosts.renameGroup('旧名', '新名')).toBeNull()
+    expect(hosts.extraGroups).toEqual(['别的', '新名'])
+    expect(hosts.removeGroup('别的')).toBeNull()
+    expect(hosts.extraGroups).toEqual(['新名'])
+  })
+
+  it('分组名单落盘，重启后空分组还在', async () => {
+    const hosts = useHostsStore()
+    hosts.addGroup(' staging ')
+    // watch 默认 pre flush，不排一次微任务的话盘上还是空的
+    await nextTick()
+    expect(JSON.parse(localStorage.getItem('dbhx:groups') ?? '[]')).toEqual(['staging'])
+
+    setActivePinia(createPinia())
+    expect(useHostsStore().extraGroups).toEqual(['staging'])
   })
 })

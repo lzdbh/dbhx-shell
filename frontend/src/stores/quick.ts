@@ -40,5 +40,15 @@ export const useQuickStore = defineStore('quick', () => {
     history.value[owner] = kept.slice(0, LIMIT)
   }
 
-  return { visible, toggle, entries, remember }
+  /**
+   * 清空某个归属的历史——右键菜单里「清空本机历史」走这里。
+   *
+   * 按归属清而不是全清：分屏时两条命令栏各发各的机器，用户对着 A 机器的栏子
+   * 按清空，不该顺手把 B 机器的也抹了。
+   */
+  function clear(owner: string): void {
+    delete history.value[owner]
+  }
+
+  return { visible, toggle, entries, remember, clear }
 })

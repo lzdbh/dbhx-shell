@@ -38,6 +38,11 @@ export interface TerminalHandlers {
    * 这里碰它就得反过来 import store，终端实例从此拖着一个 Vue 依赖。
    */
   onZoom: (step: number) => void
+  /**
+   * 右键。登记处只负责「在哪里、此刻有没有选区」，菜单里有些什么由格子决定——
+   * 查找、日志、清屏这些动作的 owner 都不在本模块。
+   */
+  onContextMenu: (at: { x: number, y: number }, hasSelection: boolean) => void
 }
 
 interface Entry {
@@ -257,10 +262,11 @@ export function ensureTerminal(
   element.className = 'xterm-host'
   term.attachCustomKeyEventHandler(event => handleClipboardKey(term, event))
   element.addEventListener('contextmenu', event => {
-    // 不拦的话 WebView2 会弹自己的菜单，用户点不到也复制不了
+    // 不拦的话 WebView2 会弹自己的菜单，用户点不到也复制不了。
+    // 右键以前直接是「粘贴」，现在交给格子弹菜单：一屏里既有能复制的选区、
+    // 又有想粘贴的口令，鼠标点下去不该替用户猜。
     event.preventDefault()
-    if (term.hasSelection()) void copyText(term.getSelection())
-    else void pasteInto(term)
+    handlers.onContextMenu({ x: event.clientX, y: event.clientY }, term.hasSelection())
   })
   element.addEventListener('wheel', event => {
     // Ctrl+滚轮 = 缩放。必须 preventDefault：不拦的话这条滚轮既会被 xterm 当成
@@ -309,6 +315,40 @@ export function detachTerminal(id: SessionId, from: HTMLElement): void {
 export function focusTerminal(id: SessionId | null): void {
   if (id === null) return
   entries.get(id)?.term.focus()
+}
+
+/**
+ * 下面几个是右键菜单的动作出口。
+ *
+ * 都做成「会话不存在就什么都不做」：菜单从弹出到点击之间隔着一次鼠标移动，
+ * 那期间会话可能已经被关掉了。让调用方先判空会把竞态推给每个格子，不如在这里兜住。
+ */
+export function copySelection(id: SessionId): void {
+  const entry = entries.get(id)
+  if (entry?.term.hasSelection()) void copyText(entry.term.getSelection())
+}
+
+export function pasteClipboard(id: SessionId): void {
+  const entry = entries.get(id)
+  if (entry) void pasteInto(entry.term)
+}
+
+export function selectAllText(id: SessionId): void {
+  entries.get(id)?.term.selectAll()
+}
+
+/**
+ * 清屏。只把屏幕上这一页滚走，不往 shell 发任何字节。
+ *
+ * 刻意不等价于敲 `clear`：那会把清屏命令本身写进远端的 shell 历史，用户按上箭头
+ * 会翻出一条自己没打算记的 `clear`。xterm 的 `clear()` 只动本地回滚区。
+ */
+export function clearView(id: SessionId): void {
+  entries.get(id)?.term.clear()
+}
+
+export function hasSelection(id: SessionId): boolean {
+  return entries.get(id)?.term.hasSelection() ?? false
 }
 
 export function lookup(id: SessionId): Terminal | undefined {
@@ -368,15 +408,26 @@ export function writeTerminal(id: SessionId, data: string): void {
 
 /**
  * 剪贴板按键：有选区时 `Ctrl/Cmd+C` 是复制，没有才让 xterm 把 `^C` 发给 shell；
- * `Ctrl/Cmd+V` 从剪贴板取文本，交给 `term.paste`（它会按远端是否开启括号粘贴模式处理）。
+ * `Ctrl/Cmd+V` 与 `Ctrl/Cmd+Shift+V` 从剪贴板取文本，交给 `term.paste`
+ * （它会按远端是否开启括号粘贴模式处理）。
+ *
+ * 两条都认：`Ctrl+V` 是 Windows 用户的直觉（同类客户端一律把它给了粘贴），
+ * `Ctrl+Shift+V` 是 Unix 终端的老习惯，也是右键菜单里那条「粘贴」的键提示。
+ * 代价是 readline 的「插入字面字符」在此处让位——那是按住 Ctrl 再敲第二个键的
+ * 冷门动作，而粘贴是每次都做的事。
  *
  * 返回 `false` 表示这个键由我们接管，xterm 不再产生对应的输入。
  */
 export function handleClipboardKey(term: Terminal, event: KeyboardEvent): boolean {
   if (event.type !== 'keydown') return true
+  // `Shift+Insert` 是老终端的粘贴，不需要 Ctrl/Cmd
+  if (event.key === 'Insert' && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    void pasteInto(term)
+    return false
+  }
   if (!(event.ctrlKey || event.metaKey) || event.altKey) return true
-  // 只认不带 Shift 的组合：`Ctrl+Shift+C` 那类留给 shell 自己的绑定
-  if (event.shiftKey) return true
+  // 带 Shift 时只认 V：`Ctrl+Shift+C` 那类留给 shell 自己的绑定
+  if (event.shiftKey && event.key.toLowerCase() !== 'v') return true
   switch (event.key.toLowerCase()) {
     case 'c':
       if (!term.hasSelection()) return true

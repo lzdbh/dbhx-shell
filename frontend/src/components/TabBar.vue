@@ -2,12 +2,15 @@
 import { computed, watch } from 'vue'
 import { message } from 'ant-design-vue'
 
-import { CloseOutlined, ControlOutlined, FolderOpenOutlined, PlusOutlined, PushpinFilled, PushpinOutlined, VideoCameraOutlined } from '@ant-design/icons-vue'
+import { CloseCircleOutlined, CloseOutlined, ControlOutlined, FolderOpenOutlined, ForwardOutlined, PlusOutlined, PushpinFilled, PushpinOutlined, SyncOutlined, VideoCameraOutlined } from '@ant-design/icons-vue'
 
 import { fileWindowApi } from '@/lib/ipc/client'
+import { openMenu } from '@/lib/contextMenu'
+import type { MenuItem, MenuPoint } from '@/lib/contextMenu'
 import { useLayoutStore } from '@/stores/layout'
 import { useQuickStore } from '@/stores/quick'
 import { useSessionsStore } from '@/stores/sessions'
+import type { SessionTab } from '@/stores/sessions'
 
 const sessions = useSessionsStore()
 const layout = useLayoutStore()
@@ -30,8 +33,7 @@ async function openLocal(): Promise<void> {
   if (!result.ok) messageApi.error(result.error ?? '无法打开本机终端')
 }
 
-async function openPanel(): Promise<void> {
-  const tab = activeTab.value
+async function openPanel(tab: SessionTab | undefined): Promise<void> {
   if (tab === undefined) {
     messageApi.warning('先打开一个会话')
     return
@@ -53,12 +55,78 @@ async function openPanel(): Promise<void> {
   }
 }
 
-async function toggleLog(): Promise<void> {
-  const tab = activeTab.value
+async function toggleLog(tab: SessionTab | undefined): Promise<void> {
   if (tab === undefined) return
   const result = await sessions.toggleLog(tab.id)
   if (result.ok) messageApi.success(result.text)
   else messageApi.error(result.text)
+}
+
+/**
+ * 重新连接。
+ *
+ * 只有已结束/出错的标签页才给这个入口：会话还活着时「重连」的真实含义是断开再拨，
+ * 那是一个会把用户正在跑的命令掐掉的动作，不该藏在一次右键里。
+ */
+async function reconnect(tab: SessionTab): Promise<void> {
+  const { hostId, label } = tab
+  await sessions.close(tab.id)
+  const result = hostId === null ? await sessions.openLocal(label) : await sessions.openRemote(hostId)
+  if (!result.ok) messageApi.error(result.error ?? '重新连接失败')
+}
+
+async function closeOthers(tab: SessionTab): Promise<void> {
+  // 先取快照再逐个关：close 会重排 tabs，边关边遍历会漏掉后半截
+  for (const other of sessions.tabs.filter(t => t.id !== tab.id)) await sessions.close(other.id)
+  sessions.activate(tab.id)
+}
+
+async function closeRight(tab: SessionTab): Promise<void> {
+  const index = sessions.tabs.findIndex(t => t.id === tab.id)
+  if (index < 0) return
+  for (const other of sessions.tabs.slice(index + 1)) await sessions.close(other.id)
+}
+
+async function closeAll(): Promise<void> {
+  for (const other of [...sessions.tabs]) await sessions.close(other.id)
+}
+
+/**
+ * 标签页的右键菜单。
+ *
+ * 动作的对象永远是**被右键的那一格**，不是当前活动格：一屏七八个标签时，用户想关的
+ * 就是手指下面那个，先激活再弹菜单会让键盘焦点跟着鼠标跑。
+ */
+function openTabMenu(at: MenuPoint, tab: SessionTab): void {
+  const dead = tab.status === 'closed' || tab.status === 'error'
+  const pinned = tab.id === layout.pinned
+  const index = sessions.tabs.findIndex(t => t.id === tab.id)
+  const list: MenuItem[] = [
+    { key: 'reconnect', label: '重新连接', icon: SyncOutlined, disabled: !dead, onClick: () => { void reconnect(tab) } },
+    { key: 'panel', label: '打开文件面板', icon: FolderOpenOutlined, disabled: tab.hostId === null || tab.protocol !== 'ssh', onClick: () => { void openPanel(tab) } },
+    // 分屏是「两格跟着 tab 走」那一套的动作，宫格模式里没有右格可言；
+    // 那里对应的问题是「这个会话摆进哪一格」，所以换成放进当前格
+    layout.mode === 'tabs'
+      ? { key: 'pin', label: pinned ? '取消分屏' : '钉到右格分屏', hint: 'Ctrl+E', icon: pinned ? PushpinFilled : PushpinOutlined, onClick: () => { layout.toggle(tab.id) } }
+      : { key: 'cell', label: '放进当前格', icon: PushpinOutlined, onClick: () => { layout.placeCell(layout.focusCell, tab.id) } },
+    { key: 'log', label: tab.logPath === null ? '记录日志到文件' : '停止记录日志', icon: VideoCameraOutlined, onClick: () => { void toggleLog(tab) } },
+    { key: 'sep', separator: true },
+    { key: 'close', label: '关闭', hint: 'Ctrl+W', icon: CloseOutlined, onClick: () => { void sessions.close(tab.id) } },
+    { key: 'others', label: '关闭其他', icon: CloseCircleOutlined, disabled: sessions.tabs.length < 2, onClick: () => { void closeOthers(tab) } },
+    { key: 'right', label: '关闭右侧', icon: ForwardOutlined, disabled: index < 0 || index === sessions.tabs.length - 1, onClick: () => { void closeRight(tab) } },
+    { key: 'sep2', separator: true },
+    { key: 'all', label: '关闭全部', danger: true, onClick: () => { void closeAll() } },
+  ]
+  openMenu(at, list)
+}
+
+/** 轨道空白处的菜单：没有标签页可指时，右键至少要能开一个。 */
+function openTrackMenu(at: MenuPoint): void {
+  openMenu(at, [
+    { key: 'new', label: '新建本机终端', hint: 'Ctrl+T', icon: PlusOutlined, onClick: () => { void openLocal() } },
+    { key: 'sep', separator: true },
+    { key: 'all', label: '关闭全部', danger: true, disabled: sessions.tabs.length === 0, onClick: () => { void closeAll() } },
+  ])
 }
 
 // 日志写不下去 ⇒ 后端自己收了灯。这条只在这一处出现，所以取完就清，不重复弹
@@ -72,13 +140,14 @@ watch(() => sessions.logNotice, (text) => {
 <template>
   <div class="tab-bar">
     <holder />
-    <div class="tabs">
+    <div class="tabs" @contextmenu.self.prevent="openTrackMenu({ x: $event.clientX, y: $event.clientY })">
       <div
         v-for="tab in sessions.tabs"
         :key="tab.id"
         class="tab"
         :class="{ active: tab.id === sessions.activeId }"
         @click="sessions.activate(tab.id)"
+        @contextmenu.prevent.stop="openTabMenu({ x: $event.clientX, y: $event.clientY }, tab)"
       >
         <span class="dot" :class="tab.status" />
         <!-- 正在记录的那一格自己带灯：多标签时不用切过去看按钮状态 -->
@@ -120,7 +189,7 @@ watch(() => sessions.logNotice, (text) => {
           命令栏
         </a-button>
       </a-tooltip>
-      <a-button size="small" :disabled="sessions.activeId === null" @click="void openPanel()">
+      <a-button size="small" :disabled="sessions.activeId === null" @click="void openPanel(activeTab)">
         <template #icon>
           <FolderOpenOutlined />
         </template>
@@ -133,7 +202,7 @@ watch(() => sessions.logNotice, (text) => {
           size="small"
           :type="activeTab?.logPath ? 'primary' : 'default'"
           :disabled="activeTab === undefined"
-          @click="void toggleLog()"
+          @click="void toggleLog(activeTab)"
         >
           <template #icon>
             <VideoCameraOutlined />

@@ -1,8 +1,13 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
+import { message } from 'ant-design-vue'
+import { CheckSquareOutlined, ClearOutlined, CopyOutlined, SearchOutlined, SnippetsOutlined, VideoCameraOutlined, ZoomInOutlined, ZoomOutOutlined } from '@ant-design/icons-vue'
+
 import type { SessionId } from '@/lib/ipc/bindings'
-import { attachTerminal, detachTerminal, ensureTerminal, focusTerminal } from '@/lib/terminal/registry'
+import { attachTerminal, clearView, copySelection, detachTerminal, ensureTerminal, focusTerminal, pasteClipboard, selectAllText } from '@/lib/terminal/registry'
+import { closeMenu, openMenu } from '@/lib/contextMenu'
+import type { MenuPoint } from '@/lib/contextMenu'
 import QuickCommandBar from '@/components/QuickCommandBar.vue'
 import TerminalStatus from '@/components/TerminalStatus.vue'
 import { useQuickStore } from '@/stores/quick'
@@ -22,15 +27,59 @@ import { useThemeStore } from '@/stores/theme'
  */
 const props = defineProps<{ session: SessionId | null }>()
 
+const emit = defineEmits<{
+  /** 把查找条叫出来。开不开归 App 管，它才知道焦点在哪一格。 */
+  (e: 'find'): void
+}>()
+
 const sessions = useSessionsStore()
 const settings = useSettingsStore()
 const themeStore = useThemeStore()
 const quick = useQuickStore()
+const [messageApi, holder] = message.useMessage()
 
 const slot = ref<HTMLElement | null>(null)
 
-/** 这个格子当前认领的会话。认领关系变了才动 DOM，避免每次响应式更新都 appendChild。 */
+/** 这个格子当前认领的会话。认领关系变了才动 DOM，避免无谓的 appendChild。 */
 let attached: SessionId | null = null
+
+/**
+ * 右键菜单。
+ *
+ * 项是按「这一格此刻能干什么」现搭的，不是常驻结构：没有选区就没有复制，
+ * 正在记录就把第二项写成「停止」，省掉一颗点了没反应的灰按钮。
+ * 字号那三条走 settings（全局偏好），和 `Ctrl+滚轮` 改的是同一个值。
+ */
+function openMenuHere(at: MenuPoint, hasSelection: boolean): void {
+  const id = props.session
+  if (id === null) return
+  const logging = sessions.tab(id)?.logPath != null
+  openMenu(at, [
+    { key: 'copy', label: '复制', hint: 'Ctrl+C', icon: CopyOutlined, disabled: !hasSelection, onClick: () => copySelection(id) },
+    { key: 'paste', label: '粘贴', hint: 'Ctrl+V', icon: SnippetsOutlined, onClick: () => pasteClipboard(id) },
+    { key: 'all', label: '全选', icon: CheckSquareOutlined, onClick: () => selectAllText(id) },
+    { key: 'sep1', separator: true },
+    { key: 'find', label: '查找', hint: 'Ctrl+F', icon: SearchOutlined, onClick: () => emit('find') },
+    { key: 'clear', label: '清屏', hint: '只滚走这一页', icon: ClearOutlined, onClick: () => clearView(id) },
+    { key: 'sep2', separator: true },
+    {
+      key: 'log',
+      label: logging ? '停止记录日志' : '记录日志到文件',
+      icon: VideoCameraOutlined,
+      onClick: () => { void toggleLog(id) },
+    },
+    { key: 'sep3', separator: true },
+    { key: 'zoomin', label: '放大字号', hint: 'Ctrl+=', icon: ZoomInOutlined, onClick: () => settings.zoom(1) },
+    { key: 'zoomout', label: '缩小字号', hint: 'Ctrl+-', icon: ZoomOutOutlined, onClick: () => settings.zoom(-1) },
+  ])
+}
+
+/** 日志开关：结果只有一句话，弹出来就行，不值得占一个对话框 */
+async function toggleLog(id: SessionId): Promise<void> {
+  const result = await sessions.toggleLog(id)
+  if (result.ok) messageApi.success(result.text)
+  else messageApi.error(result.text)
+}
 
 function claim(id: SessionId): void {
   const host = slot.value
@@ -41,6 +90,7 @@ function claim(id: SessionId): void {
     onData: data => { void sessions.send(id, data) },
     onResize: (rows, cols) => { void sessions.reportResize(id, { rows, cols }) },
     onZoom: step => { settings.zoom(step) },
+    onContextMenu: openMenuHere,
   })
   attachTerminal(id, host)
 }
@@ -49,6 +99,8 @@ function release(): void {
   const host = slot.value
   if (host !== null && attached !== null) detachTerminal(attached, host)
   attached = null
+  // 格子没了，为它弹的菜单也不该留着：点了会指向一个已经不存在的会话
+  closeMenu()
 }
 
 watch(() => props.session, id => {
@@ -70,6 +122,7 @@ onBeforeUnmount(release)
 
 <template>
   <div class="pane">
+    <holder />
     <div ref="slot" class="screen" />
     <TerminalStatus :session="props.session" />
     <!-- 命令栏在状态栏下面：它一出一退会把屏幕高度改一截，格子靠 ResizeObserver 重新 fit -->

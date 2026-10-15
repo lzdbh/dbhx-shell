@@ -1,11 +1,29 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 
-import { ArrowUpOutlined } from '@ant-design/icons-vue'
+import {
+  ArrowUpOutlined,
+  CopyOutlined,
+  DeleteOutlined,
+  DownloadOutlined,
+  ExportOutlined,
+  FileAddOutlined,
+  FolderAddOutlined,
+  FormOutlined,
+  KeyOutlined,
+  ReloadOutlined,
+  SelectOutlined,
+  UploadOutlined,
+} from '@ant-design/icons-vue'
 
 import type { FileEntry } from '../lib/ipc/bindings'
+import { clipboardApi } from '../lib/ipc/client'
 import { iconOf, typeName } from '../lib/fileType'
 import { formatSize, formatTime } from '../lib/format'
+import { openMenu } from '../lib/contextMenu'
+import type { MenuItem, MenuPoint } from '../lib/contextMenu'
+import { currentDrag, dropTargetOf, endDrag, writeDrag } from '../lib/fileDrag'
+import type { PaneSide } from '../lib/fileDrag'
 import FileIcon from './FileIcon.vue'
 
 /**
@@ -16,7 +34,7 @@ import FileIcon from './FileIcon.vue'
  * 列宽、排序、键盘操作都按 Windows 的口径来，代价是多写了几十条比较逻辑。
  */
 const props = defineProps<{
-  side: 'local' | 'remote'
+  side: PaneSide
   /** 当前目录，直接显示在地址栏里。 */
   path: string
   entries: FileEntry[]
@@ -27,6 +45,8 @@ const props = defineProps<{
   enabled: boolean
   /** 已经在根（`C:\` 或 `/`）时「上级」置灰。 */
   canGoUp: boolean
+  /** 对侧此刻能不能收东西——没连上远端时「传到对面」要灰掉。 */
+  canTransfer: boolean
   /** 后台正在做的事（外部编辑器往返），显示在状态条上。 */
   busy: string | null
 }>()
@@ -42,6 +62,10 @@ const emit = defineEmits<{
   (e: 'rename', from: FileEntry, name: string): void
   (e: 'chmod', entry: FileEntry, mode: number): void
   (e: 'open', entry: FileEntry): void
+  /** 把选中的这些送到对侧。方向（上传还是下载）由父组件按 `side` 决定。 */
+  (e: 'transfer', entries: FileEntry[]): void
+  /** 对侧拖过来的这批路径，落到这一栏。 */
+  (e: 'drop', paths: string[]): void
   /** 关掉那条错误提示（用户看完就知道了，不需要它一直占着位置）。 */
   (e: 'dismiss'): void
   /** 正在填名字：远端栏要据此压住目录跟随，否则用户敲一半面板就跳走了。 */
@@ -178,6 +202,121 @@ function onKeydown(event: KeyboardEvent): void {
   }
 }
 
+/* ── 右键菜单 ───────────────────────────────────────────── */
+
+/**
+ * 这一行该不该被算进「选中的这批」。
+ *
+ * 资源管理器的口径：右键落在已经多选出来的区域里时保持整组选择，否则只选中这一行。
+ * 这里要自己判而不是读 `props.selected`，因为上面那次 `emit` 要等父组件重渲染才生效，
+ * 而菜单项的禁用态在同一个tick 里就得算出来。
+ */
+function targetsFor(entry: FileEntry): FileEntry[] {
+  return props.selected.includes(entry.path) ? selectedEntries.value : [entry]
+}
+
+function copyPath(entry: FileEntry): void {
+  void clipboardApi.write(entry.path).catch(() => undefined)
+}
+
+/** 某一行的菜单。方向词按栏来说：本机栏是「上传到远端」，远端栏是「下载到本机」。 */
+function rowMenu(at: MenuPoint, entry: FileEntry, index: number): void {
+  if (!props.selected.includes(entry.path)) {
+    emit('update:selected', [entry.path])
+    anchor.value = index
+  }
+  const targets = targetsFor(entry)
+  const one = targets.length === 1
+  const to = props.side === 'local' ? '上传到远端' : '下载到本机'
+  openMenu(at, [
+    { key: 'open', label: entry.kind === 'dir' ? '打开' : '打开 / 编辑', hint: '双击', icon: ExportOutlined, disabled: !one || !props.enabled, onClick: () => { emit('open', entry) } },
+    { key: 'transfer', label: one ? `${to} ${entry.name}` : `${to} ${targets.length} 项`, icon: props.side === 'local' ? UploadOutlined : DownloadOutlined, disabled: !props.canTransfer, onClick: () => { emit('transfer', targets) } },
+    { key: 'copy', label: '复制路径', hint: '到剪贴板', icon: CopyOutlined, disabled: !one, onClick: () => { copyPath(entry) } },
+    { key: 'sep1', separator: true },
+    { key: 'rename', label: '重命名', icon: FormOutlined, disabled: !one || !props.enabled, onClick: startRename },
+    ...(props.side === 'remote'
+      ? [{ key: 'chmod', label: '权限', icon: KeyOutlined, disabled: !one || !props.enabled, onClick: openChmod } satisfies MenuItem]
+      : []),
+    { key: 'sep2', separator: true },
+    { key: 'remove', label: one ? '删除' : `删除 ${targets.length} 项`, icon: DeleteOutlined, danger: true, disabled: !props.enabled, onClick: askRemove },
+    { key: 'refresh', label: '刷新', icon: ReloadOutlined, onClick: () => { emit('refresh') } },
+  ])
+}
+
+/** 空白处的菜单：这里没有「目标行」，能做的只有造新东西和重读目录。 */
+function blankMenu(at: MenuPoint): void {
+  openMenu(at, [
+    { key: 'mkdir', label: '新建文件夹', icon: FolderAddOutlined, disabled: !props.enabled, onClick: () => { startCreate('dir') } },
+    { key: 'file', label: '新建空文件', icon: FileAddOutlined, disabled: !props.enabled, onClick: () => { startCreate('file') } },
+    { key: 'sep1', separator: true },
+    { key: 'all', label: '全选', icon: SelectOutlined, disabled: rows.value.length === 0, onClick: selectAll },
+    { key: 'none', label: '取消选择', disabled: props.selected.length === 0, onClick: clearSelection },
+    { key: 'sep2', separator: true },
+    { key: 'refresh', label: '刷新', icon: ReloadOutlined, onClick: () => { emit('refresh') } },
+  ])
+}
+
+function onRowContextmenu(entry: FileEntry, index: number, event: MouseEvent): void {
+  // 不拦住的话 WebView2 会弹自己的菜单，我们的浮层会被它盖住
+  event.preventDefault()
+  event.stopPropagation()
+  if (creating.value !== null) return
+  rowMenu({ x: event.clientX, y: event.clientY }, entry, index)
+}
+
+function onBlankContextmenu(event: MouseEvent): void {
+  event.preventDefault()
+  if (creating.value !== null) return
+  blankMenu({ x: event.clientX, y: event.clientY })
+}
+
+/* ── 跨栏拖拽 ───────────────────────────────────────────── */
+
+const dropping = ref(false)
+
+function onRowDragstart(entry: FileEntry, index: number, event: DragEvent): void {
+  if (!props.enabled) return
+  if (!props.selected.includes(entry.path)) {
+    emit('update:selected', [entry.path])
+    anchor.value = index
+  }
+  const targets = targetsFor(entry)
+  writeDrag(event, { side: props.side, paths: targets.map(t => t.path) })
+}
+
+/**
+ * 只有「对面拖过来的」才接。
+ *
+ * `dragover` 阶段浏览器不给读载荷内容（安全限制），所以来源栏取自模块里那份快照。
+ */
+function onDragover(event: DragEvent): void {
+  const payload = dropTargetOf(currentDrag(), props.side)
+  if (payload === null || !props.canTransfer) return
+  event.preventDefault()
+  if (event.dataTransfer !== null) event.dataTransfer.dropEffect = 'copy'
+  dropping.value = true
+}
+
+function onDrop(event: DragEvent): void {
+  dropping.value = false
+  const payload = dropTargetOf(currentDrag(), props.side)
+  endDrag()
+  if (payload === null || !props.canTransfer) return
+  event.preventDefault()
+  emit('drop', payload.paths)
+}
+
+/**
+ * 拖拽收尾。
+ *
+ * 没落到任何一栏上（松在窗口外、松在本栏里）时浏览器不会替我们清快照，而下一轮
+ * `dragover` 判的就是这份快照——留着它，之后鼠标划过对侧就会凭空亮起来。
+ */
+function onDragend(): void {
+  endDrag()
+  dropping.value = false
+}
+
 /* ── 地址栏 ─────────────────────────────────────────────── */
 
 const draftPath = ref(props.path)
@@ -308,20 +447,9 @@ function onRemoveCancel(): void {
         上级
       </a-button>
       <a-button size="small" :disabled="!enabled" @click="emit('refresh')">刷新</a-button>
-      <a-dropdown :trigger="['click']" :disabled="!enabled">
-        <a-button size="small" :disabled="!enabled">新建</a-button>
-        <template #overlay>
-          <a-menu>
-            <a-menu-item key="dir" @click="startCreate('dir')">文件夹</a-menu-item>
-            <a-menu-item key="file" @click="startCreate('file')">空文件</a-menu-item>
-          </a-menu>
-        </template>
-      </a-dropdown>
-      <a-button size="small" :disabled="!enabled || !single" @click="startRename">重命名</a-button>
-      <a-button v-if="side === 'remote'" size="small" :disabled="!enabled || !single" @click="openChmod">权限</a-button>
-      <a-button size="small" danger :disabled="!enabled || selected.length === 0" @click="askRemove">
-        删除{{ selected.length > 1 ? ` ${selected.length} 项` : '' }}
-      </a-button>
+      <!-- 新建/重命名/权限/删除不在这里了：它们都必须先有一个「对着谁做」的目标，
+           而目标就是鼠标正指着的那一行。放在工具栏上等于让用户先点行再抬头找按钮，
+           放在右键里则一步到位。 -->
       <slot name="tools" />
     </div>
 
@@ -350,12 +478,40 @@ function onRemoveCancel(): void {
 
     <a-alert v-if="error" :message="error" type="error" show-icon closable @close="emit('dismiss')" />
 
-    <div class="list" tabindex="0" :class="{ loading }" @keydown="onKeydown">
+    <div
+      class="list"
+      tabindex="0"
+      :class="{ loading, dropping }"
+      @keydown="onKeydown"
+      @contextmenu.self.prevent="onBlankContextmenu"
+      @dragover="onDragover"
+      @dragleave="dropping = false"
+      @drop="onDrop"
+    >
       <div class="head">
         <button class="h name" :class="{ on: sort.key === 'name' }" @click="toggleSort('name')">名称<i>{{ sort.key === 'name' && sort.dir < 0 ? '▾' : '▴' }}</i></button>
         <button class="h mtime" :class="{ on: sort.key === 'mtime' }" @click="toggleSort('mtime')">修改日期<i>{{ sort.key === 'mtime' && sort.dir < 0 ? '▾' : '▴' }}</i></button>
         <button class="h type" :class="{ on: sort.key === 'type' }" @click="toggleSort('type')">类型<i>{{ sort.key === 'type' && sort.dir < 0 ? '▾' : '▴' }}</i></button>
         <button class="h size" :class="{ on: sort.key === 'size' }" @click="toggleSort('size')">大小<i>{{ sort.key === 'size' && sort.dir < 0 ? '▾' : '▴' }}</i></button>
+      </div>
+
+      <!-- 资源管理器的「..」：单击就回上级，不用先把光标挪到工具栏那颗按钮上。
+           放在列表内部而不是表头上方，是因为它和行共用这套滚动区——长目录里往上滚
+           到头就能看见它，符合用户已经在列表里找东西的预期。 -->
+      <div
+        v-if="enabled && canGoUp"
+        class="row up-row"
+        title="返回上级"
+        @click="emit('up')"
+        @dblclick="emit('up')"
+        @contextmenu.prevent.stop="onBlankContextmenu"
+      >
+        <span class="c name">
+          <span class="label">...</span>
+        </span>
+        <span class="c mtime" />
+        <span class="c type">上级</span>
+        <span class="c size" />
       </div>
 
       <div v-if="rows.length === 0" class="empty">{{ loading ? '载入中…' : '此文件夹为空' }}</div>
@@ -364,9 +520,13 @@ function onRemoveCancel(): void {
         :key="entry.path"
         class="row"
         :class="{ sel: selected.includes(entry.path) }"
+        :draggable="enabled ? 'true' : 'false'"
         :title="entry.path"
         @click="(event: MouseEvent) => pick(index, event)"
         @dblclick="emit('open', entry)"
+        @contextmenu.prevent.stop="onRowContextmenu(entry, index, $event)"
+        @dragstart="onRowDragstart(entry, index, $event)"
+        @dragend="onDragend"
       >
         <span class="c name">
           <FileIcon :icon="iconOf(entry.name, entry.kind)" />
@@ -580,6 +740,18 @@ function onRemoveCancel(): void {
 .row.sel {
   background: var(--accent-soft);
   box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+/* 「...」那一行不显示图标，字要比行名略宽一点，扫一眼就能认出它不是文件 */
+.up-row .label {
+  letter-spacing: 1px;
+  color: var(--text-2);
+}
+
+/* 可以接收对侧拖过来的东西：整块描一圈主色，鼠标一放开就传 */
+.list.dropping {
+  border-color: var(--accent-line);
+  box-shadow: inset 0 0 0 2px var(--accent-soft);
 }
 
 .c {

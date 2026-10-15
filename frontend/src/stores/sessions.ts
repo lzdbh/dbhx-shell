@@ -40,6 +40,14 @@ export interface LogToggleResult {
   text: string
 }
 
+/**
+ * 一次拨号的结果。
+ *
+ * 除了成不成功，还要把新会话号交回去：宫格视图是「把这台机器放进第三格」，
+ * 光知道连上了不够，得知道连上的是哪一个会话。
+ */
+export type OpenResult = { ok: boolean, error: string | null, id: SessionId | null }
+
 export const useSessionsStore = defineStore('sessions', () => {
   const tabs = ref<SessionTab[]>([])
   const activeId = ref<SessionId | null>(null)
@@ -80,18 +88,18 @@ export const useSessionsStore = defineStore('sessions', () => {
   }
 
   /** 打开远端 shell。失败时把错误留在返回值里给调用方显示，不在这里静默建 tab。 */
-  async function openRemote(hostId: string, pty: PtySize = DEFAULT_PTY): Promise<{ ok: boolean, error: string | null }> {
+  async function openRemote(hostId: string, pty: PtySize = DEFAULT_PTY): Promise<OpenResult> {
     try {
       const info = await sessionApi.openRemote(hostId, pty)
       upsert(info)
       activeId.value = info.id
-      return { ok: true, error: null }
+      return { ok: true, error: null, id: info.id }
     } catch (err) {
-      return { ok: false, error: describeIpcError(normalizeIpcError(err)) }
+      return { ok: false, error: describeIpcError(normalizeIpcError(err)), id: null }
     }
   }
 
-  async function openLocal(label: string, pty: PtySize = DEFAULT_PTY): Promise<{ ok: boolean, error: string | null }> {
+  async function openLocal(label: string, pty: PtySize = DEFAULT_PTY): Promise<OpenResult> {
     try {
       const info = await sessionApi.openLocal(
         { protocol: 'local', endpoint: null, auth: null, pty, shell: null, cwd: null, term: 'xterm-256color' },
@@ -99,9 +107,9 @@ export const useSessionsStore = defineStore('sessions', () => {
       )
       upsert(info)
       activeId.value = info.id
-      return { ok: true, error: null }
+      return { ok: true, error: null, id: info.id }
     } catch (err) {
-      return { ok: false, error: describeIpcError(normalizeIpcError(err)) }
+      return { ok: false, error: describeIpcError(normalizeIpcError(err)), id: null }
     }
   }
 

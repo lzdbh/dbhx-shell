@@ -59,7 +59,7 @@ describe('sessions store', () => {
     mock.openRemote.mockResolvedValueOnce(info(1))
     const sessions = useSessionsStore()
     const result = await sessions.openRemote('h1')
-    expect(result).toEqual({ ok: true, error: null })
+    expect(result).toEqual({ ok: true, error: null, id: 1 })
     expect(sessions.tabs.map(t => t.id)).toEqual([1])
     expect(sessions.activeId).toBe(1)
   })

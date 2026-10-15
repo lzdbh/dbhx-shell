@@ -40,6 +40,8 @@ class FakeTerminal {
   writes: Uint8Array[] = []
   pasted: string[] = []
   selection = ''
+  selectAllCount = 0
+  cleared = 0
   keyHandler: ((event: KeyboardEvent) => boolean) | null = null
   /** 被 fit 了几次。字号变化后必须重算行列，验的就是这个数。 */
   fitCount = 0
@@ -87,6 +89,9 @@ class FakeTerminal {
   focus(): void { this.focusCount += 1 }
   dispose(): void { this.disposed = true }
   paste(text: string): void { this.pasted.push(text) }
+  /** 右键菜单的「全选」「清屏」：本地状态动作，记个数就够。 */
+  selectAll(): void { this.selectAllCount += 1 }
+  clear(): void { this.cleared += 1 }
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void { this.keyHandler = handler }
   hasSelection(): boolean { return this.selection !== '' }
   getSelection(): string { return this.selection }
@@ -173,7 +178,14 @@ const theme: TerminalTheme = {
   ansi: ['#0', '#1', '#2', '#3', '#4', '#5', '#6', '#7', '#8', '#9', '#10', '#11', '#12', '#13', '#14', '#15'],
 }
 
-const handlers = { onData: () => {}, onResize: () => {}, onZoom: () => {} }
+const menuCalls = vi.hoisted(() => ({ list: [] as { x: number, y: number, selection: boolean }[] }))
+
+const handlers = {
+  onData: () => {},
+  onResize: () => {},
+  onZoom: () => {},
+  onContextMenu: (at: { x: number, y: number }, selection: boolean) => { menuCalls.list.push({ ...at, selection }) },
+}
 
 /**
  * 假剪贴板。真实实现是后端的 `local_clipboard_*` 命令，测试里既没有那个进程也不该
@@ -387,23 +399,65 @@ describe('终端剪贴板', () => {
     expect(term.keyHandler?.({ type: 'keyup', key: 'v', ctrlKey: true } as KeyboardEvent)).toBe(true)
   })
 
-  it('右键：有选区先复制选区，没选区才粘贴', async () => {
+  it('右键只报坐标与有没有选区，不再自己替用户决定复制还是粘贴', async () => {
     const element = registry.ensureTerminal(25, theme, 13, handlers)
     const term = fake(25)!
+    menuCalls.list.length = 0
     clip.state.text = ''
     term.selection = 'error line'
-    element.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
-    await flush()
-    expect(clip.state.text).toBe('error line')
-
-    term.selection = ''
-    clip.state.text = 'ls -l'
-    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+    term.pasted.length = 0
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 120, clientY: 60 })
     element.dispatchEvent(event)
     await flush()
-    expect(term.pasted).toEqual(['ls -l'])
     // 原生菜单一弹出来就既点不到也复制不了
     expect(event.defaultPrevented).toBe(true)
+    expect(menuCalls.list).toEqual([{ x: 120, y: 60, selection: true }])
+    // 关键在于「什么都没发生」：动作等用户从菜单里挑
+    expect(clip.state.text).toBe('')
+    expect(term.pasted).toEqual([])
+  })
+
+  it('菜单动作出口：复制/粘贴/全选/清屏各自只碰自己那件事', async () => {
+    registry.ensureTerminal(26, theme, 13, handlers)
+    const term = fake(26)!
+    clip.state.text = ''
+    term.selection = 'warn line'
+    registry.copySelection(26)
+    await flush()
+    expect(clip.state.text).toBe('warn line')
+    // 没有选区时复制是空操作，不能把剪贴板清掉
+    term.selection = ''
+    registry.copySelection(26)
+    await flush()
+    expect(clip.state.text).toBe('warn line')
+
+    clip.state.text = 'df -h'
+    registry.pasteClipboard(26)
+    await flush()
+    expect(term.pasted).toEqual(['df -h'])
+    registry.selectAllText(26)
+    registry.clearView(26)
+    expect(term.selectAllCount).toBe(1)
+    expect(term.cleared).toBe(1)
+    // 会话不存在时一律静默：菜单弹出到点击之间它可能已经被关掉
+    registry.copySelection(999)
+    registry.pasteClipboard(999)
+    registry.selectAllText(999)
+    registry.clearView(999)
+    expect(term.pasted).toEqual(['df -h'])
+  })
+
+  it('粘贴三条路都通：Ctrl+V、Ctrl+Shift+V、Shift+Insert', async () => {
+    registry.ensureTerminal(27, theme, 13, handlers)
+    const term = fake(27)!
+    clip.state.text = 'top'
+    expect(term.keyHandler?.(key({ key: 'v', ctrlKey: true }))).toBe(false)
+    expect(term.keyHandler?.(key({ key: 'V', ctrlKey: true, shiftKey: true }))).toBe(false)
+    expect(term.keyHandler?.(key({ key: 'Insert', shiftKey: true }))).toBe(false)
+    await flush()
+    expect(term.pasted).toEqual(['top', 'top', 'top'])
+    // 带 Shift 的 C 仍然还给 shell：那是终端自己的绑定，我们只接 V
+    expect(term.keyHandler?.(key({ key: 'C', ctrlKey: true, shiftKey: true }))).toBe(true)
   })
 
   it('剪贴板命令失败时只是不生效，不能抛出去打断按键', async () => {
@@ -427,7 +481,7 @@ describe('终端缩放', () => {
 
   it('Ctrl+滚轮换算成缩放档位，向上为正', () => {
     const steps: number[] = []
-    const element = registry.ensureTerminal(40, theme, 13, { onData: () => {}, onResize: () => {}, onZoom: s => { steps.push(s) } })
+    const element = registry.ensureTerminal(40, theme, 13, { onData: () => {}, onResize: () => {}, onZoom: s => { steps.push(s) }, onContextMenu: () => {} })
     const up = wheel(-120, true)
     element.dispatchEvent(up)
     element.dispatchEvent(wheel(120, true))
@@ -438,7 +492,7 @@ describe('终端缩放', () => {
 
   it('不带 Ctrl 的滚轮原样交给终端翻历史', () => {
     const steps: number[] = []
-    const element = registry.ensureTerminal(41, theme, 13, { onData: () => {}, onResize: () => {}, onZoom: s => { steps.push(s) } })
+    const element = registry.ensureTerminal(41, theme, 13, { onData: () => {}, onResize: () => {}, onZoom: s => { steps.push(s) }, onContextMenu: () => {} })
     const plain = wheel(120, false)
     element.dispatchEvent(plain)
     expect(steps).toEqual([])

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-import { BulbFilled, BulbOutlined, CodeOutlined, ColumnWidthOutlined, LockOutlined, SettingOutlined } from '@ant-design/icons-vue'
+import { AppstoreOutlined, BulbFilled, BulbOutlined, CodeOutlined, ColumnWidthOutlined, LockOutlined, SettingOutlined } from '@ant-design/icons-vue'
 
 import { startEventBridge } from '@/lib/ipc/bus'
 import { applyFontSizeAll, applyTheme, focusTerminal, setHighlightRules } from '@/lib/terminal/registry'
@@ -9,14 +9,16 @@ import { installShortcuts, type ShortcutHandlers } from '@/lib/shortcuts'
 import { clearSaved, resolve, save, savedSessions } from '@/lib/session-restore'
 import { antdTheme } from '@/styles/antd'
 import AskModal from '@/components/AskModal.vue'
+import ContextMenu from '@/components/ContextMenu.vue'
 import FindBar from '@/components/FindBar.vue'
+import GridBoard from '@/components/GridBoard.vue'
 import HostTree from '@/components/HostTree.vue'
 import LockOverlay from '@/components/LockOverlay.vue'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
 import TabBar from '@/components/TabBar.vue'
 import TerminalPane from '@/components/TerminalPane.vue'
 import { useHostsStore } from '@/stores/hosts'
-import { useLayoutStore } from '@/stores/layout'
+import { GRID_SIZES, useLayoutStore, type GridSize } from '@/stores/layout'
 import { useLockStore } from '@/stores/lock'
 import { useQuickStore } from '@/stores/quick'
 import { useSessionsStore } from '@/stores/sessions'
@@ -48,11 +50,31 @@ const antTheme = computed(() => antdTheme(themeStore.dark, themeStore.colorPrima
  * 同一份输出画两遍没有意义，而且两个格子会互相把同一个终端实例抢来抢去
  * （DOM 只有一个，appendChild 到哪里哪里就有画面），看上去就是随机闪烁。
  */
-const splitActive = computed(() => layout.pinned !== null && layout.pinned !== sessions.activeId)
+const isGrid = computed(() => layout.mode === 'grid')
+
+const splitActive = computed(() => !isGrid.value && layout.pinned !== null && layout.pinned !== sessions.activeId)
 const mainSession = computed(() => sessions.activeId)
 const pinnedSession = computed(() => (splitActive.value ? layout.pinned : null))
 /** 空格子时（关会话、文件面板跟谁）动的就是它：焦点格优先，没焦点才跟着 tab 走 */
 const focusedSession = computed(() => layout.focusTarget(sessions.activeId))
+
+/** 顶条上那颗「几格」下拉的选项。 */
+const gridOptions = GRID_SIZES.map(size => ({ value: size, label: `${size} 格` }))
+
+/**
+ * 切视图。
+ *
+ * 从标签切到宫格时把当前会话带进第一格：切过去看见九个空框，用户会以为会话被关掉了，
+ * 而实际上它们都还在标签栏里。带一个过去，这一眼就看懂了两种模式说的是同一批会话。
+ */
+function switchMode(next: 'tabs' | 'grid'): void {
+  if (next === layout.mode) return
+  layout.setMode(next)
+  if (next === 'grid' && layout.cells.every(item => item === null)) {
+    const current = focusedSession.value ?? sessions.activeId
+    if (current !== null) layout.placeCell(0, current)
+  }
+}
 
 const restoreList = computed(() => resolve(savedSessions(), hosts.hosts))
 /** 要等主机列表拉回来才知道哪些能自动重开，所以初值一律 false */
@@ -70,8 +92,31 @@ function paneSession(pane: 'main' | 'pinned'): number | null {
   return pane === 'main' ? mainSession.value : pinnedSession.value
 }
 
+/**
+ * 焦点跳到下一个有会话的格子。
+ *
+ * 空格子直接跳过：按 Ctrl+Tab 的人要找的是下一台机器，不是「哪一格是空的」。
+ * 一整圈都是空格就原地不动。
+ */
+function cycleCell(): void {
+  const count = layout.cells.length
+  for (let hop = 1; hop <= count; hop += 1) {
+    const index = (layout.focusCell + hop) % count
+    const id = layout.cells[index]
+    if (id === null) continue
+    layout.focusOnCell(index)
+    focusTerminal(id)
+    sessions.activate(id)
+    return
+  }
+}
+
 /** 两格之间跳：不分屏时按 tab 顺序循环，等于 Ctrl+Tab 的左手替代。 */
 function cycleFocus(): void {
+  if (isGrid.value) {
+    cycleCell()
+    return
+  }
   if (splitActive.value) {
     const next = focusedSession.value === pinnedSession.value ? mainSession.value : pinnedSession.value
     layout.setFocused(next)
@@ -190,6 +235,23 @@ watch(() => sessions.tabs.map(t => t.id), ids => {
   save(sessions.tabs)
 })
 
+/**
+ * 宫格模式下点标签：把这个会话搬到当前格，而不是让整块画面跟着 tab 走。
+ *
+ * 标签栏在宫格模式下仍然是「有哪些会话」的清单，但用户点它的时候想看的显然是那一个。
+ * 如果它已经钉在某一格里，就跳到那一格（看见≠重新安排）；否则占用当前格——
+ * 被挤掉的那个会话不关，只是这一格不再显示它。
+ */
+watch(() => sessions.activeId, (id) => {
+  if (!isGrid.value || id === null) return
+  const already = layout.cells.findIndex(item => item === id)
+  if (already >= 0) {
+    if (already !== layout.focusCell) layout.focusOnCell(already)
+    return
+  }
+  layout.placeCell(layout.focusCell, id)
+})
+
 watch(() => themeStore.terminalTheme, next => {
   sessions.tabs.forEach(tab => { applyTheme(tab.id, next) })
 })
@@ -214,7 +276,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
             </template>
           </a-button>
         </a-tooltip>
-        <a-tooltip title="Ctrl+E：把当前会话钉到右格">
+        <a-tooltip v-if="!isGrid" title="Ctrl+E：把当前会话钉到右格">
           <a-button
             size="small"
             :type="splitActive ? 'primary' : 'text'"
@@ -223,6 +285,27 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
           >
             <template #icon>
               <ColumnWidthOutlined />
+            </template>
+          </a-button>
+        </a-tooltip>
+        <!-- 宫格档数就在切换按钮旁边：切过去那一刻用户要做的决定就是「我要几格」 -->
+        <a-tooltip v-if="isGrid" title="格子数">
+          <a-select
+            size="small"
+            class="grid-size"
+            :value="layout.gridSize"
+            :options="gridOptions"
+            @change="value => layout.setGridSize(value as GridSize)"
+          />
+        </a-tooltip>
+        <a-tooltip :title="isGrid ? '切回标签视图' : '宫格视图：同时看几台机器，从左边拖一台进格子'">
+          <a-button
+            size="small"
+            :type="isGrid ? 'primary' : 'text'"
+            @click="switchMode(isGrid ? 'tabs' : 'grid')"
+          >
+            <template #icon>
+              <AppstoreOutlined />
             </template>
           </a-button>
         </a-tooltip>
@@ -266,29 +349,34 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
               不用了
             </a-button>
           </div>
-          <div class="terminal-area" :class="{ split: splitActive }">
+          <div class="terminal-area" :class="{ split: splitActive, grid: isGrid }">
             <!-- 查找条浮在格子上，不挤布局：一挤就要重新 fit，画面会跳一下 -->
             <FindBar v-model:open="findOpen" :session="focusedSession" />
+            <GridBoard v-if="isGrid" @find="findOpen = true" />
             <!-- 焦点格高亮不用 :focus-within：用户点了文件面板之后焦点离开了终端，
                  但键盘下一条输入仍然属于这一格 -->
             <!-- 没有会话时整格不挂：格子自带边框和 pane 底色，空着就是一块占半屏的空白卡片 -->
-            <TerminalPane
-              v-if="mainSession !== null"
-              :session="mainSession"
-              class="pane-main"
-              :class="{ focused: splitActive && focusedSession === mainSession }"
-              @click="pickPane('main')"
-            />
-            <TerminalPane
-              v-if="splitActive"
-              :session="pinnedSession"
-              class="pane-pinned"
-              :class="{ focused: focusedSession === pinnedSession }"
-              @click="pickPane('pinned')"
-            />
-            <div v-if="sessions.tabs.length === 0" class="placeholder">
-              从左侧选一台主机，或按 Ctrl+T 新建本机终端
-            </div>
+            <template v-else>
+              <TerminalPane
+                v-if="mainSession !== null"
+                :session="mainSession"
+                class="pane-main"
+                :class="{ focused: splitActive && focusedSession === mainSession }"
+                @click="pickPane('main')"
+                @find="findOpen = true"
+              />
+              <TerminalPane
+                v-if="splitActive"
+                :session="pinnedSession"
+                class="pane-pinned"
+                :class="{ focused: focusedSession === pinnedSession }"
+                @click="pickPane('pinned')"
+                @find="findOpen = true"
+              />
+              <div v-if="sessions.tabs.length === 0" class="placeholder">
+                从左侧选一台主机，或按 Ctrl+T 新建本机终端
+              </div>
+            </template>
           </div>
         </a-layout>
       </a-layout>
@@ -297,6 +385,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
       <SettingsDrawer />
     </a-drawer>
     <AskModal />
+    <ContextMenu />
     <LockOverlay />
   </a-config-provider>
 </template>
@@ -374,6 +463,12 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
 .terminal-area.split .pane-main.focused,
 .terminal-area.split .pane-pinned.focused {
   border-color: var(--accent-line);
+}
+
+/* 档数下拉只有五个值，给 88px 刚好放下「9 格」再加一颗箭头；
+   再宽就把顶条右侧那组按钮挤得贴边了 */
+.grid-size {
+  width: 88px;
 }
 
 .placeholder {
