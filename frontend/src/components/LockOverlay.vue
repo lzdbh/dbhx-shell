@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
 
+import { LockOutlined } from '@ant-design/icons-vue'
+
 import { useLockStore } from '@/stores/lock'
 
 /**
@@ -46,7 +48,9 @@ watch(() => lock.locked, locked => {
 <template>
   <div v-if="lock.locked" class="overlay" data-testid="lock-overlay">
     <div class="card">
-      <div class="title">应用已锁定</div>
+      <div class="title">
+        <LockOutlined />应用已锁定
+      </div>
       <p class="sub">
         连接与凭据读写在解锁前都会被拒绝。
       </p>
@@ -82,22 +86,30 @@ watch(() => lock.locked, locked => {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* 不透出底下内容：半透明会让窗口里的地址、用户名在锁定态仍被看到 */
-  background: #1f1f1f;
-  color: #eaeaea;
+  /* 不透出底下内容，也不做毛玻璃：半透明加模糊仍然能辨出地址、用户名，
+     锁屏这一层要的是「什么都看不见」，所以用最深的那一档表面整块盖住 */
+  background: var(--bg-app);
+  color: var(--text-1);
 }
 
+/* 卡片靠「浮起的一档表面 + 一道边 + 投影」和背景分开。
+   之前写的是 rgba(255, 255, 255, 0.06)：浅色主题下白压白，卡片等于消失。 */
 .card {
   width: 320px;
   display: flex;
   flex-direction: column;
   gap: 12px;
   padding: 28px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
 }
 
 .title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 18px;
   font-weight: 600;
 }
@@ -105,11 +117,11 @@ watch(() => lock.locked, locked => {
 .sub {
   margin: 0;
   font-size: 13px;
-  opacity: 0.7;
+  color: var(--text-2);
 }
 
 .err {
-  color: #ff7875;
+  color: var(--err);
   font-size: 13px;
 }
 </style>

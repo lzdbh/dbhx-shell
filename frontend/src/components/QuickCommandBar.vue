@@ -5,7 +5,6 @@ import type { SessionId } from '@/lib/ipc/bindings'
 import { focusTerminal } from '@/lib/terminal/registry'
 import { useQuickStore } from '@/stores/quick'
 import { useSessionsStore } from '@/stores/sessions'
-import { useThemeStore } from '@/stores/theme'
 
 /**
  * 快捷命令栏，形状照 Xshell 的「快捷命令」条：终端下面一个输入框，回车把整行
@@ -19,7 +18,6 @@ const props = defineProps<{ session: SessionId | null }>()
 
 const quick = useQuickStore()
 const sessions = useSessionsStore()
-const themeStore = useThemeStore()
 
 const text = ref('')
 const input = ref<{ focus: () => void } | null>(null)
@@ -112,7 +110,6 @@ onMounted(async () => {
   <div
     v-if="session !== null"
     class="quick-bar"
-    :style="{ background: themeStore.terminalTheme.background, color: themeStore.terminalTheme.foreground }"
   >
     <span class="tag">命令</span>
     <a-input
@@ -129,18 +126,22 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* 这一条属于它上面那一格，所以底用格子的表面色而不是外围色：
+   分屏时两条命令栏各自贴着自己的终端，看起来才是一对 */
 .quick-bar {
   display: flex;
   align-items: center;
   gap: 6px;
   flex: none;
-  padding: 1px 8px;
+  padding: 2px 8px;
   font-size: 12px;
-  border-top: 1px solid rgba(128, 128, 128, 0.2);
+  background: var(--pane-bg);
+  color: var(--text-1);
+  border-top: 1px solid var(--line);
 }
 
 .tag {
-  opacity: 0.6;
+  color: var(--text-3);
   flex: none;
 }
 
@@ -161,7 +162,7 @@ onMounted(async () => {
   flex: none;
   min-width: 60px;
   text-align: right;
-  font-size: 11px;
-  opacity: 0.7;
+  font-size: 12px;
+  color: var(--text-3);
 }
 </style>

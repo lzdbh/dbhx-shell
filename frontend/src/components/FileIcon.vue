@@ -7,9 +7,10 @@ import { ACCENTS } from '../lib/fileType'
 /**
  * 列表条目的类型图标。
  *
- * 自己画而不是引图标库：`@ant-design/icons-vue` 是独立依赖，为十几个 16px 图标
- * 加一条 npm/Cargo 链不值得。描边用 `currentColor`，所以深浅主题下都跟正文同色；
- * 只有主色（文件夹的黄、图片的绿……）固定，理由是用户在资源管理器里就靠颜色认类型，
+ * 图标库（`@ant-design/icons-vue`）里那套 FileOutlined/PictureOutlined 彼此长得差不多，
+ * 在 16px 的行高下分不出「代码」和「文档」，而资源管理器靠的就是这一眼。所以这里自己画，
+ * 一套图形按类型拉开差异。描边用 `currentColor`，深浅主题下都跟正文同色；
+ * 只有主色（文件夹的黄、图片的绿……）固定，理由是用户就靠颜色认类型，
  * 跟着主题变会把「图片」和「文档」洗成同一种灰。
  */
 const props = defineProps<{ icon: IconKey }>()

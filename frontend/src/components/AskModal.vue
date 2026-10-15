@@ -131,6 +131,6 @@ async function skipPassphrase(): Promise<void> {
 .tip {
   margin: 8px 0 0;
   font-size: 12px;
-  opacity: 0.7;
+  color: var(--text-2);
 }
 </style>

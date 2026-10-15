@@ -12,6 +12,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@ant-design/icons-vue": "^7.0.1",
     "@tauri-apps/api": "^2.12.3",
     "@vueuse/core": "^15.0.0",
     "@xterm/addon-fit": "^0.10.0",

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 
+import { ArrowUpOutlined } from '@ant-design/icons-vue'
+
 import type { FileEntry } from '../lib/ipc/bindings'
 import { iconOf, typeName } from '../lib/fileType'
 import { formatSize, formatTime } from '../lib/format'
@@ -299,7 +301,12 @@ function onRemoveCancel(): void {
 <template>
   <section class="pane">
     <div class="toolbar">
-      <a-button size="small" :disabled="!canGoUp || !enabled" @click="emit('up')">↑ 上级</a-button>
+      <a-button size="small" :disabled="!canGoUp || !enabled" @click="emit('up')">
+        <template #icon>
+          <ArrowUpOutlined />
+        </template>
+        上级
+      </a-button>
       <a-button size="small" :disabled="!enabled" @click="emit('refresh')">刷新</a-button>
       <a-dropdown :trigger="['click']" :disabled="!enabled">
         <a-button size="small" :disabled="!enabled">新建</a-button>
@@ -474,13 +481,13 @@ function onRemoveCancel(): void {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  border: 1px solid rgba(128, 128, 128, 0.25);
+  border: 1px solid var(--line);
   border-radius: 4px;
   outline: none;
 }
 
 .list:focus-visible {
-  border-color: rgba(128, 128, 128, 0.55);
+  border-color: var(--line-strong);
 }
 
 .head {
@@ -492,8 +499,8 @@ function onRemoveCancel(): void {
   gap: 8px;
   padding: 3px 8px;
   font-size: 12px;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
-  background: rgba(128, 128, 128, 0.08);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-hover);
 }
 
 .h {
@@ -508,7 +515,7 @@ function onRemoveCancel(): void {
 }
 
 .h:hover {
-  background: rgba(128, 128, 128, 0.16);
+  background: var(--bg-active);
 }
 
 .h i {
@@ -567,12 +574,12 @@ function onRemoveCancel(): void {
 }
 
 .row:hover {
-  background: rgba(128, 128, 128, 0.1);
+  background: var(--bg-hover);
 }
 
 .row.sel {
-  background: rgba(22, 119, 255, 0.16);
-  box-shadow: inset 0 0 0 1px rgba(22, 119, 255, 0.35);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
 }
 
 .c {

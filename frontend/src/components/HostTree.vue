@@ -2,6 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 
+import { DeleteOutlined, EditOutlined, FolderOpenOutlined, LinkOutlined, PlusOutlined } from '@ant-design/icons-vue'
+
 import type { HostInfo } from '@/lib/ipc/bindings'
 import { fileWindowApi } from '@/lib/ipc/client'
 import { useHostsStore } from '@/stores/hosts'
@@ -90,11 +92,20 @@ onMounted(() => void hosts.refresh())
     <holder />
     <div class="toolbar">
       <a-input v-model:value="keyword" size="small" placeholder="搜索主机" allow-clear />
-      <a-button size="small" type="primary" @click="create()">新建</a-button>
+      <a-button size="small" type="primary" @click="create()">
+        <template #icon>
+          <PlusOutlined />
+        </template>
+        新建
+      </a-button>
     </div>
     <a-alert v-if="hosts.error" :message="hosts.error" type="error" banner />
     <a-spin :spinning="hosts.loading">
-      <a-empty v-if="filtered.length === 0" description="还没有主机" style="margin-top: 32px" />
+      <!-- 空状态只给一句话：组件库那台插画在侧栏 260px 里又大又抢，而且「还没有主机」
+           这件事上面那颗「新建」按钮已经说清楚了 -->
+      <div v-if="filtered.length === 0" class="empty">
+        {{ keyword ? '没有匹配的主机' : '还没有主机，先新建一台' }}
+      </div>
       <a-tree
         v-else
         :tree-data="treeData"
@@ -105,11 +116,31 @@ onMounted(() => void hosts.refresh())
       />
     </a-spin>
     <div v-if="selected" class="actions">
-      <a-button size="small" type="primary" :loading="connecting" @click="void connect(selected)">连接</a-button>
-      <a-button size="small" :disabled="selected.protocol !== 'ssh'" @click="void openPanel(selected)">文件面板</a-button>
-      <a-button size="small" @click="edit(selected)">编辑</a-button>
+      <a-button size="small" type="primary" :loading="connecting" @click="void connect(selected)">
+        <template #icon>
+          <LinkOutlined />
+        </template>
+        连接
+      </a-button>
+      <a-button size="small" :disabled="selected.protocol !== 'ssh'" @click="void openPanel(selected)">
+        <template #icon>
+          <FolderOpenOutlined />
+        </template>
+        文件面板
+      </a-button>
+      <a-button size="small" @click="edit(selected)">
+        <template #icon>
+          <EditOutlined />
+        </template>
+        编辑
+      </a-button>
       <a-popconfirm title="删除这台主机及其已存口令？" ok-text="删除" cancel-text="取消" @confirm="void remove(selected)">
-        <a-button size="small" danger>删除</a-button>
+        <a-button size="small" danger>
+          <template #icon>
+            <DeleteOutlined />
+          </template>
+          删除
+        </a-button>
       </a-popconfirm>
     </div>
     <HostFormModal v-model:open="formOpen" :host="editing" />
@@ -132,12 +163,21 @@ onMounted(() => void hosts.refresh())
   flex: none;
 }
 
+.empty {
+  padding: 24px 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* 四个动作排两行两列：一行四颗在 260px 侧栏里会被挤成换行的残块，
+   按钮上的图标还会和文字错开 */
 .actions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   flex: none;
   padding-top: 8px;
-  border-top: 1px solid rgba(128, 128, 128, 0.25);
+  border-top: 1px solid var(--line);
 }
 </style>

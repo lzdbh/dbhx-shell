@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 
+import { CloseOutlined, DownOutlined, UpOutlined } from '@ant-design/icons-vue'
+
 import { clearFind, findText, focusTerminal, lookup, type FindHit } from '@/lib/terminal/registry'
 import type { SessionId } from '@/lib/ipc/bindings'
-import { useThemeStore } from '@/stores/theme'
 
 /**
  * 终端内的查找条，形状照 Xshell 的「编辑 → 查找」：一个输入框、三个匹配开关、
@@ -22,8 +23,6 @@ const hit = ref<FindHit | null>(null)
 // 只用到 focus()，就按这个最小形状声明：AntDV 的输入框实例包装着真正的元素，
 // 写成 HTMLElement 反而拿不到它。
 const input = ref<{ focus: () => void } | null>(null)
-
-const themeStore = useThemeStore()
 
 const options = computed(() => ({
   caseSensitive: flags.caseSensitive,
@@ -106,7 +105,6 @@ watch(() => props.session, () => {
   <div
     v-if="open"
     class="find-bar"
-    :style="{ background: themeStore.terminalTheme.background, color: themeStore.terminalTheme.foreground }"
     @keydown="onKeydown"
   >
     <a-input
@@ -137,18 +135,24 @@ watch(() => props.session, () => {
         </a-button>
       </a-tooltip>
       <a-tooltip title="上一个（Shift+Enter）">
-        <a-button size="small" @click="search(false)">
-          ↑
+        <a-button size="small" type="text" @click="search(false)">
+          <template #icon>
+            <UpOutlined />
+          </template>
         </a-button>
       </a-tooltip>
       <a-tooltip title="下一个（Enter）">
-        <a-button size="small" @click="search(true)">
-          ↓
+        <a-button size="small" type="text" @click="search(true)">
+          <template #icon>
+            <DownOutlined />
+          </template>
         </a-button>
       </a-tooltip>
       <a-tooltip title="关闭（Esc）">
-        <a-button size="small" @click="close()">
-          ×
+        <a-button size="small" type="text" @click="close()">
+          <template #icon>
+            <CloseOutlined />
+          </template>
         </a-button>
       </a-tooltip>
     </div>
@@ -164,11 +168,14 @@ watch(() => props.session, () => {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 2px 4px;
-  border: 1px solid rgba(128, 128, 128, 0.35);
-  border-radius: 4px;
-  /* 底色由主题绑定（见模板）：浮在终端上，必须不透明，否则字压在输出上读不出来 */
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  padding: 3px 6px;
+  /* 浮在终端上，必须不透明，否则字压在输出上读不出来；
+     用「浮层」那一档表面而不是格子底色，才分得出这条是盖在上面的 */
+  background: var(--bg-raised);
+  color: var(--text-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 
 .find-input {

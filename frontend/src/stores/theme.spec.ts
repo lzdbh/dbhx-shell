@@ -2,7 +2,8 @@ import { createPinia, setActivePinia } from 'pinia'
 import { nextTick } from 'vue'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { useThemeStore } from './theme'
+import { DARK, LIGHT } from '../styles/palette'
+import { applyStoredTheme, useThemeStore } from './theme'
 
 const KEY = 'dbhx:theme'
 
@@ -63,5 +64,34 @@ describe('theme store', () => {
     expect(theme.terminalTheme.id).toBe('dbhx-dark')
     theme.toggleDark()
     expect(theme.terminalTheme.id).toBe('dbhx-light')
+  })
+
+  it('变量写在 <html> 上，界面侧只读变量', async () => {
+    const root = document.documentElement
+    // 挂载前那一步：main.ts 就是叫这个函数，晚一步第一帧是白底
+    applyStoredTheme()
+    expect(root.dataset.theme).toBe('dark')
+    expect(root.style.getPropertyValue('--bg-app')).toBe(DARK.bgApp)
+    expect(root.style.getPropertyValue('--pane-bg')).toBe(DARK.paneBg)
+
+    const theme = useThemeStore()
+    theme.toggleDark()
+    await nextTick()
+    expect(root.dataset.theme).toBe('light')
+    expect(root.style.getPropertyValue('--bg-app')).toBe(LIGHT.bgApp)
+    // 终端格子与界面用的是同一张表，不然会看见一圈色差缝
+    expect(theme.terminalTheme.background).toBe(LIGHT.paneBg)
+  })
+
+  it('主色换了，淡底跟着现算，不是留着一个蓝', async () => {
+    const theme = useThemeStore()
+    applyStoredTheme()
+    theme.toggleDark()
+    theme.colorPrimary = '#ff7a45'
+    await nextTick()
+    const root = document.documentElement
+    expect(root.style.getPropertyValue('--accent')).toBe('#ff7a45')
+    expect(root.style.getPropertyValue('--accent-soft')).toBe('rgba(255, 122, 69, 0.1)')
+    expect(root.style.getPropertyValue('--accent-line')).toBe('rgba(255, 122, 69, 0.45)')
   })
 })

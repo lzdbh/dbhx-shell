@@ -1,0 +1,37 @@
+/**
+ * 界面非色值变量的落点，以及变量的引用方式。
+ *
+ * **颜色不在这里。** 色值由 `styles/palette.ts` 那一张表生成，`applyThemeVars()`
+ * 把它们写成 `<html>` 上的内联变量。之所以不写在 .css 里：AntDV 的 theme token 只吃
+ * 真实颜色值（cssinjs 要从它派生 hover/active），组件库那份必须在 TS 侧，两处各写一遍
+ * 迟早对不上，所以只留一个出处。
+ *
+ * 之前每个组件各贴各的 `rgba(128, 128, 128, α)`：同一根分隔线在七个文件里是七种
+ * 透明度，深色下整体发灰、浅色下像没加载完，切主题还会漏掉几处。现在组件只写
+ * `var(--line)`，不看具体色。
+ */
+
+:root {
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+
+  /* 交互反馈只给一条时长：一处改，全应用一起改。 */
+  --tap: 0.12s;
+}
+
+/* 前庭敏感的用户不该被一堆淡入淡出折磨：时长归零，界面照用，只是不再动。
+   组件里凡是写 `var(--tap)` 的地方都自动跟着停，不需要各自再判一遍。 */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --tap: 0s;
+  }
+}
+
+/* 窗口底跟着主题走，而不是留成 WebView2 的默认白：文件管理窗口整块内容都是
+   自己画的，组件库的 .ant-layout 兜不住它。 */
+html,
+body {
+  background: var(--bg-app);
+  color: var(--text-1);
+}

@@ -1,8 +1,10 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import 'ant-design-vue/dist/reset.css'
+import './styles/tokens.css'
 import App from './App.vue'
 import FileManager from './components/FileManager.vue'
+import { applyStoredTheme } from './stores/theme'
 
 /**
  * 一个前端产物、两种窗口：主窗口是终端 shell，`files-<hex>` 窗口是文件管理。
@@ -24,6 +26,9 @@ async function fileWindowHostId(): Promise<string | null> {
 }
 
 const hostId = await fileWindowHostId()
+
+// 变量先写、组件后挂：否则第一帧读不到 `--bg-app`，深色主题下会闪一下白底。
+applyStoredTheme()
 
 if (hostId !== null) {
   createApp(FileManager, { hostId }).use(createPinia()).mount('#app')

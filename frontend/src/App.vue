@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-import { theme } from 'ant-design-vue'
+import { BulbFilled, BulbOutlined, CodeOutlined, ColumnWidthOutlined, LockOutlined, SettingOutlined } from '@ant-design/icons-vue'
 
 import { startEventBridge } from '@/lib/ipc/bus'
 import { applyFontSizeAll, applyTheme, focusTerminal, setHighlightRules } from '@/lib/terminal/registry'
 import { installShortcuts, type ShortcutHandlers } from '@/lib/shortcuts'
 import { clearSaved, resolve, save, savedSessions } from '@/lib/session-restore'
+import { antdTheme } from '@/styles/antd'
 import AskModal from '@/components/AskModal.vue'
 import FindBar from '@/components/FindBar.vue'
 import HostTree from '@/components/HostTree.vue'
@@ -39,10 +40,7 @@ let stopBridge: (() => void) | null = null
 let stopShortcuts: (() => void) | null = null
 let stopActivity: (() => void) | null = null
 
-const antTheme = computed(() => ({
-  algorithm: themeStore.dark ? theme.darkAlgorithm : theme.defaultAlgorithm,
-  token: { colorPrimary: themeStore.colorPrimary },
-}))
+const antTheme = computed(() => antdTheme(themeStore.dark, themeStore.colorPrimary))
 
 /**
  * 钉住的会话恰好是当前会话时不分屏。
@@ -207,32 +205,53 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
     <a-layout class="shell">
       <a-layout-header class="bar">
         <span class="brand">dbhx shell</span>
-        <a-button size="small" @click="void sessions.openLocal('本机终端')">
-          本机终端
-        </a-button>
+        <!-- 顶条只放图标 + tooltip：这五个动作天天按，文字标签把条带撑到一半宽，
+             而窗口宽度是要留给终端的 -->
+        <a-tooltip title="新建本机终端（Ctrl+T）">
+          <a-button size="small" type="text" @click="void sessions.openLocal('本机终端')">
+            <template #icon>
+              <CodeOutlined />
+            </template>
+          </a-button>
+        </a-tooltip>
         <a-tooltip title="Ctrl+E：把当前会话钉到右格">
-          <a-button size="small" :disabled="sessions.activeId === null" @click="toggleSplit">
-            {{ splitActive ? '取消分屏' : '分屏' }}
+          <a-button
+            size="small"
+            :type="splitActive ? 'primary' : 'text'"
+            :disabled="sessions.activeId === null"
+            @click="toggleSplit"
+          >
+            <template #icon>
+              <ColumnWidthOutlined />
+            </template>
           </a-button>
         </a-tooltip>
         <a-tooltip v-if="lock.hasPin" title="立即锁定：锁定后禁止新连接与凭据读写">
-          <a-button size="small" @click="void lock.lock()">
-            锁定
+          <a-button size="small" type="text" @click="void lock.lock()">
+            <template #icon>
+              <LockOutlined />
+            </template>
           </a-button>
         </a-tooltip>
-        <a-switch
-          :checked="themeStore.dark"
-          checked-children="暗"
-          un-checked-children="亮"
-          size="small"
-          @change="themeStore.toggleDark()"
-        />
-        <a-button size="small" @click="drawerOpen = true">
-          设置
-        </a-button>
+        <span class="spacer" />
+        <a-tooltip :title="themeStore.dark ? '切成浅色（配色偏好两个窗口共用）' : '切成深色'">
+          <a-button size="small" type="text" @click="themeStore.toggleDark()">
+            <template #icon>
+              <BulbFilled v-if="themeStore.dark" />
+              <BulbOutlined v-else />
+            </template>
+          </a-button>
+        </a-tooltip>
+        <a-tooltip title="设置（Ctrl+,）">
+          <a-button size="small" type="text" @click="drawerOpen = true">
+            <template #icon>
+              <SettingOutlined />
+            </template>
+          </a-button>
+        </a-tooltip>
       </a-layout-header>
       <a-layout has-sider>
-        <a-layout-sider :width="260" theme="light" class="sider">
+        <a-layout-sider :width="260" class="sider">
           <HostTree />
         </a-layout-sider>
         <a-layout class="center">
@@ -252,7 +271,9 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
             <FindBar v-model:open="findOpen" :session="focusedSession" />
             <!-- 焦点格高亮不用 :focus-within：用户点了文件面板之后焦点离开了终端，
                  但键盘下一条输入仍然属于这一格 -->
+            <!-- 没有会话时整格不挂：格子自带边框和 pane 底色，空着就是一块占半屏的空白卡片 -->
             <TerminalPane
+              v-if="mainSession !== null"
               :session="mainSession"
               class="pane-main"
               :class="{ focused: splitActive && focusedSession === mainSession }"
@@ -265,11 +286,9 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
               :class="{ focused: focusedSession === pinnedSession }"
               @click="pickPane('pinned')"
             />
-            <a-empty
-              v-if="sessions.tabs.length === 0"
-              description="从左侧选一台主机，或新建本机终端"
-              class="placeholder"
-            />
+            <div v-if="sessions.tabs.length === 0" class="placeholder">
+              从左侧选一台主机，或按 Ctrl+T 新建本机终端
+            </div>
           </div>
         </a-layout>
       </a-layout>
@@ -287,24 +306,36 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
   height: 100vh;
 }
 
+/* 底色由 Layout 的 colorBgHeader token 给；高度与内边距在 4.2 里没有对应 token，
+   只能在这里写。组件库默认是 64px 的网页页头，对终端窗口来说太高。 */
 .bar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 16px;
+  gap: 10px;
   height: 44px;
   line-height: 44px;
-  background: rgba(128, 128, 128, 0.08);
+  padding: 0 14px;
+  border-bottom: 1px solid var(--line);
 }
 
 .brand {
   font-weight: 600;
-  margin-right: 8px;
+  letter-spacing: 0.02em;
+  margin-right: 6px;
+  color: var(--text-1);
 }
 
+/* 左侧是「干活的动作」，右侧是主题与设置：把它们推到两头，鼠标移动距离就有了规律 */
+.spacer {
+  flex: 1;
+}
+
+/* 侧栏和顶条同属「外围」，用比窗口底亮一档的表面；终端那块才是内容。
+   底色写在这里而不是靠 Layout token：4.2 的 Layout 只有 header/body/trigger 三个色，
+   侧栏跟着 body 走会和窗口底一个色，分不出层次。 */
 .sider {
-  background: rgba(128, 128, 128, 0.04);
-  border-right: 1px solid rgba(128, 128, 128, 0.2);
+  background: var(--bg-surface);
+  border-right: 1px solid var(--line);
   overflow: hidden;
 }
 
@@ -317,8 +348,8 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
   align-items: center;
   gap: 8px;
   padding: 6px 12px;
-  background: rgba(128, 128, 128, 0.08);
-  border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--line);
 }
 
 .terminal-area {
@@ -327,8 +358,9 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
   display: flex;
   flex: 1;
   min-height: 0;
-  gap: 4px;
-  padding: 4px 6px 6px;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  background: var(--bg-app);
 }
 
 /* 等分：拖拽调比例要改的是格子的 flex-basis，而终端实例只有在我们主动 resize
@@ -337,15 +369,11 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
   flex-basis: 0;
 }
 
-.pane-main,
-.pane-pinned {
-  border: 1px solid transparent;
-}
-
-/* 当前吃键盘的那格给一圈高亮，否则两格长一样，用户不知道键去了哪 */
+/* 当前吃键盘的那格给一圈高亮，否则两格长一样，用户不知道键去了哪。
+   用主色的淡描边而不是灰色：灰色和「已结束」那种中性边框分不开。 */
 .terminal-area.split .pane-main.focused,
 .terminal-area.split .pane-pinned.focused {
-  border-color: rgba(128, 128, 128, 0.35);
+  border-color: var(--accent-line);
 }
 
 .placeholder {
@@ -353,5 +381,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
   display: flex;
   align-items: center;
   justify-content: center;
+  font-size: 12px;
+  color: var(--text-3);
 }
 </style>

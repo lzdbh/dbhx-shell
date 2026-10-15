@@ -369,14 +369,14 @@ function splitPattern(pattern: string): { host: string, port: number } {
 }
 
 .dim {
-  opacity: 0.6;
+  color: var(--text-3);
   margin-left: 6px;
 }
 
 .hint-line {
   margin: 0 0 8px;
   font-size: 12px;
-  opacity: 0.65;
+  color: var(--text-3);
 }
 
 .hl-row {
@@ -396,7 +396,7 @@ function splitPattern(pattern: string): { host: string, port: number } {
   width: 34px;
   height: 24px;
   padding: 0 2px;
-  border: 1px solid rgba(128, 128, 128, 0.45);
+  border: 1px solid var(--line-strong);
   border-radius: 4px;
   background: none;
   cursor: pointer;

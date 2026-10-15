@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
+import { ArrowDownOutlined, ArrowUpOutlined } from '@ant-design/icons-vue'
+
 import type { TransferState } from '@/lib/ipc/bindings'
 import { formatSize } from '@/lib/format'
 import { useTransfersStore } from '@/stores/transfers'
@@ -42,7 +44,11 @@ const batchErrors = computed(failedBatches)
     </div>
     <div v-for="row in rows" :key="row.id" class="row">
       <div class="line">
-        <span class="name" :title="row.path">{{ row.kind === 'upload' ? '↑' : '↓' }} {{ row.path.split('/').pop() }}</span>
+        <span class="name" :title="row.path">
+          <ArrowUpOutlined v-if="row.kind === 'upload'" class="dir" />
+          <ArrowDownOutlined v-else class="dir" />
+          {{ row.path.split('/').pop() }}
+        </span>
         <span class="state">{{ STATE_TEXT[row.state] }}</span>
       </div>
       <a-progress
@@ -62,7 +68,7 @@ const batchErrors = computed(failedBatches)
 
 <style scoped>
 .tray {
-  border-top: 1px solid rgba(128, 128, 128, 0.25);
+  border-top: 1px solid var(--line);
   padding: 6px 8px;
   max-height: 240px;
   overflow: auto;
@@ -89,24 +95,37 @@ const batchErrors = computed(failedBatches)
 }
 
 .name {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* 上传/下载靠箭头方向区分，颜色只是把这一列点亮一点，不承担含义 */
+.dir {
+  font-size: 11px;
+  color: var(--text-3);
+  flex: none;
+}
+
 .state {
   flex: none;
-  opacity: 0.7;
+  color: var(--text-3);
 }
 
 .meta {
   display: flex;
   justify-content: space-between;
-  font-size: 11px;
-  opacity: 0.7;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+  /* 字节数是数字，等宽才不会每刷新一次就左右跳 */
+  font-variant-numeric: tabular-nums;
 }
 
 .error {
-  color: #ff4d4f;
+  color: var(--err);
 }
 </style>

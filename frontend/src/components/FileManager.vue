@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
-import { theme } from 'ant-design-vue'
+import { DownloadOutlined, UploadOutlined } from '@ant-design/icons-vue'
 
 import type { FileEntry } from '@/lib/ipc/bindings'
 import { localApi } from '@/lib/ipc/client'
 import { startEventBridge } from '@/lib/ipc/bus'
 import { localJoin, localParent, parentPath } from '@/lib/format'
+import { antdTheme } from '@/styles/antd'
 import { useFilesStore } from '@/stores/files'
 import { useHostsStore } from '@/stores/hosts'
 import { useThemeStore } from '@/stores/theme'
@@ -21,10 +22,7 @@ const hosts = useHostsStore()
 const themeStore = useThemeStore()
 const transfers = useTransfersStore()
 
-const antTheme = computed(() => ({
-  algorithm: themeStore.dark ? theme.darkAlgorithm : theme.defaultAlgorithm,
-  token: { colorPrimary: themeStore.colorPrimary },
-}))
+const antTheme = computed(() => antdTheme(themeStore.dark, themeStore.colorPrimary))
 
 const host = computed(() => hosts.byId(props.hostId) ?? null)
 /** vault 记录里的端口是「缺省即按协议补」，直接插值会显示成 `:null`。 */
@@ -264,8 +262,9 @@ onBeforeUnmount(() => {
       <div class="bar">
         <span class="title">{{ host ? host.label : '文件管理' }}</span>
         <span class="subtitle">{{ subtitle }}</span>
-        <a-tag v-if="conn !== null" color="green">已连接</a-tag>
-        <a-tag v-else color="orange">未连接</a-tag>
+        <!-- 和标签栏同一个点：a-tag 的 green 是组件库预设色，跟 --ok 不是一套，
+             同一件事在两个窗口里会给出两种绿 -->
+        <span class="status"><span class="dot" :class="conn !== null ? 'ok' : 'down'" />{{ conn !== null ? '已连接' : '未连接' }}</span>
       </div>
 
       <div class="panes">
@@ -307,12 +306,18 @@ onBeforeUnmount(() => {
         <div class="transfer">
           <a-tooltip title="把左栏选中的文件上传到右栏当前目录">
             <a-button size="small" type="primary" :disabled="!canUpload" @click="void uploadSelected()">
-              {{ local.selected.length > 0 ? `上传 ${local.selected.length} 个 →` : '上传 →' }}
+              <template #icon>
+                <UploadOutlined />
+              </template>
+              {{ local.selected.length > 0 ? `上传 ${local.selected.length} 个` : '上传' }}
             </a-button>
           </a-tooltip>
           <a-tooltip title="把右栏选中的文件下载到左栏当前目录">
             <a-button size="small" type="primary" :disabled="!canDownload" @click="void downloadSelected()">
-              {{ remoteSelected.length > 0 ? `← 下载 ${remoteSelected.length} 个` : '← 下载' }}
+              <template #icon>
+                <DownloadOutlined />
+              </template>
+              {{ remoteSelected.length > 0 ? `下载 ${remoteSelected.length} 个` : '下载' }}
             </a-button>
           </a-tooltip>
         </div>
@@ -360,7 +365,8 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--line);
   flex: none;
 }
 
@@ -370,8 +376,35 @@ onBeforeUnmount(() => {
 
 .subtitle {
   font-size: 12px;
-  opacity: 0.7;
+  color: var(--text-3);
   font-family: ui-monospace, Menlo, Consolas, monospace;
+  /* 地址里的数字要对齐，扫一眼就能比较两台机器 */
+  font-variant-numeric: tabular-nums;
+}
+
+/* 连接状态点：尺寸与配色和标签栏那套一致（.dot 在两个组件里各写一份，
+   scoped 样式不共享，但值都取自同一批变量） */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.dot.ok {
+  background: var(--ok);
+}
+
+.dot.down {
+  background: var(--warn);
 }
 
 .panes {

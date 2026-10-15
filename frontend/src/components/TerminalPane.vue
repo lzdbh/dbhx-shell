@@ -79,7 +79,8 @@ onBeforeUnmount(release)
 
 <style scoped>
 .pane {
-  /* 格子的尺寸完全由父层的 flex 决定，这里只保证终端撑满 */
+  /* 格子的尺寸完全由父层的 flex 决定，这里只保证终端撑满。
+     边框颜色由外层决定：单屏时它几乎看不见，分屏时焦点那格被涂成主色淡描边 */
   position: relative;
   display: flex;
   flex-direction: column;
@@ -87,6 +88,10 @@ onBeforeUnmount(release)
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  background: var(--pane-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  transition: border-color var(--tap) ease;
 }
 
 /* 状态条占掉的那一行高度由 flex 算，屏幕元素只管剩下的部分 */
@@ -96,11 +101,12 @@ onBeforeUnmount(release)
   min-height: 0;
 }
 
-/* 宿主元素是登记处 createElement 造的，带不上 scoped 的 data-v 属性，只能 :deep 进去 */
+/* 宿主元素是登记处 createElement 造的，带不上 scoped 的 data-v 属性，只能 :deep 进去。
+   四周留一点内边距，光标和最后一列字符才不会贴着圆角边被削掉 */
 .screen :deep(.xterm-host) {
   position: absolute;
   inset: 0;
-  padding: 4px 0 0 6px;
+  padding: 6px 8px 0;
 }
 
 .screen :deep(.xterm) {

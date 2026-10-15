@@ -2,6 +2,8 @@
 import { computed, watch } from 'vue'
 import { message } from 'ant-design-vue'
 
+import { CloseOutlined, ControlOutlined, FolderOpenOutlined, PlusOutlined, PushpinFilled, PushpinOutlined, VideoCameraOutlined } from '@ant-design/icons-vue'
+
 import { fileWindowApi } from '@/lib/ipc/client'
 import { useLayoutStore } from '@/stores/layout'
 import { useQuickStore } from '@/stores/quick'
@@ -86,14 +88,21 @@ watch(() => sessions.logNotice, (text) => {
         <span v-if="tab.error" class="error" :title="tab.error">!</span>
         <!-- 钉住状态直接标在 tab 上：右格显示的是哪个会话，看一眼就知道 -->
         <button
-          class="pin"
+          class="icon-btn pin"
           :class="{ on: tab.id === layout.pinned }"
           :title="tab.id === layout.pinned ? '取消分屏' : '钉到右格分屏'"
           @click.stop="layout.toggle(tab.id)"
-        >⑂</button>
-        <button class="close" title="关闭会话" @click.stop="void sessions.close(tab.id)">×</button>
+        >
+          <PushpinFilled v-if="tab.id === layout.pinned" />
+          <PushpinOutlined v-else />
+        </button>
+        <button class="icon-btn close" title="关闭会话" @click.stop="void sessions.close(tab.id)">
+          <CloseOutlined />
+        </button>
       </div>
-      <button class="add" title="新建本机终端" @click="void openLocal()">＋</button>
+      <button class="icon-btn add" title="新建本机终端" @click="void openLocal()">
+        <PlusOutlined />
+      </button>
     </div>
     <div class="actions">
       <!-- 开关是全局的，栏子却是每格一条、各发各的会话。一个会话都没有时开了也只
@@ -105,10 +114,16 @@ watch(() => sessions.logNotice, (text) => {
           :disabled="sessions.tabs.length === 0"
           @click="quick.toggle()"
         >
+          <template #icon>
+            <ControlOutlined />
+          </template>
           命令栏
         </a-button>
       </a-tooltip>
       <a-button size="small" :disabled="sessions.activeId === null" @click="void openPanel()">
+        <template #icon>
+          <FolderOpenOutlined />
+        </template>
         文件面板
       </a-button>
       <a-tooltip
@@ -120,30 +135,40 @@ watch(() => sessions.logNotice, (text) => {
           :disabled="activeTab === undefined"
           @click="void toggleLog()"
         >
+          <template #icon>
+            <VideoCameraOutlined />
+          </template>
           日志
         </a-button>
       </a-tooltip>
-      <a-tag v-if="activeTab" :color="activeTab.status === 'connected' ? 'green' : 'default'">
+      <!-- 状态自己画点：a-tag 的 green 是组件库预设色，和标签页里那个点是两套颜色，
+           同一件事在一条栏里出现两种绿 -->
+      <span v-if="activeTab" class="status">
+        <span class="dot" :class="activeTab.status" />
         {{ STATUS_TEXT[activeTab.status] ?? '' }}
-      </a-tag>
+      </span>
     </div>
   </div>
 </template>
 
 <style scoped>
+/* 标签轨道：和窗口底同色，比终端那块暗一档，当前标签因此能「浮」到内容上。
+   高度写死而不是靠内容撑：标签一多一行行高变了，下面的格子会跟着跳。 */
 .tab-bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
-  padding: 4px 8px;
-  background: rgba(128, 128, 128, 0.05);
+  flex: none;
+  height: 40px;
+  padding: 0 8px;
+  background: var(--bg-app);
+  border-bottom: 1px solid var(--line);
 }
 
 .tabs {
   display: flex;
-  align-items: stretch;
-  gap: 4px;
+  align-items: center;
+  gap: 2px;
   overflow-x: auto;
   flex: 1;
   min-width: 0;
@@ -153,45 +178,53 @@ watch(() => sessions.logNotice, (text) => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 8px;
-  border-radius: 4px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--radius) var(--radius) 0 0;
   cursor: pointer;
   white-space: nowrap;
   font-size: 12px;
   max-width: 260px;
+  color: var(--text-2);
+  transition: background var(--tap) ease, color var(--tap) ease;
 }
 
 .tab:hover {
-  background: rgba(128, 128, 128, 0.14);
+  background: var(--bg-hover);
+  color: var(--text-1);
 }
 
+/* 当前标签：底色用终端那一格的表面，顶部压一条主色，和旁边「没在看」的标签一眼分开。
+   不做「标签与内容连成一体」的负边框那套：横向滚动的容器会把溢出裁掉，一半连上一半没连上。 */
 .tab.active {
-  background: rgba(128, 128, 128, 0.22);
+  background: var(--pane-bg);
+  color: var(--text-1);
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 
 .dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #8c8c8c;
+  background: var(--text-3);
   flex: none;
 }
 
 .dot.connected {
-  background: #52c41a;
+  background: var(--ok);
 }
 
 .dot.connecting {
-  background: #faad14;
+  background: var(--warn);
 }
 
 .dot.error {
-  background: #ff4d4f;
+  background: var(--err);
 }
 
 .dot.closed {
   background: transparent;
-  border: 1px solid #8c8c8c;
+  border: 1px solid var(--text-3);
 }
 
 /* 录制中的红点。和状态点同尺寸，靠颜色和呼吸区分：多标签时一眼看出哪一格在写文件 */
@@ -199,7 +232,7 @@ watch(() => sessions.logNotice, (text) => {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #ff4d4f;
+  background: var(--err);
   flex: none;
   animation: rec-breathe 1.8s ease-in-out infinite;
 }
@@ -228,65 +261,70 @@ watch(() => sessions.logNotice, (text) => {
 }
 
 .cwd {
-  color: rgba(128, 128, 128, 0.85);
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 12px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
   overflow: hidden;
   text-overflow: ellipsis;
   direction: rtl;
 }
 
 .error {
-  color: #ff4d4f;
+  color: var(--err);
   font-weight: 700;
 }
 
-.pin {
+/* 标签里的三个图标按钮共用这一套：靠透明度分层，不用各自描一遍边框 */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
   border: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: inherit;
+  font-size: 11px;
   cursor: pointer;
-  font-size: 12px;
-  line-height: 1;
-  opacity: 0.35;
+  opacity: 0.5;
+  transition: opacity var(--tap) ease, background var(--tap) ease;
 }
 
-.pin:hover {
-  opacity: 0.8;
+.icon-btn:hover {
+  opacity: 1;
+  background: var(--bg-active);
 }
 
 /* 钉住的 tab 一直显色，不用鼠标悬停去猜哪个会话在右格 */
 .pin.on {
   opacity: 1;
-  color: #1677ff;
-}
-
-.close {
-  border: 0;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  opacity: 0.6;
-}
-
-.close:hover {
-  opacity: 1;
+  color: var(--accent);
 }
 
 .add {
-  border: 0;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  font-size: 15px;
-  padding: 0 8px;
+  width: 24px;
+  height: 24px;
+  font-size: 13px;
+  opacity: 0.7;
 }
 
 .actions {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: none;
+}
+
+/* 状态自己画点，和标签页里那个点同一套颜色，所以复用 .dot */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-2);
   flex: none;
 }
 </style>
