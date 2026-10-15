@@ -43,6 +43,43 @@ pub enum GroupMode {
     Favorite,
 }
 
+/// 主机那边跑的是什么系统，细到发行版。纯展示语义（决定列表里那颗图标），不参与拨号。
+///
+/// 为什么要分发行版而不是只留「Linux」一档：这一列的价值全在「扫一眼认出哪台是哪台」，
+/// 而运维眼里 Ubuntu 和 CentOS 是两种机器。分得太粗，图标就退化成一行装饰。
+///
+/// 默认 `Unknown`：用户还没告诉我们，而不是「探测失败」。对图标来说两者没区别——
+/// 都画通用图形，不去猜一个看起来像依据的东西。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum OsType {
+    #[default]
+    Unknown,
+    /// 只知道是 Linux，发行版不明
+    Linux,
+    Ubuntu,
+    Debian,
+    Centos,
+    /// CentOS 的两条继任线，国内内网正在陆续换过去
+    Rocky,
+    Alma,
+    /// Red Hat Enterprise Linux。变体名不用 `Redhat`：读的人得反应一下那是不是个词。
+    Rhel,
+    Fedora,
+    Opensuse,
+    Arch,
+    Alpine,
+    Kali,
+    /// 深度 / 统信 UOS 那一支，政企内网里常见
+    Deepin,
+    Freebsd,
+    Windows,
+    /// macOS。变体名刻意不叫 `MacOS`：大小写混排序列化成 snake_case 会变成 `mac_os`。
+    Mac,
+    /// 明确不是上面任何一种（交换机、路由器、自研设备…）
+    Other,
+}
+
 /// 一台主机。`endpoint` 是「拨号用什么」，`label` 是「人看什么」。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct HostRecord {
@@ -53,6 +90,10 @@ pub struct HostRecord {
     pub tags: Vec<String>,
     pub favorite: bool,
     pub protocol: crate::session::Protocol,
+    /// `#[serde(default)]` 是给存量 vault 文件留的：加这个字段之前建的机器没有它，
+    /// 缺省解析成 `Unknown`，而不是整条记录读不出来。
+    #[serde(default)]
+    pub os: OsType,
     pub endpoint: crate::session::Endpoint,
     pub auth_mode: AuthMode,
     /// `auth_mode` 为 PublicKey 时指向一把身份
@@ -93,6 +134,8 @@ pub struct HostInfo {
     pub tags: Vec<String>,
     pub favorite: bool,
     pub protocol: crate::session::Protocol,
+    /// 列表图标用，见 `OsType`
+    pub os: OsType,
     pub endpoint: crate::session::Endpoint,
     pub auth_mode: AuthMode,
     pub auth: crate::session::AuthRef,
@@ -127,6 +170,7 @@ impl HostInfo {
             tags: record.tags.clone(),
             favorite: record.favorite,
             protocol: record.protocol,
+            os: record.os,
             endpoint: record.endpoint.clone(),
             auth_mode: record.auth_mode,
             auth,
@@ -189,6 +233,7 @@ mod tests {
             tags: vec!["prod".into()],
             favorite: true,
             protocol: Protocol::Ssh,
+            os: OsType::Linux,
             endpoint: Endpoint { host: "10.0.0.1".into(), port: Some(2222), username: "app".into() },
             auth_mode: mode,
             identity_id: identity.map(|i| IdentityId(i.into())),
@@ -212,6 +257,25 @@ mod tests {
         for forbidden in ["password", "passphrase", "private_key", "secret"] {
             let hit = keys.iter().find(|k| k.rsplit('.').next().unwrap_or_default().contains(forbidden));
             assert!(hit.is_none(), "HostInfo 泄露了字段 `{hit:?}`: {json}");
+        }
+    }
+
+    /// 前端的图标表（`OS_GLYPH`）是按这些名字取值的，改拼法等于悄悄丢图标，
+    /// 所以把名字钉在这里：想改就得同时改前端那张表。
+    #[test]
+    fn os_type_json_names_are_frozen() {
+        for (os, want) in [
+            (OsType::Unknown, "\"unknown\""),
+            (OsType::Linux, "\"linux\""),
+            (OsType::Rocky, "\"rocky\""),
+            (OsType::Alma, "\"alma\""),
+            (OsType::Rhel, "\"rhel\""),
+            (OsType::Opensuse, "\"opensuse\""),
+            (OsType::Deepin, "\"deepin\""),
+            (OsType::Freebsd, "\"freebsd\""),
+            (OsType::Mac, "\"mac\""),
+        ] {
+            assert_eq!(serde_json::to_string(&os).unwrap(), want);
         }
     }
 

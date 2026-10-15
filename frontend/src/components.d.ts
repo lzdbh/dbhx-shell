@@ -13,6 +13,7 @@ declare module 'vue' {
   export interface GlobalComponents {
     AAlert: typeof import('ant-design-vue/es')['Alert']
     AButton: typeof import('ant-design-vue/es')['Button']
+    AButtonGroup: typeof import('ant-design-vue/es')['ButtonGroup']
     ACheckbox: typeof import('ant-design-vue/es')['Checkbox']
     AConfigProvider: typeof import('ant-design-vue/es')['ConfigProvider']
     ADescriptions: typeof import('ant-design-vue/es')['Descriptions']
@@ -37,6 +38,7 @@ declare module 'vue' {
     APopconfirm: typeof import('ant-design-vue/es')['Popconfirm']
     AProgress: typeof import('ant-design-vue/es')['Progress']
     ASelect: typeof import('ant-design-vue/es')['Select']
+    ASelectOptGroup: typeof import('ant-design-vue/es')['SelectOptGroup']
     ASelectOption: typeof import('ant-design-vue/es')['SelectOption']
     AskModal: typeof import('./components/AskModal.vue')['default']
     ASpace: typeof import('ant-design-vue/es')['Space']
@@ -56,6 +58,7 @@ declare module 'vue' {
     HostFormModal: typeof import('./components/HostFormModal.vue')['default']
     HostTree: typeof import('./components/HostTree.vue')['default']
     LockOverlay: typeof import('./components/LockOverlay.vue')['default']
+    OsIcon: typeof import('./components/OsIcon.vue')['default']
     QuickCommandBar: typeof import('./components/QuickCommandBar.vue')['default']
     SettingsDrawer: typeof import('./components/SettingsDrawer.vue')['default']
     TabBar: typeof import('./components/TabBar.vue')['default']

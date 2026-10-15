@@ -251,6 +251,8 @@ export type HostDraft = {
 	tags: string[],
 	favorite: boolean,
 	protocol: Protocol,
+	/**  列表图标用。表单从既有记录预填，所以「编辑不改」不会把它冲掉。 */
+	os: OsType,
 	endpoint: Endpoint,
 	auth_mode: AuthMode,
 	identity_id: IdentityId | null,
@@ -276,6 +278,8 @@ export type HostInfo = {
 	tags: string[],
 	favorite: boolean,
 	protocol: Protocol,
+	/**  列表图标用，见 `OsType` */
+	os: OsType,
 	endpoint: Endpoint,
 	auth_mode: AuthMode,
 	auth: AuthRef,
@@ -379,6 +383,29 @@ export type LogSummary = {
 	path: string,
 	bytes: number,
 };
+
+/**
+ *  主机那边跑的是什么系统，细到发行版。纯展示语义（决定列表里那颗图标），不参与拨号。
+ * 
+ *  为什么要分发行版而不是只留「Linux」一档：这一列的价值全在「扫一眼认出哪台是哪台」，
+ *  而运维眼里 Ubuntu 和 CentOS 是两种机器。分得太粗，图标就退化成一行装饰。
+ * 
+ *  默认 `Unknown`：用户还没告诉我们，而不是「探测失败」。对图标来说两者没区别——
+ *  都画通用图形，不去猜一个看起来像依据的东西。
+ */
+export type OsType = "unknown" | 
+/**  只知道是 Linux，发行版不明 */
+"linux" | "ubuntu" | "debian" | "centos" | 
+/**  CentOS 的两条继任线，国内内网正在陆续换过去 */
+"rocky" | "alma" | 
+/**  Red Hat Enterprise Linux。变体名不用 `Redhat`：读的人得反应一下那是不是个词。 */
+"rhel" | "fedora" | "opensuse" | "arch" | "alpine" | "kali" | 
+/**  深度 / 统信 UOS 那一支，政企内网里常见 */
+"deepin" | "freebsd" | "windows" | 
+/**  macOS。变体名刻意不叫 `MacOS`：大小写混排序列化成 snake_case 会变成 `mac_os`。 */
+"mac" | 
+/**  明确不是上面任何一种（交换机、路由器、自研设备…） */
+"other";
 
 /**  打开面板的结果。 */
 export type PanelInfo = {

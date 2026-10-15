@@ -24,7 +24,7 @@ use dbhx_ipc::commands::vault::{HostDraft, UserReply, reply_impl, set_password_i
 use dbhx_ipc::events::{BusEvent, FollowHold, TermData};
 use dbhx_ipc::hub;
 use dbhx_ipc::state::{BUS_QUEUE, Core};
-use dbhx_model::{AuthMode, Endpoint, ErrorCode, FileKind, KnownHost, KnownHostSource, Protocol, PtySize, TerminalEncoding};
+use dbhx_model::{AuthMode, Endpoint, ErrorCode, FileKind, KnownHost, KnownHostSource, OsType, Protocol, PtySize, TerminalEncoding};
 use dbhx_ssh::pattern_of;
 use dbhx_testsrv::{HOST_KEY_ALGO, HOST_KEY_B64, TestServer, TestSpec, sample_fs};
 use tokio::sync::mpsc;
@@ -106,6 +106,7 @@ fn draft(server: &TestServer) -> HostDraft {
         tags: vec![],
         favorite: false,
         protocol: Protocol::Ssh,
+        os: OsType::Linux,
         endpoint: Endpoint { host: server.host(), port: Some(server.port()), username: "app".into() },
         auth_mode: AuthMode::Password,
         identity_id: None,

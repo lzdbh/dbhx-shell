@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use dbhx_model::{
-    AuthMode, Endpoint, ErrorCode, HostId, HostInfo, HostRecord, IpcError, IdentityId, KnownHost, Protocol,
+    AuthMode, Endpoint, ErrorCode, HostId, HostInfo, HostRecord, IpcError, IdentityId, KnownHost, OsType, Protocol,
     TerminalEncoding, now_ms,
 };
 use dbhx_vault::SecretKind;
@@ -38,6 +38,8 @@ pub struct HostDraft {
     pub tags: Vec<String>,
     pub favorite: bool,
     pub protocol: Protocol,
+    /// 列表图标用。表单从既有记录预填，所以「编辑不改」不会把它冲掉。
+    pub os: OsType,
     pub endpoint: Endpoint,
     pub auth_mode: AuthMode,
     pub identity_id: Option<IdentityId>,
@@ -85,6 +87,7 @@ pub fn merge_record(draft: HostDraft, existing: Option<&HostRecord>, now: u64) -
         tags: draft.tags,
         favorite: draft.favorite,
         protocol: draft.protocol,
+        os: draft.os,
         endpoint: draft.endpoint,
         auth_mode: draft.auth_mode,
         identity_id: draft.identity_id,
@@ -459,6 +462,7 @@ mod tests {
             tags: vec!["prod".into()],
             favorite: true,
             protocol: Protocol::Ssh,
+            os: OsType::Linux,
             endpoint: Endpoint { host: "10.0.0.1".into(), port: Some(2222), username: "app".into() },
             auth_mode: AuthMode::Password,
             identity_id: None,
@@ -477,6 +481,7 @@ mod tests {
             tags: vec![],
             favorite: false,
             protocol: Protocol::Ssh,
+            os: OsType::Unknown,
             endpoint: Endpoint { host: "h".into(), port: None, username: "u".into() },
             auth_mode: AuthMode::Password,
             identity_id: None,

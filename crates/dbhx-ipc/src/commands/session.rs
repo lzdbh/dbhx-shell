@@ -142,7 +142,7 @@ pub fn session_list(core: State<'_>) -> Result<Vec<SessionInfo>, IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbhx_model::{AuthMode, Endpoint, HostRecord, Protocol};
+    use dbhx_model::{AuthMode, Endpoint, HostRecord, OsType, Protocol};
 
     fn host() -> HostRecord {
         HostRecord {
@@ -152,6 +152,7 @@ mod tests {
             tags: vec![],
             favorite: false,
             protocol: Protocol::Ssh,
+            os: OsType::Linux,
             endpoint: Endpoint { host: "10.0.0.1".into(), port: None, username: "app".into() },
             auth_mode: AuthMode::Agent,
             identity_id: None,
@@ -227,6 +228,7 @@ mod tests {
                 tags: vec![],
                 favorite: false,
                 protocol: Protocol::Local,
+                os: OsType::Unknown,
                 endpoint: Endpoint { host: String::new(), port: None, username: String::new() },
                 auth_mode: AuthMode::Agent,
                 identity_id: None,

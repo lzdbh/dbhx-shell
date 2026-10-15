@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { Modal, message } from 'ant-design-vue'
 
-import { CopyOutlined, DeleteOutlined, EditOutlined, FolderAddOutlined, FolderOpenOutlined, FormOutlined, LinkOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons-vue'
+import { CopyOutlined, DeleteOutlined, DownOutlined, EditOutlined, FolderAddOutlined, FolderOpenOutlined, FormOutlined, LinkOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 
 import type { HostInfo } from '@/lib/ipc/bindings'
 import { fileWindowApi } from '@/lib/ipc/client'
@@ -12,6 +12,7 @@ import { endHostDrag, writeHostDrag } from '@/lib/hostDrag'
 import { UNGROUPED, useHostsStore } from '@/stores/hosts'
 import { useSessionsStore } from '@/stores/sessions'
 import HostFormModal from './HostFormModal.vue'
+import OsIcon from './OsIcon.vue'
 
 const hosts = useHostsStore()
 const sessions = useSessionsStore()
@@ -26,7 +27,6 @@ const editing = ref<HostInfo | null>(null)
 const seeding = ref<HostInfo | null>(null)
 /** 从分组节点新建时带上的分组名；编辑已有主机时忽略。 */
 const presetGroup = ref<string | null>(null)
-const connecting = ref(false)
 
 const HOST_PREFIX = 'h:'
 const GROUP_PREFIX = 'g:'
@@ -45,8 +45,11 @@ const treeData = computed(() =>
     key: `${GROUP_PREFIX}${group.name}`,
     selectable: false,
     children: group.hosts.map(host => ({
-      // 标题里带上 user@host：同名主机在树里撞车时，只有地址能区分它们
-      title: `${host.label} · ${hosts.subtitle(host)}`,
+      // 标题只留名字：地址那半截在 260px 的侧栏里几乎总被省略号切掉，反而最没用的
+      // `:22` 每次都露着。完整身份挪进 tooltip 和右键菜单的提示里，同名主机照样分得开。
+      title: host.label,
+      tip: `${host.label} · ${hosts.subtitle(host)}`,
+      os: host.os,
       key: `${HOST_PREFIX}${host.id}`,
     })),
   })),
@@ -64,14 +67,8 @@ const groupsOfShown = computed(() => {
   return list.filter(group => group.hosts.length > 0)
 })
 
-const selected = computed<HostInfo | null>(() =>
-  selectedKey.value?.startsWith(HOST_PREFIX) ? hosts.byId(selectedKey.value.slice(HOST_PREFIX.length)) ?? null : null,
-)
-
 async function connect(host: HostInfo): Promise<void> {
-  connecting.value = true
   const result = await sessions.openRemote(host.id)
-  connecting.value = false
   if (!result.ok) messageApi.error(result.error ?? '连接失败')
   else messageApi.success(`正在连接 ${host.label}`)
 }
@@ -203,9 +200,8 @@ function submitGroupDialog(): void {
 /**
  * 删除的确认框。
  *
- * 列表里那颗按钮用的是 `a-popconfirm`（挂在按钮旁边），右键菜单点完菜单就没了，
- * 没有宿主可挂，所以走 `useModal` 的确认框——它和 `messageApi` 一样是从当前主题
- * 上下文里出来的，深色模式下不会突然变成一块白。
+ * 右键菜单点完菜单就没了，没有宿主可挂 `a-popconfirm`，所以走 `useModal` 的确认框——
+ * 它和 `messageApi` 一样是从当前主题上下文里出来的，深色模式下不会突然变成一块白。
  */
 function askRemove(host: HostInfo): void {
   void modalApi.confirm({
@@ -290,7 +286,7 @@ function onNodeContext(key: unknown, event: MouseEvent): void {
   const hostId = hostIdOf(key)
   if (hostId !== null) {
     const host = hosts.byId(hostId)
-    // 右键顺手把它选上：菜单里没有的动作，用户还能顺着看下面那排按钮找到
+    // 右键顺手把它选上：菜单一收就什么都没留下，高亮是「刚才动的是这台」唯一的痕迹
     if (host) selectedKey.value = `${HOST_PREFIX}${hostId}`
     if (host) hostMenu(at, host)
     return
@@ -299,11 +295,34 @@ function onNodeContext(key: unknown, event: MouseEvent): void {
   if (raw.startsWith(GROUP_PREFIX)) groupMenu(at, raw.slice(GROUP_PREFIX.length))
 }
 
+/**
+ * 「新建」的两种东西。
+ *
+ * 工具栏那颗箭头和树背景的右键共用这一份：两个入口给两份名单，
+ * 早晚会出现一边有、一边没有，用户就以为程序行为不一致。
+ */
+function newItems(): MenuItem[] {
+  return [
+    { key: 'new', label: '新建主机', icon: PlusOutlined, onClick: () => { create() } },
+    { key: 'group', label: '新建分组', icon: FolderAddOutlined, onClick: () => { openGroupDialog() } },
+  ]
+}
+
+/**
+ * 分裂按钮的箭头那颗：把上面两条开在按钮下沿。
+ *
+ * 坐标不用光标位置而用按钮自身的矩形，是因为点箭头时第一个条目正好落在指针下面
+ * （和资源管理器的口径一致），而右键整颗按钮也走同一个函数，两个入口看到的是同一个框。
+ */
+function openNewMenu(event: MouseEvent): void {
+  const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  openMenu({ x: Math.round(box.left), y: Math.round(box.bottom + 2) }, newItems())
+}
+
 /** 树背景上的右键：没有节点可指，那就给「凭空加东西」的三条。 */
 function onBlankContext(event: MouseEvent): void {
   openMenu({ x: event.clientX, y: event.clientY }, [
-    { key: 'new', label: '新建主机', icon: PlusOutlined, onClick: () => { create() } },
-    { key: 'group', label: '新建分组', icon: FolderAddOutlined, onClick: () => { openGroupDialog() } },
+    ...newItems(),
     { key: 'sep', separator: true },
     { key: 'refresh', label: '刷新列表', icon: ReloadOutlined, onClick: () => { void hosts.refresh() } },
   ])
@@ -317,21 +336,26 @@ onMounted(() => void hosts.refresh())
     <modalHolder />
     <div class="toolbar">
       <a-input v-model:value="keyword" size="small" placeholder="搜索主机" allow-clear />
-      <a-button size="small" type="primary" @click="create()">
-        <template #icon>
-          <PlusOutlined />
-        </template>
-        新建
-      </a-button>
-      <!-- 一颗没有文字的方块：侧栏只有 260px，再加一个词就要开始换行，
-           而「建分组」这件事在树上右键也有同样的入口，按钮只是让它更容易被看见 -->
-      <a-tooltip title="新建分组">
-        <a-button size="small" @click="openGroupDialog()">
+      <!-- 分裂按钮把「新建主机 / 新建分组」收进一颗：点主体仍旧一键建主机（最常用的事
+           不该多一步），只有旁边那颗箭头开二选一。
+           原先是两颗并排的按钮，其中分组那颗只剩一个图标、没有文字，在 260px 的侧栏里
+           看着像和「新建」互不相干的第三个动作，而不是它的另一件事。
+           树背景的右键也留着同样两条，两个入口共用一份名单。 -->
+      <a-button-group size="small" class="new-split">
+        <a-button type="primary" @click="create()">
           <template #icon>
-            <FolderAddOutlined />
+            <PlusOutlined />
           </template>
+          新建
         </a-button>
-      </a-tooltip>
+        <a-tooltip title="新建主机 / 新建分组">
+          <a-button type="primary" class="caret" @click="openNewMenu" @contextmenu.prevent="openNewMenu">
+            <template #icon>
+              <DownOutlined />
+            </template>
+          </a-button>
+        </a-tooltip>
+      </a-button-group>
     </div>
     <a-alert v-if="hosts.error" :message="hosts.error" type="error" banner />
     <!-- 右键接在这层自己造的 div 上，而不是 `<a-spin>` 的 attribute 透传：
@@ -359,46 +383,21 @@ onMounted(() => void hosts.refresh())
           <template #title="node">
             <span
               class="node"
-              :title="String(node.title ?? '')"
+              :class="{ leaf: hostIdOf(node.key) !== null }"
+              :title="String(node.tip ?? node.title ?? '')"
               :draggable="hostIdOf(node.key) !== null ? 'true' : 'false'"
               @dblclick.stop="onNodeDoubleClick(node.key)"
               @contextmenu.prevent.stop="onNodeContext(node.key, $event)"
               @dragstart="onNodeDragstart(node.key, $event)"
               @dragend="endHostDrag()"
             >
-              {{ node.title }}
+              <!-- 只有主机行挂系统图标：分组不是某台机器，给它画个机型是假信息 -->
+              <OsIcon v-if="hostIdOf(node.key) !== null" :os="node.os" />
+              <span class="label">{{ node.title }}</span>
             </span>
           </template>
         </a-tree>
       </a-spin>
-    </div>
-    <div v-if="selected" class="actions">
-      <a-button size="small" type="primary" :loading="connecting" @click="void connect(selected)">
-        <template #icon>
-          <LinkOutlined />
-        </template>
-        连接
-      </a-button>
-      <a-button size="small" :disabled="selected.protocol !== 'ssh'" @click="void openPanel(selected)">
-        <template #icon>
-          <FolderOpenOutlined />
-        </template>
-        文件面板
-      </a-button>
-      <a-button size="small" @click="edit(selected)">
-        <template #icon>
-          <EditOutlined />
-        </template>
-        编辑
-      </a-button>
-      <a-popconfirm title="删除这台主机及其已存口令？" ok-text="删除" cancel-text="取消" @confirm="void remove(selected)">
-        <a-button size="small" danger>
-          <template #icon>
-            <DeleteOutlined />
-          </template>
-          删除
-        </a-button>
-      </a-popconfirm>
     </div>
     <HostFormModal
       v-model:open="formOpen"
@@ -443,6 +442,19 @@ onMounted(() => void hosts.refresh())
   flex: none;
 }
 
+/* 搜索框吃掉剩下的宽度，这颗分裂按钮只占自己那么宽 */
+.new-split {
+  flex: none;
+}
+
+/* AntD 对「纯图标按钮」里的图标统一乘了 1.143（`.ant-btn-icon-only > span`），
+   于是箭头被画成 16px，比左边「新建」那颗 14px 的加号还大一号，看着像它才是主角。
+   钉平再收一号：它只是「这里还有菜单」的记号，不该和主图标争。 */
+.new-split :deep(.caret .anticon) {
+  transform: none;
+  font-size: 12px;
+}
+
 .tree-body {
   flex: 1 1 auto;
   min-height: 0;
@@ -459,25 +471,37 @@ onMounted(() => void hosts.refresh())
   color: var(--text-3);
 }
 
-/* 四个动作排两行两列：一行四颗在 260px 侧栏里会被挤成换行的残块，
-   按钮上的图标还会和文字错开 */
-.actions {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-  flex: none;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-}
-
 /* 标题自己占一整行：双击和拖拽要落在标题上，而 `block-node` 只保证行是整块可点、
    标题本身还是内联的——不撑满的话文字右侧那块空白双击没反应。
-   一行放不下就省略号收掉，完整地址在原生 tooltip 里（`:title` 挂在这个 span 上）。 */
+   行里是「图标 + 名字」两段，所以省略号交给 `.label`：图标不能被挤掉，
+   而完整身份在原生 tooltip 里（`:title` 挂在这个 span 上）。 */
 .node {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.node .label {
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* 图标比名字淡一档：扫列表时找的是名字，系统只是旁边的一个记号。 */
+.node .osi {
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+/* 主机是叶子，永远不会有展开箭头，可 AntD 照样给它留一整个 26px 的 switcher 空槽：
+   侧栏只有 260px，名字前面先被吃掉 52px，看着就是「莫名往右缩了一大截」。
+   空槽压到 10px，层级缩进那 26px 原样留着，所以分组名和主机名之间仍有一档看得见的差。
+   只挑带 `.leaf` 的行——空分组也是 `switcher-noop`，跟着缩会让它和别的分组名错开。 */
+.host-tree :deep(.ant-tree-treenode:has(.node.leaf) > .ant-tree-switcher) {
+  width: 10px;
+  min-width: 10px;
 }
 
 .group-error {

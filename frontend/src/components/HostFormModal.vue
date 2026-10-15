@@ -2,9 +2,10 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 
-import type { AuthMode, HostDraft, HostId, HostInfo, Protocol, TerminalEncoding } from '@/lib/ipc/bindings'
+import type { AuthMode, HostDraft, HostId, HostInfo, OsType, Protocol, TerminalEncoding } from '@/lib/ipc/bindings'
 import { vaultApi } from '@/lib/ipc/client'
 import { useHostsStore } from '@/stores/hosts'
+import OsIcon from './OsIcon.vue'
 
 const props = defineProps<{ open: boolean, host: HostInfo | null, presetGroup?: string | null, seed?: HostInfo | null }>()
 const emit = defineEmits<{ 'update:open': [boolean], saved: [HostId] }>()
@@ -24,6 +25,7 @@ const form = reactive({
   group: '',
   favorite: false,
   protocol: 'ssh' as Protocol,
+  os: 'unknown' as OsType,
   host: '',
   port: 22,
   username: '',
@@ -38,6 +40,40 @@ const form = reactive({
 
 /** 各协议的默认端口；存回记录时等于默认值就归一成 null，让后端 `default_port` 兜底。 */
 const PROTOCOL_DEFAULT_PORT: Record<Protocol, number | null> = { ssh: 22, telnet: 23, local: null }
+
+/**
+ * 主机跑的系统。纯展示：只决定列表里那颗图标，不参与拨号，也不去探测。
+ *
+ * 探测要做成用户点一下才发生的动作（连上去跑一次 `uname -s`），不能挂在每次连接上——
+ * 那等于为了一个图标多开一条通道。这里先让用户自己填。
+ *
+ * 分到发行版这一级：列表图标跟着它走，Ubuntu 画 Ubuntu、CentOS 画 CentOS，
+ * 认不出具体发行版就退到「其他 Linux」，那同样是一句诚实的话。
+ */
+const LINUX_OS: { value: OsType, label: string }[] = [
+  { value: 'ubuntu', label: 'Ubuntu' },
+  { value: 'debian', label: 'Debian' },
+  { value: 'centos', label: 'CentOS' },
+  { value: 'rocky', label: 'Rocky Linux' },
+  { value: 'alma', label: 'AlmaLinux' },
+  { value: 'rhel', label: 'Red Hat Enterprise Linux' },
+  { value: 'fedora', label: 'Fedora' },
+  { value: 'opensuse', label: 'openSUSE' },
+  { value: 'arch', label: 'Arch Linux' },
+  { value: 'alpine', label: 'Alpine' },
+  { value: 'kali', label: 'Kali Linux' },
+  { value: 'deepin', label: 'Deepin（深度 / 统信 UOS）' },
+  { value: 'linux', label: '其他 Linux（发行版不明）' },
+]
+
+/** FreeBSD 归在这一组而不是 Linux 组：它不是 Linux，界面别替用户合并这两个概念。 */
+const OTHER_OS: { value: OsType, label: string }[] = [
+  { value: 'windows', label: 'Windows' },
+  { value: 'mac', label: 'macOS' },
+  { value: 'freebsd', label: 'FreeBSD' },
+  { value: 'other', label: '其他设备（交换机、路由器…）' },
+  { value: 'unknown', label: '未知' },
+]
 
 const submitting = ref(false)
 const revealing = ref(false)
@@ -66,6 +102,7 @@ watch(() => [props.open, props.host, props.seed] as const, ([open]) => {
   form.group = host?.group ?? props.presetGroup ?? ''
   form.favorite = host?.favorite ?? false
   form.protocol = host?.protocol ?? 'ssh'
+  form.os = host?.os ?? 'unknown'
   form.host = host?.endpoint.host ?? ''
   form.port = host?.endpoint.port ?? PROTOCOL_DEFAULT_PORT[host?.protocol ?? 'ssh'] ?? 22
   form.username = host?.endpoint.username ?? ''
@@ -109,6 +146,7 @@ async function submit(): Promise<void> {
     tags: source.value?.tags ?? [],
     favorite: form.favorite,
     protocol: form.protocol,
+    os: form.os,
     endpoint: {
       host: form.host.trim(),
       // 等于该协议默认端口就存 null，让后端的 default_port 兜底，记录更干净
@@ -179,6 +217,23 @@ async function revealStored(): Promise<void> {
           <a-select-option value="local">本机终端</a-select-option>
         </a-select>
       </a-form-item>
+      <!-- 挨着协议放：两者都是「这是什么机器」的一半，但互不推导——
+           telnet 后面可能是 NAS，SSH 后面可能是 Windows。只用来画列表里那颗图标。
+           选项里带上图标：选完就能看见待会儿列表里会长什么样，不用保存后回头确认。 -->
+      <a-form-item label="系统">
+        <a-select v-model:value="form.os">
+          <a-select-opt-group label="Linux 发行版">
+            <a-select-option v-for="item in LINUX_OS" :key="item.value" :value="item.value">
+              <span class="os-opt"><OsIcon :os="item.value" />{{ item.label }}</span>
+            </a-select-option>
+          </a-select-opt-group>
+          <a-select-opt-group label="其他系统">
+            <a-select-option v-for="item in OTHER_OS" :key="item.value" :value="item.value">
+              <span class="os-opt"><OsIcon :os="item.value" />{{ item.label }}</span>
+            </a-select-option>
+          </a-select-opt-group>
+        </a-select>
+      </a-form-item>
       <template v-if="isRemote">
         <a-form-item label="主机">
           <a-input v-model:value="form.host" placeholder="10.0.0.12" />
@@ -225,3 +280,12 @@ async function revealStored(): Promise<void> {
     </a-form>
   </a-modal>
 </template>
+
+<style scoped>
+/* 选项与选中值共用这一行：图标跟文字同高一行摆，别一上一下。 */
+.os-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+</style>

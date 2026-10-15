@@ -475,7 +475,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbhx_model::{AuthMode, Endpoint, Protocol, TerminalEncoding};
+    use dbhx_model::{AuthMode, Endpoint, OsType, Protocol, TerminalEncoding};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -495,6 +495,7 @@ mod tests {
             tags: vec![],
             favorite: false,
             protocol: Protocol::Ssh,
+            os: OsType::Linux,
             endpoint: Endpoint {
                 host: "10.0.0.1".into(),
                 port: Some(22),
