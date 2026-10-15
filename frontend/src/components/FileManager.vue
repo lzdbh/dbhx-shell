@@ -14,6 +14,7 @@ import { useTransfersStore } from '@/stores/transfers'
 import ContextMenu from '@/components/ContextMenu.vue'
 import FilePane from '@/components/FilePane.vue'
 import TransferTray from '@/components/TransferTray.vue'
+import WindowControls from '@/components/WindowControls.vue'
 
 const props = defineProps<{ hostId: string }>()
 
@@ -282,12 +283,16 @@ onBeforeUnmount(() => {
          WebView2 默认白，而 AntD 深色主题里「禁用态」用的是 rgba(255,255,255,.08) 这种
          半透明填充——压在白底上等于看不见，禁用按钮看着就是两块空白。 -->
     <a-layout class="file-manager">
-      <div class="bar">
+      <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
+           窗控按钮是 clickable 标签，drag.js 会自动豁免 -->
+      <div class="bar" data-tauri-drag-region="deep">
         <span class="title">{{ host ? host.label : '文件管理' }}</span>
         <span class="subtitle">{{ subtitle }}</span>
         <!-- 和标签栏同一个点：a-tag 的 green 是组件库预设色，跟 --ok 不是一套，
              同一件事在两个窗口里会给出两种绿 -->
         <span class="status"><span class="dot" :class="conn !== null ? 'ok' : 'down'" />{{ conn !== null ? '已连接' : '未连接' }}</span>
+        <span class="spacer" />
+        <WindowControls />
       </div>
 
       <div class="panes">
@@ -374,14 +379,21 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
+/* 顶条即标题栏（窗口去边框了），高度向主窗口看齐；右边不留内边距，
+   窗控按钮通到窗口右上角。 */
 .bar {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 12px;
+  height: 44px;
+  padding: 0 0 0 14px;
   background: var(--bg-surface);
   border-bottom: 1px solid var(--line);
   flex: none;
+}
+
+.spacer {
+  flex: 1;
 }
 
 .title {

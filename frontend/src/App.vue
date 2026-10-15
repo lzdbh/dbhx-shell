@@ -17,6 +17,7 @@ import LockOverlay from '@/components/LockOverlay.vue'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
 import TabBar from '@/components/TabBar.vue'
 import TerminalPane from '@/components/TerminalPane.vue'
+import WindowControls from '@/components/WindowControls.vue'
 import { useHostsStore } from '@/stores/hosts'
 import { GRID_SIZES, useLayoutStore, type GridSize } from '@/stores/layout'
 import { useLockStore } from '@/stores/lock'
@@ -265,7 +266,9 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
 <template>
   <a-config-provider :theme="antTheme">
     <a-layout class="shell">
-      <a-layout-header class="bar">
+      <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
+           但按钮是 clickable 标签、drag.js 自动豁免，下拉没有可点击标签必须显式关 -->
+      <a-layout-header class="bar" data-tauri-drag-region="deep">
         <span class="brand">dbhx shell</span>
         <!-- 顶条只放图标 + tooltip：这五个动作天天按，文字标签把条带撑到一半宽，
              而窗口宽度是要留给终端的 -->
@@ -293,6 +296,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
           <a-select
             size="small"
             class="grid-size"
+            data-tauri-drag-region="false"
             :value="layout.gridSize"
             :options="gridOptions"
             @change="value => layout.setGridSize(value as GridSize)"
@@ -332,6 +336,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
             </template>
           </a-button>
         </a-tooltip>
+        <WindowControls />
       </a-layout-header>
       <a-layout has-sider>
         <a-layout-sider :width="260" class="sider">
@@ -396,14 +401,15 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
 }
 
 /* 底色由 Layout 的 colorBgHeader token 给；高度与内边距在 4.2 里没有对应 token，
-   只能在这里写。组件库默认是 64px 的网页页头，对终端窗口来说太高。 */
+   只能在这里写。组件库默认是 64px 的网页页头，对终端窗口来说太高。
+   右边不留内边距：窗控按钮要通到窗口右上角，和系统窗口一致。 */
 .bar {
   display: flex;
   align-items: center;
   gap: 10px;
   height: 44px;
   line-height: 44px;
-  padding: 0 14px;
+  padding: 0 0 0 14px;
   border-bottom: 1px solid var(--line);
 }
 

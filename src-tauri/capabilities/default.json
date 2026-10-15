@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口权限。core:default 提供事件与窗口基础能力；dbhx:default 由 src-tauri/build.rs 里 InlinedPlugin::commands 自动生成的 allow-<命令> 权限聚合而来——plugin 命令一律走 ACL，不授权就会被 runtime 拒。需要按命令粒度收紧时把 dbhx:default 换成单条权限，例如 dbhx:allow-vault-set-password。",
+  "description": "主窗口权限。core:default 提供事件与窗口基础能力；dbhx:default 由 src-tauri/build.rs 里 InlinedPlugin::commands 自动生成的 allow-<命令> 权限聚合而来——plugin 命令一律走 ACL，不授权就会被 runtime 拒。需要按命令粒度收紧时把 dbhx:default 换成单条权限，例如 dbhx:allow-vault-set-password。窗口去边框后自绘窗控（拖拽区、最小化/最大化/关闭）依赖 core:window 的四条写命令，而 core:window:default 只含 getter 与内部双击最大化，这四条必须显式列。",
   "windows": ["main", "files-*"],
-  "permissions": ["core:default", "dbhx:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "dbhx:default"
+  ]
 }

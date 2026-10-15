@@ -233,6 +233,10 @@ pub fn open_with_impl(path: String) -> Result<(), IpcError> {
 /// 只建窗口、不带任何会话状态：新窗口是独立 webview，有自己的 Pinia，挂载后自己
 /// 从 label 里的 `HostId` 去开远端栏。这里刻意不做「顺手把面板也开好」——那会让
 /// 建窗口与拨号耦合，而拨号失败时用户至少还能看到本机栏。
+///
+/// 去边框（标题栏由 `FileManager.vue` 自绘）配 `shadow(true)` 显式写出来：这个组合
+/// 在 Windows 上是 tao 的「with_undecorated_shadow」模式，DWM 阴影与左右/下边缘的
+/// 原生缩放都保留，只把顶部那条留给 tauri-runtime-wry 的 resize helper。
 pub fn open_file_window_impl(app: &AppHandle, host_id: HostId) -> Result<(), IpcError> {
     let label = format!("{FILE_WINDOW_PREFIX}{}", host_id.0);
     if let Some(window) = app.get_webview_window(&label) {
@@ -245,7 +249,8 @@ pub fn open_file_window_impl(app: &AppHandle, host_id: HostId) -> Result<(), Ipc
         .inner_size(1100.0, 700.0)
         .min_inner_size(760.0, 460.0)
         .resizable(true)
-        .decorations(true)
+        .decorations(false)
+        .shadow(true)
         .build()
         .map_err(|e| {
             tracing::debug!(%e, "创建文件管理窗口失败");
