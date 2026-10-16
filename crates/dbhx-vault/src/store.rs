@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dbhx_model::{HostId, HostRecord, IdentityId, IdentityRecord, SecretId, SyncTarget};
+use dbhx_model::{HostId, HostRecord, IdentityId, IdentityRecord, ProviderKind, SecretId, SyncTarget};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -109,6 +109,12 @@ struct VaultDoc {
     /// 见 `dbhx_model::SyncTarget`。
     #[serde(default)]
     sync_target: Option<SyncTarget>,
+    /// 用户在设置里选的那一家。**必须和 `sync_target` 分开存**：片段坐标只有在
+    /// 第一次推送成功之后才存在，而「推给谁」这个决定在推送之前就要用到 ——
+    /// 只靠 `sync_target` 的话，Gitee 用户的第一次同步会默默建到 GitHub 上去。
+    /// 已有坐标时以坐标里那一家为准（那个 id 只在其所属的那家有效）。
+    #[serde(default)]
+    sync_provider: Option<ProviderKind>,
     /// 上一次同步完成时**本地这份快照**的副本，用本机主密钥密封。
     ///
     /// 它是三方合并的**基线**：没有基线就只能整库定胜负，那正是合并最容易
@@ -633,6 +639,30 @@ impl Vault {
             self.doc.sync_target = target;
             self.dirty = true;
         }
+    }
+
+    /// 设置里选的那一家。`None` = 还没选过。
+    ///
+    /// 与 `sync_target` 的关系：坐标里那一家优先（那个 id 只在那一处解得开），
+    /// 这个字段只在**还没有坐标**时起作用，决定第一次推送把片段建到哪家。
+    pub fn sync_provider(&self) -> Option<ProviderKind> {
+        self.doc.sync_provider
+    }
+
+    /// 换一家。带着别家的片段坐标换家没有意义（那个 id 在另一处根本解不开），
+    /// 所以顺手把坐标清掉，**基线也一起清**：基线说的是「云上现在就是这一份」，
+    /// 新那家还没有那一份；留着它，下一次同步会把「本地还没推上去」误判成
+    /// 「两边已经一致」，于是永远不去新那家建片段。
+    pub fn set_sync_provider(&mut self, provider: ProviderKind) {
+        if self.doc.sync_provider == Some(provider) {
+            return;
+        }
+        self.doc.sync_provider = Some(provider);
+        if self.doc.sync_target.as_ref().map(|t| t.provider) != Some(provider) {
+            self.doc.sync_target = None;
+            self.doc.sync_base = None;
+        }
+        self.dirty = true;
     }
 
     /// 上一次同步的基线快照。解不开时返回 `Err`：调用方可以按「没有基线」继续合并
@@ -1453,6 +1483,38 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// 选的那一家要能单独落盘：第一次推送成功之前云上还没有坐标，那时唯一记得住的就是这个选择。
+    /// 换成另一家时坐标与基线一起作废 —— 那个 id 在新那家根本解不开，而留着基线会让
+    /// 下一次同步把「还没推」读成「已经一致」。
+    #[test]
+    fn the_chosen_provider_survives_a_reopen_and_a_switch_voids_the_old_fragment() {
+        let dir = temp_dir("provider-choice");
+        let key_path = dir.join("master.key");
+        let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
+        v.set_sync_provider(dbhx_model::ProviderKind::Gitee);
+        assert!(v.sync_target().is_none(), "还没建过片段时不该凭空冒出坐标");
+        let hid = v.upsert_host(host("一台"));
+        v.set_host_password(&hid, b"pw").unwrap();
+        let base = v.local_snapshot(false).unwrap();
+        v.set_sync_base(Some(&base)).unwrap();
+        v.set_sync_target(Some(SyncTarget {
+            provider: dbhx_model::ProviderKind::Gitee,
+            id: "3d0rmjto24pfie6bawxsu73".into(),
+        }));
+        // 重复选同一家不该把已经建好的坐标抹掉：那只是用户把下拉框点回原处
+        v.set_sync_provider(dbhx_model::ProviderKind::Gitee);
+        assert_eq!(v.sync_target().map(|t| t.id.as_str()), Some("3d0rmjto24pfie6bawxsu73"));
+        v.flush().unwrap();
+        drop(v);
+
+        let mut reopened = Vault::open(&dir, KeySource::File(key_path)).unwrap();
+        assert_eq!(reopened.sync_provider(), Some(dbhx_model::ProviderKind::Gitee), "选的一家没存住");
+        reopened.set_sync_provider(dbhx_model::ProviderKind::GitHub);
+        assert!(reopened.sync_target().is_none(), "换家之后还留着 gitee 的 id，下一次会把它拼进 github 的地址");
+        assert!(reopened.sync_base().unwrap().is_none(), "换家之后留着基线，下一次同步会把「还没推」当成「已经一致」");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// 换同步串等于换了一把锁：老基线是用旧串的同步密钥解出来再转封的，
     /// 留着它只会让下一次合并拿一份对不上号的底子定胜负。
     #[test]
@@ -1500,6 +1562,7 @@ mod tests {
             "sync_str",
             "sync_base",
             "sync_target",
+            "sync_provider",
             "provider_token",
         ] {
             doc.as_object_mut().unwrap().remove(gone);

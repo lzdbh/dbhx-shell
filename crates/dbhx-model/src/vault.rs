@@ -225,15 +225,19 @@ pub enum HostKeyDecision {
 /// 之所以放在这一层而不是 `dbhx-sync`：它要进 vault 文档持久化，又要在 IPC 上走到
 /// 设置面板，而 `dbhx-vault` 不能反向依赖 `dbhx-sync`（那边已经依赖它）。
 ///
-/// 每加一家都要先实测它的字段形状：GitHub 与 Gitee 在「创建用 `files` 哈希、
-/// 更新却用平铺 `filename`+`content`」这类细节上并不一致，靠猜写出来的解析
-/// 只会以「云端响应读不懂」的形式在用户那边失败。
+/// 每加一家都要先实测它的字段形状，而且**要看响应体的值变没变**，只看状态码不算数：
+/// 上一轮据「PATCH 回 200」记下了「Gitee 更新用平铺 `filename`+`content`」，
+/// 这轮把内容长度做成可辨认的标记重测，发现那种写法回 200 却一个字也没改进云端，
+/// 真正生效的是和创建一样的 `files` 哈希。文档抄错的第三方教程就是这么来的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     /// GitHub Gist。**实测 `public:false` 也是匿名可读的**，所以云端那份密文要按
     /// 「谁都能下载、可以无限次离线爆破」设防，见 `dbhx-vault::envelope`。
     GitHub,
+    /// Gitee 代码片段。**实测私密片段匿名读 API 与 raw 都是 403**，这一点比 GitHub 好；
+    /// 但密文仍按同一套参数设防 —— 两家共用一个信封，密钥强度不能跟着服务选。
+    Gitee,
 }
 
 /// 云端那一份的坐标：哪家服务 + 哪个片段。
@@ -339,6 +343,11 @@ mod tests {
         // 这个字符串同时出现在 vault 文档和 IPC 契约里：改拼法等于让老库里的
         // `sync_target` 悄悄读不出来，而报错长得像「没配过同步」。
         assert_eq!(serde_json::to_string(&ProviderKind::GitHub).unwrap(), "\"github\"");
+        assert_eq!(serde_json::to_string(&ProviderKind::Gitee).unwrap(), "\"gitee\"");
+        assert_eq!(
+            serde_json::from_value::<ProviderKind>(serde_json::json!("gitee")).unwrap(),
+            ProviderKind::Gitee
+        );
         let target = SyncTarget { provider: ProviderKind::GitHub, id: "abc123".into() };
         assert_eq!(
             serde_json::from_str::<SyncTarget>(&serde_json::to_string(&target).unwrap()).unwrap(),

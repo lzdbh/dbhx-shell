@@ -8,6 +8,12 @@
 //! 是 JSON 字符串。非 UTF-8 的密文直接塞进去，会在「把请求体序列化出来」这一步
 //! 就变成一串替换字符 —— 那种损坏要等到用户换设备拉取时才暴露，代价太大。
 //! 体积因此涨 4/3，这个代价换的是「任何接口都能原样往返」，值得。
+//!
+//! 关于「两家到底差在哪」：实测下来只差**域名**。GitHub 与 Gitee 的 `files` 都是
+//! 「文件名 → 内容」的哈希，创建与更新都是这个形状，读回来都带 `content` 与
+//! `truncated`。这不是照文档推的：Gitee 的更新接口对平铺的 `filename`+`content`
+//! 回 200 却一个字也不改（`tools/sync-probe.mjs` 里那条探测），而按 GitHub 那套
+//! `files` 哈希才真的写进去了。共用一条路径的前提是这样量出来的。
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -25,6 +31,9 @@ pub const SYNC_FILE_NAME: &str = "dbhx-shell-sync.json";
 /// 实测 GitHub 的接口对单文件返回的上限是 1 MiB，而 base64 把 3 字节撑成 4：
 /// 700 KiB 编码后约 955,000 字符，留了余量。超它的量宁可在本地就拒绝并说明原因，
 /// 也不要发出去换回一个「响应读不懂」—— 用户看到后者只会怀疑同步串错了。
+///
+/// Gitee 也量过：2 MiB 的文件写得进去、读得回来，`truncated` 还是 false，
+/// 所以它不是紧的那一家。两家共用这一个数 —— 信封是同一套，限额没必要分。
 const MAX_BLOB_BYTES: usize = 700 * 1024;
 
 /// 片段标题。刻意写死成一句不含身份信息的话：GitHub 的 private gist
@@ -32,6 +41,10 @@ const MAX_BLOB_BYTES: usize = 700 * 1024;
 const GIST_DESCRIPTION: &str = "dbhx-shell 加密主机列表：内容已密封，需要本机的同步串才能读";
 
 const GITHUB_API: &str = "https://api.github.com";
+
+/// Gitee 的开放接口前缀。实测 `Authorization: Bearer <令牌>` 与 `token <令牌>` 都认，
+/// 所以沿用传输层那一种放法，不必把令牌拼进 query —— 一拼进 URL 就再也擦不干净了。
+const GITEE_API: &str = "https://gitee.com/api/v5";
 
 /// 从云端读回来的那一份密文。`bytes` 是完整的信封（头部 + AES-GCM），
 /// 交给 `dbhx_vault::DerivedKey::from_blob` 才能变成快照。
@@ -173,6 +186,8 @@ impl SyncClient {
     fn url_for(&self, id: Option<&str>) -> Result<String, ProviderError> {
         let root = match self.provider {
             ProviderKind::GitHub => format!("{GITHUB_API}/gists"),
+            // id 的字符白名单对两家的形式都够用（GitHub 是十六进制串，Gitee 实测是 23 位小写字母数字）
+            ProviderKind::Gitee => format!("{GITEE_API}/gists"),
         };
         match id {
             None => Ok(root),
@@ -224,13 +239,18 @@ fn decode(text: &str) -> Result<Vec<u8>, ProviderError> {
     STANDARD.decode(&padded).map_err(|_| ProviderError::UnexpectedShape)
 }
 
-/// 创建时的请求体。GitHub 要 `files` 是「文件名 → 内容」的对象，
-/// 实测把 `filename`+`content` 平铺上去会被拒（`files` is missing）。
+/// 创建时的请求体。两家都要 `files` 是「文件名 → 内容」的对象。
+///
+/// Gitee 这里有一段必须记住的实测：把 `filename`+`content` 平铺上去，创建直接被拒
+/// （`files` is missing），而**更新**却回 200 且什么都不改。后者比 400 危险得多 ——
+/// 客户端会以为推上去了，第二台设备永远停在老数据上。所以两家共用这一种形状，
+/// 平铺那种写法在测试里被明确钉成「不能用」。
 fn create_body(provider: ProviderKind, content: &str) -> serde_json::Value {
     match provider {
-        ProviderKind::GitHub => serde_json::json!({
+        ProviderKind::GitHub | ProviderKind::Gitee => serde_json::json!({
             "description": GIST_DESCRIPTION,
-            // 实测 false 也挡不住匿名读，但它至少不让片段出现在用户的公开列表里
+            // GitHub 上实测 false 挡不住匿名读，但它至少不让片段出现在用户的公开列表里；
+            // Gitee 上 false 是真的挡得住（匿名读 API 与 raw 都是 403）
             "public": false,
             "files": { SYNC_FILE_NAME: { "content": content } },
         }),
@@ -238,10 +258,12 @@ fn create_body(provider: ProviderKind, content: &str) -> serde_json::Value {
 }
 
 /// 更新时的请求体。创建要 `description` 与 `public`，更新只要内容 ——
-/// 多余字段会被 GitHub 原样改掉标题，而标题不该每次同步都重写一遍。
+/// 多余字段会被服务端原样改掉标题，而标题不该每次同步都重写一遍。
+///
+/// 两家的更新都用 `files` 哈希、都用 PATCH（Gitee 用 PUT 是 405），所以这里也共用。
 fn update_body(provider: ProviderKind, content: &str) -> serde_json::Value {
     match provider {
-        ProviderKind::GitHub => serde_json::json!({
+        ProviderKind::GitHub | ProviderKind::Gitee => serde_json::json!({
             "files": { SYNC_FILE_NAME: { "content": content } },
         }),
     }
@@ -250,7 +272,7 @@ fn update_body(provider: ProviderKind, content: &str) -> serde_json::Value {
 /// 从写入响应里取 id。创建与更新返回的是同一个形状。
 fn parse_id(provider: ProviderKind, json: &serde_json::Value) -> Result<String, ProviderError> {
     match provider {
-        ProviderKind::GitHub => json
+        ProviderKind::GitHub | ProviderKind::Gitee => json
             .get("id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -267,16 +289,26 @@ fn parse_cloud(provider: ProviderKind, json: &serde_json::Value) -> Result<Optio
     if json.is_null() {
         return Err(ProviderError::UnexpectedShape);
     }
+    // 两家的 `files` 都是「文件名 → 文件对象」的哈希，文件对象里都带 `content`
+    // 与 `truncated`（实测字段清单：size, raw_url, type, truncated, content）。
     let file = match provider {
-        ProviderKind::GitHub => json.get("files").and_then(|f| f.get(SYNC_FILE_NAME)),
+        ProviderKind::GitHub | ProviderKind::Gitee => json.get("files").and_then(|f| f.get(SYNC_FILE_NAME)),
     };
     let Some(file) = file else { return Ok(None) };
     if file.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
         return Err(ProviderError::Truncated);
     }
+    // Gitee 在整个片段对象上也带一个 `truncated`。它的确切语义没测出来（不知道是
+    // 「某个文件截断」还是「整个响应截断」），而这两种都可能让我们在只拿到半份
+    // 密文时毫不知情 —— 宁可在这里硬失败，也不能拿一份残缺的信封去解出半个列表。
+    if provider == ProviderKind::Gitee && json.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
+        return Err(ProviderError::Truncated);
+    }
     let content = file.get("content").and_then(|c| c.as_str()).ok_or(ProviderError::UnexpectedShape)?;
     let updated_at = match provider {
-        ProviderKind::GitHub => json.get("updated_at").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        ProviderKind::GitHub | ProviderKind::Gitee => {
+            json.get("updated_at").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
     };
     Ok(Some(CloudBlob { bytes: decode(content)?, updated_at }))
 }
@@ -362,6 +394,153 @@ mod tests {
 
     fn client() -> SyncClient {
         SyncClient::new(ProviderKind::GitHub, None, token())
+    }
+
+    fn gitee(id: Option<&str>) -> SyncClient {
+        SyncClient::new(ProviderKind::Gitee, id.map(|s| s.to_string()), token())
+    }
+
+    /// 按 Gitee 实测的响应形状拼一份（顶层多出来的 `owner/user/git_pull_url/truncated`
+    /// 和文件对象里的 `size/type/raw_url` 都照抄进来）。
+    /// 测试用真实形状而不是最小形状，才挡得住「我们只测了自己想当然的那几个字段」。
+    fn gitee_json(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": "https://gitee.com/api/v5/gists/3d0rmjto24pfie6bawxsu73",
+            "forks_url": "https://gitee.com/api/v5/gists/3d0rmjto24pfie6bawxsu73/forks",
+            "commits_url": "https://gitee.com/api/v5/gists/3d0rmjto24pfie6bawxsu73/commits",
+            "id": "3d0rmjto24pfie6bawxsu73",
+            "description": GIST_DESCRIPTION,
+            "public": false,
+            "owner": { "id": 1, "login": "someone" },
+            "user": { "id": 1, "login": "someone" },
+            "files": {
+                SYNC_FILE_NAME: {
+                    "size": content.len(),
+                    "raw_url": "https://gitee.com/gists/3d0rmjto24pfie6bawxsu73/raw",
+                    "type": "json",
+                    "truncated": false,
+                    "content": content,
+                }
+            },
+            "truncated": false,
+            "html_url": "https://gitee.com/gists/3d0rmjto24pfie6bawxsu73",
+            "comments": 0,
+            "comments_url": "https://gitee.com/api/v5/gists/3d0rmjto24pfie6bawxsu73/comments",
+            "git_pull_url": "https://gitee.com/3d0rmjto24pfie6bawxsu73.git",
+            "git_push_url": "https://gitee.com/3d0rmjto24pfie6bawxsu73.git",
+            "created_at": "2026-10-16T10:00:00+08:00",
+            "updated_at": "2026-10-16T10:00:00+08:00",
+            "forks": 0,
+            "history": [],
+        })
+    }
+
+    /// Gitee 那一家的核心回归：**更新用的是 `files` 哈希，不是平铺的 `filename`+`content`**。
+    ///
+    /// 平铺那种写法服务端回 200、响应体长得跟成功一模一样，可云端那份内容一个字都不改
+    /// （实测：写 39 字节、推 439 字节、读回来还是 39 字节）。这种失败不会报错，
+    /// 只会让第二台设备永远停在老数据上，所以把它钉在最显眼的一条测试里。
+    #[tokio::test]
+    async fn gitee_updates_through_the_files_hash_never_the_flat_fields() {
+        let fake = Fake::new();
+        fake.ok(serde_json::json!({ "id": "3d0rmjto24pfie6bawxsu73" }));
+        let c = gitee(Some("3d0rmjto24pfie6bawxsu73"));
+        c.push(&fake, b"payload").await.unwrap();
+
+        let sent = fake.take();
+        assert_eq!(sent.method, Method::Patch);
+        assert_eq!(sent.url, "https://gitee.com/api/v5/gists/3d0rmjto24pfie6bawxsu73");
+        assert!(!sent.url.contains("ghp_"), "令牌出现在 URL 里: {}", sent.url);
+        let body = sent.body.unwrap();
+        assert_eq!(decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(), b"payload");
+        assert!(body.get("filename").is_none(), "平铺的 filename 会静默不生效，绝不能发出去");
+        assert!(body.get("content").is_none(), "同上：平铺的 content 是那种「回 200 但没写」的写法");
+        // 更新不该重写标题：Gitee 的 description 同样会被原样改掉
+        assert!(body.get("description").is_none());
+        assert!(body.get("public").is_none());
+    }
+
+    #[tokio::test]
+    async fn gitee_creates_through_the_same_files_hash_and_stays_private() {
+        let fake = Fake::new();
+        fake.ok(serde_json::json!({ "id": "3d0rmjto24pfie6bawxsu73", "public": false }));
+        let target = gitee(None).push(&fake, b"\x01\x02\xff\xfe").await.unwrap();
+        assert_eq!(target.provider, ProviderKind::Gitee);
+        assert_eq!(target.id, "3d0rmjto24pfie6bawxsu73");
+
+        let sent = fake.take();
+        assert_eq!(sent.method, Method::Post);
+        assert_eq!(sent.url, "https://gitee.com/api/v5/gists");
+        assert!(!sent.url.contains("access_token"), "令牌不能靠 query: {}", sent.url);
+        let body = sent.body.unwrap();
+        assert_eq!(body["public"], serde_json::json!(false));
+        assert_eq!(body["description"], serde_json::json!(GIST_DESCRIPTION));
+        assert_eq!(decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(), vec![1, 2, 0xff, 0xfe]);
+    }
+
+    #[tokio::test]
+    async fn gitees_real_response_shape_round_trips() {
+        let blob: Vec<u8> = (0..512u32).map(|i| (i * 251) as u8).collect();
+        let fake = Fake::new();
+        fake.ok(gitee_json(&encode(&blob)));
+        let got = gitee(Some("3d0rmjto24pfie6bawxsu73")).fetch(&fake).await.unwrap().expect("该读到内容");
+        assert_eq!(got.bytes, blob);
+        assert_eq!(got.updated_at.as_deref(), Some("2026-10-16T10:00:00+08:00"));
+        assert_eq!(fake.take().method, Method::Get);
+    }
+
+    #[tokio::test]
+    async fn either_truncated_flag_on_gitee_is_a_hard_error() {
+        // 文件级与片段级各来一次：两家只有 Gitee 在顶层也带这个标记，
+        // 而它的语义没测出来，那就哪一种为真都按「拿不到完整数据」处理
+        for level in ["file", "gist"] {
+            let mut json = gitee_json("nothing");
+            if level == "file" {
+                json["files"][SYNC_FILE_NAME]["truncated"] = serde_json::json!(true);
+                json["files"][SYNC_FILE_NAME]["content"] = serde_json::Value::Null;
+            } else {
+                json["truncated"] = serde_json::json!(true);
+            }
+            let fake = Fake::new();
+            fake.ok(json);
+            let err = gitee(Some("x")).fetch(&fake).await.unwrap_err();
+            assert!(matches!(err, ProviderError::Truncated), "{level} 这一档放过了: {err:?}");
+        }
+        // GitHub 没有顶层那个字段，缺字段不能被当成「截断了」
+        let fake = Fake::new();
+        fake.ok(serde_json::json!({
+            "id": "x", "files": { SYNC_FILE_NAME: { "content": encode(b"ok"), "truncated": false } }
+        }));
+        let c = SyncClient::new(ProviderKind::GitHub, Some("x".into()), token());
+        assert_eq!(c.fetch(&fake).await.unwrap().unwrap().bytes, b"ok");
+    }
+
+    /// 两家的地址不能串：串了就是把一台的令牌发给另一台，而且还会读到「没有这个片段」。
+    #[tokio::test]
+    async fn each_provider_gets_its_own_host_and_never_the_other_s() {
+        for (kind, host, path) in [
+            (ProviderKind::GitHub, "api.github.com", "/gists/abc"),
+            (ProviderKind::Gitee, "gitee.com", "/api/v5/gists/abc"),
+        ] {
+            let fake = Fake::new();
+            fake.ok(gitee_json("x"));
+            let c = SyncClient::new(kind, Some("abc".into()), token());
+            let _ = c.fetch(&fake).await;
+            let sent = fake.take();
+            assert!(sent.url.contains(host) && sent.url.ends_with(path), "{kind:?} 发去了 {}", sent.url);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gitee_id_with_the_wrong_shape_is_refused_before_it_reaches_the_url() {
+        // Gitee 的 id 实测是 23 位小写字母数字，白名单比它宽；宽一点没关系，
+        // 但带 `/`、`?` 或 `@` 的粘贴内容必须先挡住，否则 header 里的令牌跟着跑了
+        for bad in ["..%2f", "a/b", "x?access_token=1", "evil.com/api/v5/gists"] {
+            let fake = Fake::new();
+            let c = gitee(Some(bad));
+            assert!(matches!(c.fetch(&fake).await.unwrap_err(), ProviderError::BadId), "放过了 {bad:?}");
+            assert_eq!(fake.count(), 0);
+        }
     }
 
     fn gist_json(content: &str) -> serde_json::Value {
@@ -539,7 +718,7 @@ mod tests {
         assert!(rendered.contains("redacted"));
     }
 
-    /// 唯一一条真联网的用例，默认不跑。上面所有测试证明的都只是
+    /// 真联网的用例，默认不跑。上面所有离线测试证明的都只是
     /// 「我们以为接口是这样」，而接口只有远端说了算。
     ///
     /// 跑法：`DBHX_TOKEN_FILE=<令牌文件> cargo test -p dbhx-sync -- --ignored --nocapture`。
@@ -548,10 +727,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "需要真实令牌，手动跑"]
     async fn talks_to_the_real_github_api_and_leaves_nothing_behind() {
-        let path = std::env::var("DBHX_TOKEN_FILE").expect("设 DBHX_TOKEN_FILE 指向令牌文件");
-        let raw = std::fs::read(&path).expect("读不到令牌文件");
-        let token = Zeroizing::new(String::from_utf8(raw).expect("令牌文件不是 UTF-8").trim().to_string());
-        assert!(!token.is_empty(), "令牌文件是空的");
+        let token = crate::token_from_file();
 
         // 一段真信封形状的字节：含非 UTF-8，用来证明 base64 那一层不是多余的
         let probe: Vec<u8> = b"DBHXSYN1".iter().copied().chain((0u8..64).map(|i| i.wrapping_mul(37))).collect();
@@ -569,5 +745,58 @@ mod tests {
 
         with_id.delete(&transport).await.expect("清理失败：请手动删除标题含 dbhx-shell 的片段");
         assert!(with_id.fetch(&transport).await.is_err(), "删完还在，说明没真删");
+    }
+
+    /// Gitee 这一条必须**换一段长度不同的内容**再读一次：状态码 200 在这一家
+    /// 证明不了写进去了 —— 实测平铺 `filename`+`content` 就是 200、响应漂亮、
+    /// 云端一个字没改。离线测试全绿而用户换设备拉到老数据，就是这种事故。
+    ///
+    /// 中间步骤一律用 `?` 而不是 `expect`： panic 会跳过删除那一步，把密文留在云上。
+    #[tokio::test]
+    #[ignore = "需要真实令牌，手动跑"]
+    async fn talks_to_the_real_gitee_api_and_leaves_nothing_behind() {
+        let token = crate::token_from_file();
+        let first: Vec<u8> = b"DBHXSYN1".iter().copied().chain((0u8..64).map(|i| i.wrapping_mul(37))).collect();
+        // 长度不同才分辨得出读回来的是新那份还是老那份
+        let second: Vec<u8> = b"DBHXSYN2".iter().copied().chain((0u8..200).map(|i| i.wrapping_mul(131))).collect();
+        let transport = crate::wire::HttpTransport::new();
+        let fresh = SyncClient::new(ProviderKind::Gitee, None, token.clone());
+        let target = fresh.push(&transport, &first).await.expect("创建片段失败");
+        let with_id = SyncClient::from_target(&target, token.clone());
+
+        let outcome = async {
+            let read_back = with_id
+                .fetch(&transport)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "刚写完就读不到，说明创建没生效".to_string())?;
+            if read_back.bytes != first {
+                return Err("创建后读回来的内容与写进去的不一致".to_string());
+            }
+            let again = with_id.push(&transport, &second).await.map_err(|e| e.to_string())?;
+            if again.id != target.id {
+                return Err(format!("更新变成了新建：{} 变成了 {}", target.id, again.id));
+            }
+            let updated = with_id
+                .fetch(&transport)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "更新后读不到".to_string())?;
+            // 这一句是整个用例的意义所在
+            if updated.bytes != second {
+                return Err("更新回 200 却没真改掉云端那份 —— 请求体的字段形状不对就是这个表现".to_string());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        // 走到这里才删：上面无论成功还是失败，云上那份都不该留下
+        let cleanup = with_id.delete(&transport).await;
+        let gone = with_id.fetch(&transport).await;
+        if let Err(msg) = outcome {
+            panic!("{msg}（片段 id {}，清理 {:?}）", target.id, cleanup);
+        }
+        cleanup.expect("清理失败：请手动删除标题含 dbhx-shell 的那个片段");
+        assert!(matches!(gone, Err(ProviderError::Missing)), "删完还在，说明没真删");
     }
 }

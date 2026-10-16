@@ -91,7 +91,10 @@ pub enum WireError {
     Connect { reason: String, retryable: bool },
     #[error("等待云端响应超时（{secs} 秒）")]
     TimedOut { secs: u64 },
-    #[error("令牌无效或权限不够：GitHub 需要 gist scope，Gitee 需要 gists 写权限")]
+    /// 两家都要求令牌能读写「片段」这一类资源。具体在各自的授权页面上叫什么名字，
+    /// 没实测过（测试用的令牌是整账号权限的私人令牌），所以文案只说要做的事，
+    /// 不编一个可能对不上的勾选项名字。
+    #[error("令牌无效，或者它没有片段（gist）的读写权限")]
     Unauthorized,
     #[error("被云端限流，请稍后再试")]
     RateLimited,

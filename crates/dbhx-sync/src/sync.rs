@@ -10,8 +10,11 @@
 //! - **派生最多两次，且各只在真正需要时才付**。Argon2id 单次实测约 5s，用户点完
 //!   按钮要等的就是这段时间。拉取时解云上那一份一次，推送时封新的一份一次；
 //!   「云上和本地一样」那次同步应该只花一次派生就返回。
-//! - **推上去的盐每次都是新的**。gist 的历史 revision 删不掉，云端因此同时躺着
+//! - **推上去的盐每次都是新的**。GitHub 的 gist revision 实测删不掉，云端因此同时躺着
 //!   好几份密文；复用盐等于给这堆历史密文配同一把钥匙，攻破一份就攻破全部。
+//!   Gitee 那边的历史能不能列出、能不能保留没测出来（`/gists/{id}/history` 回 404，
+//!   而整个片段删除是真删：删完再读是 404），所以两家一律按「旧密文会留着」设防 ——
+//!   多换一次盐不要钱，漏设防要钱。
 
 use dbhx_model::{ProviderKind, SyncTarget};
 use dbhx_vault::envelope;
@@ -121,9 +124,11 @@ pub async fn sync_once(
     let sync_str = vault.with_sync_str(|p| Ok(envelope::normalize(&String::from_utf8_lossy(p))))?;
     let token =
         vault.with_provider_token(|p| Ok(Zeroizing::new(String::from_utf8_lossy(p).into_owned())))?;
+    // 选的那一家优先。换家时 vault 会把别家的坐标连同基线一起清掉，
+    // 所以这里不会遇到「设置里选 Gitee、坐标却是 GitHub 的片段」这种没意义的组合。
     let provider = vault
-        .sync_target()
-        .map(|t| t.provider)
+        .sync_provider()
+        .or_else(|| vault.sync_target().map(|t| t.provider))
         .unwrap_or(ProviderKind::GitHub);
     let had_target = vault.sync_target().is_some();
     let client = SyncClient::new(provider, vault.sync_target().map(|t| t.id.clone()), token);
@@ -301,6 +306,18 @@ mod tests {
             self.sent.lock().unwrap().iter().map(|(m, _, _)| *m).collect()
         }
 
+        /// 最后一次请求打到了哪个地址。选错家的同步在方法与次数上都和选对家一模一样，
+        /// 只有地址能分辨。
+        fn last_url(&self) -> String {
+            self.sent
+                .lock()
+                .unwrap()
+                .last()
+                .expect("没有发过任何请求")
+                .1
+                .clone()
+        }
+
         fn count(&self) -> usize {
             self.sent.lock().unwrap().len()
         }
@@ -427,6 +444,53 @@ mod tests {
         assert_eq!(target.id, "deadbeef");
         assert_eq!(target.provider, ProviderKind::GitHub);
         assert!(v.sync_base().unwrap().is_some(), "推成功了就该有基线，否则下次还是整库定胜负");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 「第一次推到哪家」必须在还没有任何坐标时就定下来。
+    ///
+    /// 只看 `sync_target` 的话，选了 Gitee 的库会把片段默默建到 GitHub 上 ——
+    /// 方法与次数都一模一样，只有地址不对，而这种错在离线测试里根本不显形。
+    #[tokio::test]
+    async fn a_vault_that_chose_gitee_opens_its_first_fragment_there() {
+        let dir = temp_dir("gitee-first");
+        let mut v = vault_with_host(&dir, "本机的一台");
+        v.set_sync_provider(ProviderKind::Gitee);
+        let fake = Fake::new();
+        fake.ok(serde_json::json!({ "id": "3d0rmjto24pfie6bawxsu73" }));
+        let report = sync_once(&mut v, &fake, false).await.unwrap();
+        assert_eq!(report.outcome, SyncOutcome::Created);
+        assert_eq!(fake.last_url(), "https://gitee.com/api/v5/gists");
+        let target = v.sync_target().expect("新建的片段坐标必须记下来");
+        assert_eq!(target.provider, ProviderKind::Gitee);
+        assert_eq!(target.id, "3d0rmjto24pfie6bawxsu73");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 换家 = 换地方，不是把同一个 id 搬到另一台机器上去读。
+    ///
+    /// 清掉坐标之后必须连基线一起清：基线说的是「云上现在就是这一份」，
+    /// 而新那家还没有那一份。留着它，下一次同步会把「还没推」读成「已经一致」，
+    /// 于是永远不去新那家建片段 —— 用户看到的现象是「点了同步，什么也没发生」。
+    #[tokio::test]
+    async fn switching_provider_moves_the_sync_to_the_new_host_instead_of_reusing_the_id() {
+        let dir = temp_dir("switch-provider");
+        let mut v = vault_with_host(&dir, "本机的一台");
+        let fake = Fake::new();
+        fake.ok(serde_json::json!({ "id": "deadbeef" }));
+        sync_once(&mut v, &fake, false).await.unwrap();
+        assert!(v.sync_base().unwrap().is_some(), "没有基线就说明这个用例没测到关键分支");
+
+        v.set_sync_provider(ProviderKind::Gitee);
+        assert!(v.sync_target().is_none(), "GitHub 那个片段 id 拼到 gitee.com 上根本读不开");
+        assert!(v.sync_base().unwrap().is_none(), "基线得跟着清掉，否则下一次同步以为已经一致");
+
+        let fake = Fake::new();
+        fake.ok(serde_json::json!({ "id": "3d0rmjto24pfie6bawxsu73" }));
+        let report = sync_once(&mut v, &fake, false).await.unwrap();
+        assert_eq!(report.outcome, SyncOutcome::Created, "换家之后第一次同步该在新那家建一份");
+        assert_eq!(fake.methods(), vec![Method::Post], "换家只该建新的，不该去动老那家");
+        assert_eq!(fake.last_url(), "https://gitee.com/api/v5/gists");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -558,16 +622,12 @@ mod tests {
     /// 本机主密钥**。口令在 A 上封存、经同步密钥重封上云、在 B 上再转成本机封存，
     /// 全程不落明文 —— 换设备这件事只有这样才叫自证过一次。
     ///
+    /// 两家共用这一段：信封、重密封、合并、基线都不该知道数据落在哪台服务上，
+    /// 于是唯一按家分岔的只有 `SyncTarget.provider`。把它写成参数而不是复制一遍，
+    /// 才有资格说「这一层与 provider 无关」是被测过的。
+    ///
     /// 测完删掉片段；删不掉时把 id 印在报错里，好让人（或我）手动收拾。
-    #[tokio::test]
-    #[ignore = "需要真实令牌，手动跑"]
-    async fn two_devices_really_meet_through_the_github_api() {
-        let path = std::env::var("DBHX_TOKEN_FILE").expect("设 DBHX_TOKEN_FILE 指向令牌文件");
-        let raw = std::fs::read(&path).expect("读不到令牌文件");
-        let token = Zeroizing::new(
-            String::from_utf8(raw).expect("令牌文件不是 UTF-8").trim().to_string(),
-        );
-        assert!(!token.is_empty(), "令牌文件是空的");
+    async fn two_devices_meet(provider: ProviderKind, token: Zeroizing<String>) {
         // 现造一串，免得把测试用的同步串写进仓库里
         let sync_str = envelope::generate_sync_str();
         let transport = crate::wire::HttpTransport::new();
@@ -579,6 +639,8 @@ mod tests {
         for v in [&mut a, &mut b] {
             v.set_sync_str(sync_str.as_bytes()).unwrap();
             v.set_provider_token(token.as_bytes()).unwrap();
+            // 第一次推送之前云上还没有坐标，「建到哪家」只能来自这个显式选择
+            v.set_sync_provider(provider);
         }
 
         for (label, pw) in [("生产库", "pw-prod".as_bytes()), ("测试库", "pw-test".as_bytes())] {
@@ -588,6 +650,7 @@ mod tests {
         let report = sync_once(&mut a, &transport, false).await.expect("A 首同步失败");
         assert_eq!(report.outcome, SyncOutcome::Created);
         let target = a.sync_target().cloned().expect("没记下新建的片段坐标");
+        assert_eq!(target.provider, provider, "编排层把新建的片段记到了另一家名下");
         b.set_sync_target(Some(target.clone()));
 
         let report = sync_once(&mut b, &transport, false).await.expect("B 拉取失败");
@@ -625,5 +688,17 @@ mod tests {
         for dir in [&dir_a, &dir_b] {
             std::fs::remove_dir_all(dir).ok();
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "需要真实令牌，手动跑"]
+    async fn two_devices_really_meet_through_the_github_api() {
+        two_devices_meet(ProviderKind::GitHub, crate::token_from_file()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "需要真实令牌，手动跑"]
+    async fn two_devices_really_meet_through_the_gitee_api() {
+        two_devices_meet(ProviderKind::Gitee, crate::token_from_file()).await;
     }
 }
