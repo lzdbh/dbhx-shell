@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { message as antdMessage } from 'ant-design-vue'
 
 import type { FileEntry } from '@/lib/ipc/bindings'
+import { useMacFullscreen } from '@/lib/fullscreen'
 import { localApi } from '@/lib/ipc/client'
 import { startEventBridge } from '@/lib/ipc/bus'
 import { localJoin, localParent, parentPath } from '@/lib/format'
@@ -27,6 +28,8 @@ const transfers = useTransfersStore()
 // 与主窗口同一套：macOS 用原生红绿灯，自绘窗控藏掉、工具栏左侧让出灯位。
 // 窗口那边的配置在 local.rs 的 with_platform_chrome。
 const mac = isMac()
+// 全屏时灯收进浮层，那截占位要跟着收掉（与 App.vue 同一套）
+const macFullscreen = useMacFullscreen()
 
 // 这个组件里 `message()` 已经是「把异常翻成中文」的那个小工具，别名导入免得撞名
 const [messageApi, msgHolder] = antdMessage.useMessage()
@@ -290,7 +293,7 @@ onBeforeUnmount(() => {
     <a-layout class="file-manager">
       <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
            窗控按钮是 clickable 标签，drag.js 会自动豁免 -->
-      <div class="bar" :class="{ 'bar--mac': mac }" data-tauri-drag-region="deep">
+      <div class="bar" :class="{ 'bar--mac': mac, 'bar--mac-fs': mac && macFullscreen }" data-tauri-drag-region="deep">
         <span class="title">{{ host ? host.label : '文件管理' }}</span>
         <span class="subtitle">{{ subtitle }}</span>
         <!-- 和标签栏同一个点：a-tag 的 green 是组件库预设色，跟 --ok 不是一套，
@@ -402,6 +405,11 @@ onBeforeUnmount(() => {
 .bar--mac {
   height: 32px;
   padding-left: 78px;
+}
+
+/* 原生全屏时灯收进顶部浮层，回到默认左边距（与主窗口同一条规则） */
+.bar--mac-fs {
+  padding-left: 14px;
 }
 
 .spacer {

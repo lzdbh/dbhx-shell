@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { AppstoreOutlined, BulbFilled, BulbOutlined, CodeOutlined, ColumnWidthOutlined, LockOutlined, SettingOutlined, SyncOutlined } from '@ant-design/icons-vue'
 import { Modal, message } from 'ant-design-vue'
 
+import { useMacFullscreen } from '@/lib/fullscreen'
 import { startEventBridge } from '@/lib/ipc/bus'
 import { isMac } from '@/lib/platform'
 import { lastSyncAgo, summarize } from '@/lib/syncSummary'
@@ -44,6 +45,8 @@ const transfers = useTransfersStore()
 // macOS 用原生红绿灯（那颗绿的即全屏），自绘窗控整组藏掉，工具栏左侧让出灯位。
 // 见 tauri.macos.conf.json 与 FileManager.vue 的同名判断。
 const mac = isMac()
+// 全屏时灯收进浮层，那截占位要跟着收掉
+const macFullscreen = useMacFullscreen()
 
 const drawerOpen = ref(false)
 const findOpen = ref(false)
@@ -330,7 +333,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
       <modalHolder />
       <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
            但按钮是 clickable 标签、drag.js 自动豁免，下拉没有可点击标签必须显式关 -->
-      <a-layout-header class="bar" :class="{ 'bar--mac': mac }" data-tauri-drag-region="deep">
+      <a-layout-header class="bar" :class="{ 'bar--mac': mac, 'bar--mac-fs': mac && macFullscreen }" data-tauri-drag-region="deep">
         <!-- mac 上这条就是原生标题栏，左边那截位置归红绿灯，再写一遍品牌名只是和
              窗口标题重复；Windows 去边框、没有原生标题可依赖，所以留着 -->
         <span v-if="!mac" class="brand">dbhx shell</span>
@@ -503,6 +506,11 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
   height: 32px;
   line-height: 32px;
   padding-left: 78px;
+}
+
+/* 原生全屏时灯收进「指针移到顶部才滑出来」的浮层，这 78px 纯属浪费，回到默认左边距 */
+.bar--mac-fs {
+  padding-left: 14px;
 }
 
 .brand {
