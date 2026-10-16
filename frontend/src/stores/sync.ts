@@ -18,6 +18,14 @@ import { describeIpcError, normalizeIpcError } from '../lib/ipc/errors'
  * 进 loading 态——不挡住第二次点击的话，两条同步会排队抢同一把 vault 锁，
  * 第二次的结论是基于第一次改完的状态做的，报给用户的数字就不再对应他按的那一下。
  */
+/**
+ * 上次成功同步的时刻（epoch 毫秒），存在 localStorage。
+ *
+ * 这是一条**本机偏好**，不是秘密：它只说「这台机器什么时候跑过一趟」，
+ * 既不含同步串也不含令牌，所以不需要进 vault、也不参与云上的那份。
+ */
+const LAST_SYNC_KEY = 'dbhx:sync-last-at'
+
 export const useSyncStore = defineStore('sync', () => {
   /** 最后一次读到的配置投影。没读到过时为 null，面板先显示骨架而不是一片空白。 */
   const status = ref<SyncStatus | null>(null)
@@ -25,6 +33,8 @@ export const useSyncStore = defineStore('sync', () => {
   const error = ref<string | null>(null)
   /** 最近一次同步的结果，面板用它念「拉回 N 台 / 冲突 M 条」。 */
   const last = ref<SyncReport | null>(null)
+  /** 上一次真正跑成的时刻，null = 这台机器上还没跑成过。 */
+  const lastSyncAt = ref<number | null>(readLastSync())
 
   async function refresh(): Promise<void> {
     status.value = await syncApi.status()
@@ -75,6 +85,9 @@ export const useSyncStore = defineStore('sync', () => {
     try {
       const report = recreate ? await syncApi.recreate() : await syncApi.now()
       last.value = report
+      // 只有真跑完的一趟才盖时间戳：「没配齐」和「云上片段不见了」都不算——
+      // 顶栏那句「上次同步 3 分钟前」说的是上一次确实把两份对上了。
+      if (report.outcome !== 'not_configured' && report.outcome !== 'recreate_required') stamp()
       // 合并改动了本机库，主机条数与片段 id（第一次同步时新建）都变了
       await refresh()
       return report
@@ -91,11 +104,22 @@ export const useSyncStore = defineStore('sync', () => {
     }
   }
 
+  /** 盖时间戳。存不下就算了：它只喂一句悬浮提示，不值得为此打扰用户。 */
+  function stamp(): void {
+    lastSyncAt.value = Date.now()
+    try {
+      localStorage.setItem(LAST_SYNC_KEY, String(lastSyncAt.value))
+    } catch {
+      /* 隐私模式或者盘满了，顶栏少一句「上次同步」而已 */
+    }
+  }
+
   return {
     status,
     busy,
     error,
     last,
+    lastSyncAt,
     refresh,
     setStr,
     setToken,
@@ -106,3 +130,8 @@ export const useSyncStore = defineStore('sync', () => {
     syncNow,
   }
 })
+
+function readLastSync(): number | null {
+  const raw = Number(localStorage.getItem(LAST_SYNC_KEY))
+  return Number.isFinite(raw) && raw > 0 ? raw : null
+}

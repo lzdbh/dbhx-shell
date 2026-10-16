@@ -35,6 +35,7 @@ function projection(over: Partial<SyncStatus> = {}): SyncStatus {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  localStorage.clear()
   setActivePinia(createPinia())
   api.status.mockResolvedValue(projection())
   api.now.mockResolvedValue({
@@ -123,6 +124,60 @@ describe('sync store', () => {
     await store.syncNow(true)
     expect(api.recreate).toHaveBeenCalledTimes(1)
     expect(api.now).not.toHaveBeenCalled()
+  })
+
+  it('stamps the moment a sync really ran', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_700_000_000_000)
+    const store = useSyncStore()
+    expect(store.lastSyncAt).toBeNull()
+    await store.syncNow()
+    expect(store.lastSyncAt).toBe(1_700_000_000_000)
+    expect(localStorage.getItem('dbhx:sync-last-at')).toBe('1700000000000')
+    vi.useRealTimers()
+  })
+
+  it('does not stamp a run that never talked to the cloud', async () => {
+    api.now.mockResolvedValueOnce({
+      outcome: 'not_configured',
+      hosts: 0,
+      imported: 0,
+      conflicts: [],
+      missing_identities: [],
+      missing_credentials: [],
+    })
+    const store = useSyncStore()
+    await store.syncNow()
+    expect(store.lastSyncAt).toBeNull()
+  })
+
+  it('does not stamp a run that stopped to ask about recreating', async () => {
+    api.now.mockResolvedValueOnce({
+      outcome: 'recreate_required',
+      hosts: 0,
+      imported: 0,
+      conflicts: [],
+      missing_identities: [],
+      missing_credentials: [],
+    })
+    const store = useSyncStore()
+    await store.syncNow()
+    expect(store.lastSyncAt).toBeNull()
+  })
+
+  it('keeps the previous stamp when a later run fails', async () => {
+    const store = useSyncStore()
+    await store.syncNow()
+    const stamped = store.lastSyncAt
+    api.now.mockRejectedValueOnce({ code: 'unreachable', message: 'tcp connect error', retryable: true })
+    expect(await store.syncNow()).toBeNull()
+    expect(store.lastSyncAt).toBe(stamped)
+  })
+
+  it('reads the stamp back after a reload', async () => {
+    localStorage.setItem('dbhx:sync-last-at', '1700000000000')
+    setActivePinia(createPinia())
+    expect(useSyncStore().lastSyncAt).toBe(1_700_000_000_000)
   })
 
   it('translates a mismatched sync string into sync wording', async () => {

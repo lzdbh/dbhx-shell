@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-import { AppstoreOutlined, BulbFilled, BulbOutlined, CodeOutlined, ColumnWidthOutlined, LockOutlined, SettingOutlined } from '@ant-design/icons-vue'
+import { AppstoreOutlined, BulbFilled, BulbOutlined, CodeOutlined, ColumnWidthOutlined, LockOutlined, SettingOutlined, SyncOutlined } from '@ant-design/icons-vue'
+import { Modal, message } from 'ant-design-vue'
 
 import { startEventBridge } from '@/lib/ipc/bus'
+import { lastSyncAgo, summarize } from '@/lib/syncSummary'
 import { applyFontSizeAll, applyTheme, focusTerminal, setHighlightRules } from '@/lib/terminal/registry'
 import { installShortcuts, type ShortcutHandlers } from '@/lib/shortcuts'
 import { clearSaved, resolve, save, savedSessions } from '@/lib/session-restore'
@@ -24,6 +26,7 @@ import { useLockStore } from '@/stores/lock'
 import { useQuickStore } from '@/stores/quick'
 import { useSessionsStore } from '@/stores/sessions'
 import { useSettingsStore } from '@/stores/settings'
+import { useSyncStore } from '@/stores/sync'
 import { useThemeStore } from '@/stores/theme'
 import { useTransfersStore } from '@/stores/transfers'
 
@@ -33,11 +36,15 @@ const lock = useLockStore()
 const quick = useQuickStore()
 const sessions = useSessionsStore()
 const settings = useSettingsStore()
+const sync = useSyncStore()
 const themeStore = useThemeStore()
 const transfers = useTransfersStore()
 
 const drawerOpen = ref(false)
 const findOpen = ref(false)
+// 和抽屉里那套一样的用法：从当前主题上下文里拿 api，深色模式下浮层不会突然变成一块白
+const [messageApi, msgHolder] = message.useMessage()
+const [modalApi, modalHolder] = Modal.useModal()
 
 let stopBridge: (() => void) | null = null
 let stopShortcuts: (() => void) | null = null
@@ -75,6 +82,54 @@ function switchMode(next: 'tabs' | 'grid'): void {
     const current = focusedSession.value ?? sessions.activeId
     if (current !== null) layout.placeCell(0, current)
   }
+}
+
+/**
+ * 顶栏的「立即同步」。
+ *
+ * 只在配齐（同步串 + 令牌）时才有这颗按钮：摆一颗点了只会失败的按钮比不摆更糟——
+ * 用户会以为同步坏了，而实际只是还没配。配置本身仍然只在设置抽屉里做。
+ */
+const syncReady = computed(() => Boolean(sync.status?.has_sync_str && sync.status?.has_token))
+
+async function runSync(recreate = false): Promise<void> {
+  const report = await sync.syncNow(recreate)
+  if (!report) {
+    messageApi.error(sync.error ?? '同步失败')
+    return
+  }
+  if (report.outcome === 'recreate_required') {
+    // 云上那个片段没了（多半是在网页上被删）。换坐标并把本机这份推上去是会改动云上的
+    // 动作，不能替用户决定，所以问一句再走。
+    void modalApi.confirm({
+      title: '云上那个片段已经不在了',
+      content: '重建会在云上开一个新片段，并把本机这份主机列表推上去。本机数据不受影响。',
+      okText: '重建并同步',
+      cancelText: '先不动',
+      onOk: () => { void runSync(true) },
+    })
+    return
+  }
+  messageApi.success(summarize(report))
+  // 合并会改本机库，主机列表那边得重读一次
+  await hosts.refresh()
+}
+
+/**
+ * 悬浮文案在展开那一刻现算。
+ *
+ * 「上次同步 3 分钟前」要是渲染时算好的，应用闲置半小时它还写着「刚刚」——
+ * 一句关于时间的话，宁可晚半秒也不要说错。
+ */
+const syncHint = ref('同步主机列表到云端')
+
+function fillSyncHint(open: boolean): void {
+  if (!open) return
+  const parts = ['同步主机列表到云端']
+  const ago = lastSyncAgo(sync.lastSyncAt)
+  if (ago) parts.push(ago)
+  if (sync.status) parts.push(`本机 ${sync.status.hosts} 台`)
+  syncHint.value = parts.join(' · ')
 }
 
 const restoreList = computed(() => resolve(savedSessions(), hosts.hosts))
@@ -216,7 +271,7 @@ onMounted(async () => {
   stopActivity = watchUserActivity(() => lock.activity())
   // 再先接事件后拉列表：拉列表期间到达的 term-data 否则会没人认领
   stopBridge = await startEventBridge()
-  await Promise.all([sessions.refresh(), transfers.refresh(), hosts.refresh(), lock.refresh()])
+  await Promise.all([sessions.refresh(), transfers.refresh(), hosts.refresh(), lock.refresh(), sync.refresh()])
   // 恢复**不自动拨号**：无人值守地往生产机连不是启动该做的事。
   // 只在「后端确实没有会话」时给一条提示，由用户决定重开哪些。
   // 锁屏时不弹这条：底层界面都被盖住了，先解锁再谈恢复。
@@ -266,6 +321,8 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
 <template>
   <a-config-provider :theme="antTheme">
     <a-layout class="shell">
+      <msgHolder />
+      <modalHolder />
       <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
            但按钮是 clickable 标签、drag.js 自动豁免，下拉没有可点击标签必须显式关 -->
       <a-layout-header class="bar" data-tauri-drag-region="deep">
@@ -321,6 +378,15 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
           </a-button>
         </a-tooltip>
         <span class="spacer" />
+        <!-- 同步只在配齐之后出现：没配齐时点它只会得到一句「还没配好」，
+             与其摆一颗注定失败的按钮，不如让人去设置抽屉里把那两样填上 -->
+        <a-tooltip v-if="syncReady" :title="syncHint" @open-change="fillSyncHint">
+          <a-button size="small" type="text" :loading="sync.busy" @click="void runSync()">
+            <template #icon>
+              <SyncOutlined />
+            </template>
+          </a-button>
+        </a-tooltip>
         <a-tooltip :title="themeStore.dark ? '切成浅色（配色偏好两个窗口共用）' : '切成深色'">
           <a-button size="small" type="text" @click="themeStore.toggleDark()">
             <template #icon>
