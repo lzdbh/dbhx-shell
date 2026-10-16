@@ -291,7 +291,7 @@ export const useFilesStore = defineStore('files', () => {
    * 键用远端路径而不是本机临时路径：同名文件在不同目录里编辑是两回事，
    * 而临时目录只有一个，用本机路径当键会让第二次编辑「抢」掉第一个的临时文件。
    */
-  const edits = new Map<string, { connection: number, cancelled: boolean }>()
+  const edits = new Map<string, { connection: number, cancelled: boolean, done: Promise<void> }>()
 
   /**
    * 用系统关联程序编辑远端文件：取到本机临时目录 → 打开 → 盯着它保存 → 存回原处。
@@ -305,11 +305,19 @@ export const useFilesStore = defineStore('files', () => {
   async function editRemote(connection: number, entry: FileEntry): Promise<void> {
     const p = panels.get(connection)
     if (!p || entry.kind === 'dir') return
-    if (edits.has(entry.path)) {
-      p.error = `${entry.name} 还在编辑中，先等那一次收尾`
-      return
+    // 同一个文件再点一次，几乎总是「编辑器已经关了，我要再看一眼」。而上一次那份
+    // 监听最长要盯半小时（判不了编辑器退出，只能等它自己安静下来），直接拒绝就等于
+    // 让用户半小时打不开这个文件。所以先叫它收摊、等它删掉临时副本，再重新取一份。
+    // 必须等：新旧两次用的是同一个临时路径，抢着下载会被上一次的收尾删掉。
+    const previous = edits.get(entry.path)
+    if (previous) {
+      previous.cancelled = true
+      p.busy = `正在收尾上一次 ${entry.name} 的编辑…`
+      await previous.done.catch(() => undefined)
     }
-    const token = { connection, cancelled: false }
+    let finish: () => void = () => {}
+    const done = new Promise<void>((resolve) => { finish = resolve })
+    const token = { connection, cancelled: false, done }
     edits.set(entry.path, token)
     const note = (text: string | null): void => { p.busy = text }
     let temp = ''
@@ -340,9 +348,13 @@ export const useFilesStore = defineStore('files', () => {
     } catch (err) {
       p.error = lastError(err)
     } finally {
-      edits.delete(entry.path)
+      // 只清自己那一份：`cancelEdits` 会先把标记从表里摘掉，这时临时文件可能已经
+      // 属于接管它的那次编辑了，再删一次就把新会话正在用的文件删了。
+      const mine = edits.get(entry.path) === token
+      if (mine) edits.delete(entry.path)
       note(null)
-      if (temp !== '') await localApi.remove(temp, false).catch(() => undefined)
+      if (temp !== '' && mine) await localApi.remove(temp, false).catch(() => undefined)
+      finish()
     }
   }
 
@@ -402,11 +414,10 @@ export const useFilesStore = defineStore('files', () => {
 
   /** 关掉文件窗口或面板时收摊：正在等的编辑循环下一轮就会退出。 */
   function cancelEdits(connection?: number): void {
-    for (const [path, token] of edits) {
-      if (connection === undefined || token.connection === connection) {
-        token.cancelled = true
-        edits.delete(path)
-      }
+    // 只举旗，不从这里删表：删了之后那一次会话会以为「已经有人接管」而跳过收尾，
+    // 临时副本就留在本机了。标记举起来，循环退出时它自己删，接管者也等得到那一步。
+    for (const token of edits.values()) {
+      if (connection === undefined || token.connection === connection) token.cancelled = true
     }
   }
 

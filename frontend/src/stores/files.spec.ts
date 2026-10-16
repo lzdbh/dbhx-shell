@@ -227,19 +227,30 @@ describe('外部编辑器往返', () => {
     expect(files.panel(3)?.busy).toBeNull()
   })
 
-  it('refuses a second edit of the same remote file', async () => {
+  it('a second edit of the same file takes the first one over', async () => {
     const files = useFilesStore()
     await files.openForSession(1)
     const note = entry('note.txt')
     mockLocal.stat.mockResolvedValue({ ...note, path: TEMP })
     vi.useFakeTimers()
+
     const first = files.editRemote(3, note)
-    await run(100)
-    await files.editRemote(3, note)
-    expect(files.panel(3)?.error).toContain('还在编辑中')
-    expect(mock.download).toHaveBeenCalledTimes(1)
+    // 先让第一次真正走到「已交给编辑器」，这才是用户关掉记事本再点一次的场景
+    await run(300)
+    expect(mockLocal.open).toHaveBeenCalledTimes(1)
+    const second = files.editRemote(3, note)
+    // 第一次那份的监听要等下一拍才发现被取消，随后它删掉临时副本，第二次才重新取
+    await run(2_000)
+    expect(mockLocal.remove).toHaveBeenCalledTimes(1)
+    expect(mock.download).toHaveBeenCalledTimes(2)
+    expect(mockLocal.open).toHaveBeenCalledTimes(2)
+    expect(files.panel(3)?.error).toBeNull()
+
     files.cancelEdits(3)
-    await run(900)
+    await run(2_000)
     await first
+    await second
+    // 两次会话各删各的那一份，谁也不会把对方正在用的文件删掉
+    expect(mockLocal.remove).toHaveBeenCalledTimes(2)
   })
 })
