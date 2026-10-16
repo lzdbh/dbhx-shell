@@ -452,7 +452,16 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
         </a-layout>
       </a-layout>
     </a-layout>
-    <a-drawer v-model:open="drawerOpen" title="设置" :width="420" placement="right">
+    <!-- 680 宽是为了让设置页走「左标题右控件」的行：420 那一档放不下标题、说明和控件，
+         只能全部堆成竖列，一节设置拖出三屏滚动。body 内边距交给组件自己管，
+         否则左侧导航条贴不到抽屉边缘，会浮在一圈白里。 -->
+    <a-drawer
+      v-model:open="drawerOpen"
+      title="设置"
+      :width="680"
+      placement="right"
+      :body-style="{ padding: 0, overflow: 'hidden' }"
+    >
       <SettingsDrawer />
     </a-drawer>
     <AskModal />
