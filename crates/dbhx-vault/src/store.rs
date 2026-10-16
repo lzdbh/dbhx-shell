@@ -124,6 +124,11 @@ struct VaultDoc {
     /// 安全性没有额外损失：拿到它和拿到云端那一份等价，都需要同步串才能解。
     #[serde(default)]
     sync_base: Option<String>,
+    /// 「同步私钥」开关，默认关。存在 vault 而不是前端偏好里：它决定推上去的那份
+    /// 里到底有没有私钥，属于「这台设备怎么同步」的一部分——重装或换设备之后
+    /// 悄悄回到默认值，等于让用户以为老样子，实际推上去的内容少了一整块。
+    #[serde(default)]
+    sync_private_keys: bool,
 }
 
 fn current_version() -> u32 {
@@ -634,9 +639,16 @@ impl Vault {
         self.doc.sync_target.as_ref()
     }
 
+    /// 记下云端坐标。**坐标一变，基线必须一起作废**：基线说的是「云上现在就是这一份」，
+    /// 换到另一个片段就没有那一份了。留着它，下一次同步会把「本地还没推给新地方」
+    /// 读成「两边已经一致」，于是新片段永远建不起来 —— 症状是「点了同步但另一台
+    /// 设备始终拉到老数据」，而界面上一切正常。
+    ///
+    /// 同 id 重复设置不触发清除，所以 `sync_once` 每次推完照常刷新基线。
     pub fn set_sync_target(&mut self, target: Option<SyncTarget>) {
         if self.doc.sync_target != target {
             self.doc.sync_target = target;
+            self.doc.sync_base = None;
             self.dirty = true;
         }
     }
@@ -663,6 +675,18 @@ impl Vault {
             self.doc.sync_base = None;
         }
         self.dirty = true;
+    }
+
+    /// 「同步私钥」开关当前是开还是关。默认关，理由见 `VaultDoc::sync_private_keys`。
+    pub fn sync_private_keys(&self) -> bool {
+        self.doc.sync_private_keys
+    }
+
+    pub fn set_sync_private_keys(&mut self, enabled: bool) {
+        if self.doc.sync_private_keys != enabled {
+            self.doc.sync_private_keys = enabled;
+            self.dirty = true;
+        }
     }
 
     /// 上一次同步的基线快照。解不开时返回 `Err`：调用方可以按「没有基线」继续合并
@@ -1512,6 +1536,59 @@ mod tests {
         reopened.set_sync_provider(dbhx_model::ProviderKind::GitHub);
         assert!(reopened.sync_target().is_none(), "换家之后还留着 gitee 的 id，下一次会把它拼进 github 的地址");
         assert!(reopened.sync_base().unwrap().is_none(), "换家之后留着基线，下一次同步会把「还没推」当成「已经一致」");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 「同步私钥」决定推上去的包里有没有私钥，必须跨重启记住：勾过一次、重装之后
+    /// 悄悄回到默认，下一次推的就是少一块的包，而另一台设备合并完不会告诉用户少了什么。
+    #[test]
+    fn the_private_keys_switch_is_remembered_across_a_reopen() {
+        let dir = temp_dir("sync-keys-switch");
+        let key_path = dir.join("master.key");
+        let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
+        assert!(!v.sync_private_keys(), "默认必须是关：没勾过就不该让私钥离开本机");
+        v.set_sync_private_keys(true);
+        v.flush().unwrap();
+        drop(v);
+
+        let mut reopened = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
+        assert!(reopened.sync_private_keys(), "勾过的开关重启后必须还是勾着的");
+        reopened.set_sync_private_keys(false);
+        reopened.flush().unwrap();
+        drop(reopened);
+
+        assert!(!Vault::open(&dir, KeySource::File(key_path)).unwrap().sync_private_keys());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 手工改片段坐标（第二台设备抄 id 时打错、或用户在云上重建了一个）同样得丢基线：
+    /// 基线描述的是老那个片段，新那个里此刻是什么本机并不知道。
+    #[test]
+    fn typing_a_different_fragment_id_drops_the_baseline_too() {
+        let (mut v, _key, dir) = sync_vault("target-change");
+        let hid = v.upsert_host(host("一台"));
+        v.set_host_password(&hid, b"pw").unwrap();
+        let base = v.local_snapshot(false).unwrap();
+        v.set_sync_target(Some(SyncTarget {
+            provider: dbhx_model::ProviderKind::GitHub,
+            id: "aaaa".into(),
+        }));
+        v.set_sync_base(Some(&base)).unwrap();
+
+        v.set_sync_target(Some(SyncTarget {
+            provider: dbhx_model::ProviderKind::GitHub,
+            id: "bbbb".into(),
+        }));
+        assert!(v.sync_base().unwrap().is_none(), "换了片段还留着老片段的基线");
+
+        // 同一个 id 重复设置不能把基线弄丢：sync_once 每次推完都重设坐标，
+        // 若这里也清一次，紧接着写入的新基线就成了唯一依据，等于每次同步都失忆一半。
+        v.set_sync_base(Some(&base)).unwrap();
+        v.set_sync_target(Some(SyncTarget {
+            provider: dbhx_model::ProviderKind::GitHub,
+            id: "bbbb".into(),
+        }));
+        assert!(v.sync_base().unwrap().is_some(), "重复设置同一个坐标不该把基线抹掉");
         std::fs::remove_dir_all(dir).ok();
     }
 

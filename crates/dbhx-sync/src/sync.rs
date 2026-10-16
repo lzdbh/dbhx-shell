@@ -27,7 +27,7 @@ use crate::provider::{ProviderError, SyncClient};
 use crate::wire::Transport;
 
 /// 一次同步跑到了哪一步。设置面板拿它决定念哪句话。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncOutcome {
     /// 同步串或云端令牌还没配齐。**没碰网络，也没改本地。**
@@ -51,7 +51,7 @@ pub enum SyncOutcome {
 }
 
 /// 一次同步的结果。只带名字和条数，不带任何凭据内容。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
 pub struct SyncReport {
     pub outcome: SyncOutcome,
     /// 合并完本机有几台主机。UI 用「现在共 N 台」一句自证同步确实生效了。

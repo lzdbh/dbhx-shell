@@ -6,6 +6,7 @@ import type {
   HostId,
   IdentityId,
   Pong,
+  ProviderKind,
   PtySize,
   SessionId,
   UserReply,
@@ -87,6 +88,28 @@ export const hostkeyApi = {
   list: () => unwrap(commands.hostkeysList()),
   forget: (host: string, port: number, algorithm: string) => unwrap(commands.hostkeysForget(host, port, algorithm)),
   importSystem: () => unwrap(commands.hostkeysImport()),
+}
+
+/**
+ * 云同步配置。同步串与云端令牌**只进不出**：
+ * 界面能读到的只有 `has_sync_str` / `has_token` 两个布尔，贴进去的值当场就还给后端，
+ * 前端不留任何副本（不写 store 的原始字段、不进 localStorage）。
+ */
+export const syncApi = {
+  // 这条返回裸 `SyncStatus`（同 `lockApi.status`），其余几条仍走 unwrap。
+  status: () => commands.syncStatus(),
+  /** 生成一串新同步串。**只生成不存**，用户看完确认再调 `setStr`。 */
+  newStr: () => commands.syncNewStr(),
+  setStr: (text: string | null) => unwrap(commands.syncSetStr(text)),
+  setToken: (text: string | null) => unwrap(commands.syncSetToken(text)),
+  setProvider: (provider: ProviderKind) => unwrap(commands.syncSetProvider(provider)),
+  /** 云端片段的 id。传 null 或空串 = 这台设备不再跟着任何片段。 */
+  setFragment: (id: string | null) => unwrap(commands.syncSetFragment(id)),
+  setPrivateKeys: (enabled: boolean) => unwrap(commands.syncSetPrivateKeys(enabled)),
+  /** 一次要等十秒上下（两次 Argon2id 派生），调用方必须自己置 loading。 */
+  now: () => unwrap(commands.syncNow()),
+  /** 弃掉本机记着的片段，用本机这份在云上重建一个。另一台设备不会自动跟过来。 */
+  recreate: () => unwrap(commands.syncRecreate()),
 }
 
 export const sftpApi = {

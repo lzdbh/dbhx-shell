@@ -99,6 +99,15 @@ pub const COMMAND_NAMES: &[&str] = &[
     "local_clipboard_read",
     "local_clipboard_write",
     "open_file_window",
+    "sync_status",
+    "sync_set_str",
+    "sync_new_str",
+    "sync_set_token",
+    "sync_set_provider",
+    "sync_set_fragment",
+    "sync_set_private_keys",
+    "sync_now",
+    "sync_recreate",
 ];
 
 /// 命令清单的唯一构造点。运行时注册与 TS 导出都走它，保证不会分叉。
@@ -167,6 +176,15 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::clipboard::local_clipboard_read,
             commands::clipboard::local_clipboard_write,
             commands::local::open_file_window,
+            commands::sync::sync_status,
+            commands::sync::sync_set_str,
+            commands::sync::sync_new_str,
+            commands::sync::sync_set_token,
+            commands::sync::sync_set_provider,
+            commands::sync::sync_set_fragment,
+            commands::sync::sync_set_private_keys,
+            commands::sync::sync_now,
+            commands::sync::sync_recreate,
         ])
         .events(collect_events![
             events::TermData,

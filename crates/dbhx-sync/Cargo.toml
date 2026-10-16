@@ -10,6 +10,8 @@ dbhx-model.workspace = true
 dbhx-vault.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `SyncReport` 要过 IPC，契约里就得有它的 TS 类型；推导本身不要 tauri
+specta.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

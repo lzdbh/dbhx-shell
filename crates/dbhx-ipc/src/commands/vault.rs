@@ -791,6 +791,12 @@ mod tests {
         )
         .unwrap();
         set_lock_pin_impl(&core, Zeroizing::new("9-8-7-6".into())).unwrap();
+        // 同步的两个秘密也一并喂进这个漏斗：它们是新加进来的、唯一「用户自己贴进来
+        // 又长期存在本机」的凭据，而 `sync_status` 是条会自动朝外刷的投影。
+        const SYNC_STR: &str = "0123456789abcdefSYNCSTRaudit";
+        const TOKEN: &str = "ghp_auditTOKENVALUE00000000000000";
+        crate::commands::sync::set_str_impl(&core, Some(Zeroizing::new(SYNC_STR.into()))).unwrap();
+        crate::commands::sync::set_token_impl(&core, Some(Zeroizing::new(TOKEN.into()))).unwrap();
         crate::commands::session::open_local_impl(
             &core,
             crate::commands::session::default_local_spec(None, dbhx_model::PtySize::default()),
@@ -807,9 +813,10 @@ mod tests {
         outward.push_str(&serde_json::to_string(&lock_status_impl(&core)).unwrap());
         outward.push_str(&serde_json::to_string(&crate::commands::session::list_impl(&core)).unwrap());
         outward.push_str(&serde_json::to_string(&crate::commands::transfer::running_impl(&core)).unwrap());
+        outward.push_str(&serde_json::to_string(&crate::commands::sync::status_impl(&core)).unwrap());
 
         // 明文秘密：一个都不许出现在 IPC 载荷里
-        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY", "BEGIN OPENSSH"] {
+        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY", "BEGIN OPENSSH", SYNC_STR, TOKEN] {
             assert!(!outward.contains(leak), "IPC 载荷泄露了明文 {leak}");
         }
         // 内部引用字段名：渲染层拿到就能指名换出别的记录的口令
@@ -819,7 +826,7 @@ mod tests {
 
         // 落盘的是密文：vault.json 里绝不该有裸明文
         let on_disk = std::fs::read_to_string(core.dir().join("vault.json")).unwrap();
-        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY"] {
+        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY", SYNC_STR, TOKEN] {
             assert!(!on_disk.contains(leak), "vault.json 明文落盘了 {leak}");
         }
 

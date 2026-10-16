@@ -20,9 +20,11 @@ pub mod provider;
 pub mod sync;
 pub mod wire;
 
-pub use provider::{CloudBlob, ProviderError, SyncClient, SYNC_FILE_NAME};
+pub use provider::{is_valid_fragment_id, CloudBlob, ProviderError, SyncClient, SYNC_FILE_NAME};
 pub use sync::{sync_once, SyncError, SyncOutcome, SyncReport};
-pub use wire::{HttpTransport, Transport, WireError};
+// 命令层的测试要注入假云端，就得自己拼 `Request`/`Response` 并认得 `Method`；
+// 它们和 `Transport` 是同一套契约，所以平级导出，不必让外部去猜 `wire` 这个模块名。
+pub use wire::{BoxFuture, HttpTransport, Method, Request, Response, Transport, WireError};
 
 /// 直连用例共用的令牌读法：路径从环境变量进，值只从仓库外的文件读。
 /// 两家共用一份，免得「令牌不落进测试代码」这条规矩有两个可能写错的版本。

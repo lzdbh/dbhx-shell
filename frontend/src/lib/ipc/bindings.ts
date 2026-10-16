@@ -94,6 +94,20 @@ export const commands = {
 	 *  会把建窗口这件事投递给事件循环再阻塞等回音——同一条线程等自己，一点就整窗卡死。
 	 */
 	openFileWindow: (hostId: HostId) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|open_file_window", { hostId })),
+	syncStatus: () => __TAURI_INVOKE<SyncStatus>("plugin:dbhx|sync_status"),
+	/**  存同步串；传 `null` 表示忘记本机存的那一份。 */
+	syncSetStr: (text: string | null) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sync_set_str", { text })),
+	syncNewStr: () => __TAURI_INVOKE<string>("plugin:dbhx|sync_new_str"),
+	/**  存云端令牌；传 `null` 表示忘记。 */
+	syncSetToken: (text: string | null) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sync_set_token", { text })),
+	syncSetProvider: (provider: ProviderKind) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sync_set_provider", { provider })),
+	/**  抄入云端片段 id；传 `null` 或空串表示不再跟着任何片段。 */
+	syncSetFragment: (id: string | null) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sync_set_fragment", { id })),
+	syncSetPrivateKeys: (enabled: boolean) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sync_set_private_keys", { enabled })),
+	/**  「立即同步」。耗时以十秒计（两次 Argon2id），按钮在此期间必须是 loading 的。 */
+	syncNow: () => typedError<SyncReport, IpcError>(__TAURI_INVOKE("plugin:dbhx|sync_now")),
+	/**  在云上重建一个片段，用本机这份当起点。 */
+	syncRecreate: () => typedError<SyncReport, IpcError>(__TAURI_INVOKE("plugin:dbhx|sync_recreate")),
 };
 
 /** Events */
@@ -440,6 +454,29 @@ export type Pong = {
 /**  M6 落了 telnet；mosh/et/serial 仍未接，先不占位。 */
 export type Protocol = "ssh" | "local" | "telnet";
 
+/**
+ *  云同步落在哪家「片段」服务上。
+ * 
+ *  之所以放在这一层而不是 `dbhx-sync`：它要进 vault 文档持久化，又要在 IPC 上走到
+ *  设置面板，而 `dbhx-vault` 不能反向依赖 `dbhx-sync`（那边已经依赖它）。
+ * 
+ *  每加一家都要先实测它的字段形状，而且**要看响应体的值变没变**，只看状态码不算数：
+ *  上一轮据「PATCH 回 200」记下了「Gitee 更新用平铺 `filename`+`content`」，
+ *  这轮把内容长度做成可辨认的标记重测，发现那种写法回 200 却一个字也没改进云端，
+ *  真正生效的是和创建一样的 `files` 哈希。文档抄错的第三方教程就是这么来的。
+ */
+export type ProviderKind = 
+/**
+ *  GitHub Gist。**实测 `public:false` 也是匿名可读的**，所以云端那份密文要按
+ *  「谁都能下载、可以无限次离线爆破」设防，见 `dbhx-vault::envelope`。
+ */
+"github" | 
+/**
+ *  Gitee 代码片段。**实测私密片段匿名读 API 与 raw 都是 403**，这一点比 GitHub 好；
+ *  但密文仍按同一套参数设防 —— 两家共用一个信封，密钥强度不能跟着服务选。
+ */
+"gitee";
+
 export type PtySize = {
 	rows: number,
 	cols: number,
@@ -506,6 +543,63 @@ export type SftpFollowed = {
 	/**  `None` 表示没有导航，`hold` 说明为什么 */
 	listing: DirListing | null,
 	hold: FollowHold | null,
+};
+
+/**  一次同步跑到了哪一步。设置面板拿它决定念哪句话。 */
+export type SyncOutcome = 
+/**  同步串或云端令牌还没配齐。**没碰网络，也没改本地。** */
+"not_configured" | 
+/**
+ *  本地记着的片段在云上已经不存在了。
+ * 
+ *  这里刻意不擅自新建一份：同一个账号下很可能还躺着另一台设备刚推上去的、
+ *  比本地更新的数据，悄悄建第二个片段会让两台设备从此各写各的 ——
+ *  而那正是这套设计最想避免的事故。得由用户点头重建。
+ */
+"recreate_required" | 
+/**  两边内容一致，什么都没动。 */
+"nothing" | 
+/**
+ *  从云上取回了东西，本地已合并落盘；云上无需再写。
+ * 
+ *  「新设备第一次同步」正常落在这一档：它只该读，不该白写一遍。
+ */
+"pulled" | 
+/**  第一次同步：云上本来没有片段，这是刚建出来的那一份。 */
+"created" | 
+/**  本地（含刚合并进来的远端改动）比云上那一份新，已经回推成功。 */
+"pushed";
+
+/**  一次同步的结果。只带名字和条数，不带任何凭据内容。 */
+export type SyncReport = {
+	outcome: SyncOutcome,
+	/**  合并完本机有几台主机。UI 用「现在共 N 台」一句自证同步确实生效了。 */
+	hosts: number,
+	/**  这次写入本机的主机条数（含转存的冲突副本）。 */
+	imported: number,
+	/**  两边都改过同一条而转存成「（冲突副本）」的条目名。 */
+	conflicts: string[],
+	/**  认证方式要私钥、但本机仍没有对应身份的主机名。 */
+	missing_identities: string[],
+	/**  口令既不在本地也不在云上、需要重设一次口令的主机名。 */
+	missing_credentials: string[],
+};
+
+/**  同步配置的可外显形状。两个秘密字段只有「配过没有」，值永不出来。 */
+export type SyncStatus = {
+	/**  用户选的那一家。还没有片段坐标时，它决定第一次推送把片段建到哪去。 */
+	provider: ProviderKind,
+	has_sync_str: boolean,
+	has_token: boolean,
+	/**
+	 *  云端片段的 id。`None` = 这台设备还没跟着任何一个片段。
+	 *  它不是秘密（见 `dbhx_model::SyncTarget`），而且必须显示出来：
+	 *  第二台设备光有同步串是找不到云上那一份的。
+	 */
+	fragment_id: string | null,
+	include_private_keys: boolean,
+	/**  本机主机条数。面板用「现在共 N 台」自证同步确实落到本库了。 */
+	hosts: number,
 };
 
 /**

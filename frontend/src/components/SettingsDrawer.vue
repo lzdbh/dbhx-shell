@@ -3,10 +3,13 @@ import { onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 
 import { formatTime } from '@/lib/format'
+import { clipboardApi } from '@/lib/ipc/client'
+import type { ProviderKind, SyncReport } from '@/lib/ipc/bindings'
 import { useHostkeysStore } from '@/stores/hostkeys'
 import { useHostsStore } from '@/stores/hosts'
 import { useLockStore } from '@/stores/lock'
 import { DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE, useSettingsStore } from '@/stores/settings'
+import { useSyncStore } from '@/stores/sync'
 import { useThemeStore } from '@/stores/theme'
 
 const settings = useSettingsStore()
@@ -14,7 +17,14 @@ const themeStore = useThemeStore()
 const hosts = useHostsStore()
 const hostkeys = useHostkeysStore()
 const lock = useLockStore()
+const sync = useSyncStore()
 const [messageApi, holder] = message.useMessage()
+
+/** 同步目的地两选一。值必须是后端契约里的小写串，写错了会被当成非法枚举拒掉。 */
+const PROVIDER_OPTIONS: { value: ProviderKind, label: string }[] = [
+  { value: 'github', label: 'GitHub Gist' },
+  { value: 'gitee', label: 'Gitee 代码片段' },
+]
 
 /** 自动上锁的候选时长（分钟）。0 是「关闭」，放在选择器里而不是开关，好让「多久」和「开不开」是一件事。 */
 const IDLE_OPTIONS = [
@@ -58,10 +68,19 @@ const newPin = ref('')
 const confirmPin = ref('')
 const savingPin = ref(false)
 
+/**
+ * 同步串与令牌只在这一次提交里活着。保存成功就清空输入框，
+ * 界面之后只显示「已配置」——想改只能重新贴一遍，这是有意的。
+ */
+const syncStr = ref('')
+const syncToken = ref('')
+const syncFragment = ref('')
+
 onMounted(() => {
   void hostkeys.refresh()
   void hosts.refresh()
   void lock.refresh()
+  void sync.refresh()
 })
 
 /** 前端预校验只是少跑一趟后端；真正的长度校验与「锁着不许改锁」都在 Rust 侧。 */
@@ -94,6 +113,110 @@ async function removePin(): Promise<void> {
   } catch (e) {
     messageApi.error(describe(e))
   }
+}
+
+async function saveSyncStr(): Promise<void> {
+  if (await sync.setStr(syncStr.value)) {
+    // 清掉明文：界面上之后只剩「已配置」三个字，值不在渲染层留副本
+    syncStr.value = ''
+    messageApi.success('已保存同步串')
+  } else {
+    messageApi.error(sync.error ?? '保存失败')
+  }
+}
+
+async function forgetSyncStr(): Promise<void> {
+  if (await sync.setStr(null)) messageApi.success('已忘记本机存的同步串，云上那一份没动')
+  else messageApi.error(sync.error ?? '操作失败')
+}
+
+/** 生成只填进输入框，不落盘。存下去才算换锁，而换锁让云上那一份立刻解不开。 */
+async function generateSyncStr(): Promise<void> {
+  syncStr.value = await sync.newStr()
+  messageApi.info('已生成一串。先抄到别处存好，再点保存')
+}
+
+async function copySyncStr(): Promise<void> {
+  await clipboardApi.write(syncStr.value)
+  messageApi.success('已复制到剪贴板')
+}
+
+async function saveSyncToken(): Promise<void> {
+  if (await sync.setToken(syncToken.value)) {
+    syncToken.value = ''
+    messageApi.success('已保存云端令牌')
+  } else {
+    messageApi.error(sync.error ?? '保存失败')
+  }
+}
+
+async function forgetSyncToken(): Promise<void> {
+  if (await sync.setToken(null)) messageApi.success('已忘记令牌')
+  else messageApi.error(sync.error ?? '操作失败')
+}
+
+async function saveSyncFragment(): Promise<void> {
+  if (await sync.setFragment(syncFragment.value)) {
+    syncFragment.value = ''
+    messageApi.success('已记下片段 id')
+  } else {
+    messageApi.error(sync.error ?? '保存失败')
+  }
+}
+
+async function forgetSyncFragment(): Promise<void> {
+  if (await sync.setFragment(null)) messageApi.success('本机不再跟着任何片段')
+  else messageApi.error(sync.error ?? '操作失败')
+}
+
+/**
+ * 换目的地。切之前先把「有没有跟着片段」记下来：后端在换家那一刻会连同基线
+ * 一起清掉坐标，界面必须把这件事说出来，否则用户以为切回去 id 还在。
+ */
+async function switchProvider(provider: ProviderKind): Promise<void> {
+  const dropped = sync.status?.fragment_id
+  if (!(await sync.setProvider(provider))) {
+    messageApi.error(sync.error ?? '切换失败')
+    return
+  }
+  if (dropped) messageApi.warning(`已切到另一家，原来跟着的片段 ${dropped} 已经清空，要重新填 id`)
+}
+
+/** 勾不勾都当场落盘并回读：它决定推上去的那份里到底有没有私钥，不能只改界面。 */
+async function savePrivateKeys(enabled: boolean): Promise<void> {
+  if (await sync.setPrivateKeys(enabled))
+    messageApi.success(enabled ? '已开启：私钥会一起封进云上那份' : '已关闭：私钥只留在本机')
+  else messageApi.error(sync.error ?? '操作失败')
+}
+
+async function runSync(recreate = false): Promise<void> {
+  const report = await sync.syncNow(recreate)
+  if (!report) {
+    messageApi.error(sync.error ?? '同步失败')
+    return
+  }
+  const text = summarize(report)
+  if (report.outcome === 'recreate_required') messageApi.warning(text)
+  else messageApi.success(text)
+  // 合并会改本机库，主机列表那边得重读一次
+  await hosts.refresh()
+}
+
+/** 每种结局一句话，末尾补上「还有什么得手工补」。 */
+function summarize(report: SyncReport): string {
+  const head: Record<SyncReport['outcome'], string> = {
+    not_configured: '同步串或令牌还没配齐，什么都没做',
+    recreate_required: '云上那个片段已经不在了，需要你点头重建',
+    nothing: '两边内容一致，什么都没动',
+    pulled: `从云上取回 ${report.imported} 台，本机共 ${report.hosts} 台`,
+    created: `已在云上建好片段，共 ${report.hosts} 台`,
+    pushed: `已把本机这份推上云，共 ${report.hosts} 台`,
+  }
+  const notes: string[] = []
+  if (report.conflicts.length > 0) notes.push(`${report.conflicts.length} 条两边都改过，已另存为「（冲突副本）」`)
+  if (report.missing_identities.length > 0) notes.push(`${report.missing_identities.length} 台还缺对应的私钥`)
+  if (report.missing_credentials.length > 0) notes.push(`${report.missing_credentials.length} 台要重新设一次口令`)
+  return notes.length > 0 ? `${head[report.outcome]}；${notes.join('；')}` : head[report.outcome]
 }
 
 function describe(e: unknown): string {
@@ -284,6 +407,171 @@ function splitPattern(pattern: string): { host: string, port: number } {
       </a-form-item>
 
       <a-divider orientation="left">
+        云端同步
+      </a-divider>
+      <p class="hint-line">
+        把主机列表（含账号口令）整个加密成一份，存进所选那家的一个片段里。
+        云上躺着的是密文，没有同步串谁也解不开；但<strong>片段地址有可能被别人翻到</strong>，
+        所以同步串泄露等于整本主机库连口令一起交出去，别把它和地址存在同一个地方。
+        第二台设备要把「同步串」和「片段 id」两样都填进去：
+        id 是云端随机生成的，从同步串推不出来，少一样就找不到云上那一份。
+      </p>
+      <a-form-item label="存到哪一家">
+        <a-select
+          :value="sync.status?.provider ?? 'github'"
+          style="width: 200px"
+          :options="PROVIDER_OPTIONS"
+          @update:value="(v) => void switchProvider(v as ProviderKind)"
+        />
+        <span class="dim">换一家会清空当前跟着的片段 id。</span>
+      </a-form-item>
+
+      <a-form-item label="同步串">
+        <a-space direction="vertical" style="width: 100%">
+          <a-space>
+            <a-tag :color="sync.status?.has_sync_str ? 'green' : 'default'">
+              {{ sync.status?.has_sync_str ? '已配置' : '未配置' }}
+            </a-tag>
+            <span class="dim">32 个字符；丢了，云上那一份就永远解不开。</span>
+          </a-space>
+          <a-space wrap>
+            <a-input-password
+              v-model:value="syncStr"
+              :maxlength="64"
+              autocomplete="new-password"
+              class="sync-input"
+              placeholder="贴入同步串以保存或更换"
+            />
+            <a-button size="small" :disabled="!syncStr.trim()" @click="void saveSyncStr()">
+              保存
+            </a-button>
+            <a-button size="small" :disabled="!syncStr.trim()" @click="void copySyncStr()">
+              复制
+            </a-button>
+            <a-button size="small" @click="void generateSyncStr()">
+              生成新的
+            </a-button>
+            <a-popconfirm
+              v-if="sync.status?.has_sync_str"
+              title="忘记之后本机再也解不开云上那一份，云端的数据不动。确定吗？"
+              ok-text="忘记"
+              cancel-text="取消"
+              @confirm="void forgetSyncStr()"
+            >
+              <a-button size="small" danger>
+                忘记
+              </a-button>
+            </a-popconfirm>
+          </a-space>
+        </a-space>
+      </a-form-item>
+
+      <a-form-item label="云端令牌">
+        <a-space direction="vertical" style="width: 100%">
+          <a-space>
+            <a-tag :color="sync.status?.has_token ? 'green' : 'default'">
+              {{ sync.status?.has_token ? '已配置' : '未配置' }}
+            </a-tag>
+            <span class="dim">只用来读写云上那个片段，要那个账号有相应的片段权限。</span>
+          </a-space>
+          <a-space wrap>
+            <a-input-password
+              v-model:value="syncToken"
+              :maxlength="256"
+              autocomplete="off"
+              class="sync-input"
+              placeholder="贴入令牌以保存或更换"
+            />
+            <a-button size="small" :disabled="!syncToken.trim()" @click="void saveSyncToken()">
+              保存
+            </a-button>
+            <a-popconfirm
+              v-if="sync.status?.has_token"
+              title="忘记令牌之后就无法再推新数据上云，本机和云端都已存的东西都还在。确定吗？"
+              ok-text="忘记"
+              cancel-text="取消"
+              @confirm="void forgetSyncToken()"
+            >
+              <a-button size="small" danger>
+                忘记
+              </a-button>
+            </a-popconfirm>
+          </a-space>
+        </a-space>
+      </a-form-item>
+
+      <a-form-item label="云端片段 id">
+        <a-space direction="vertical" style="width: 100%">
+          <a-space>
+            <span class="mono">{{ sync.status?.fragment_id ? `当前跟着 ${sync.status.fragment_id}` : '还没有跟着任何片段' }}</span>
+          </a-space>
+          <a-space wrap>
+            <a-input
+              v-model:value="syncFragment"
+              :maxlength="64"
+              class="sync-input"
+              placeholder="网页地址里那一串字母数字"
+            />
+            <a-button size="small" :disabled="!syncFragment.trim()" @click="void saveSyncFragment()">
+              保存
+            </a-button>
+            <a-popconfirm
+              v-if="sync.status?.fragment_id"
+              title="不再跟着任何片段之后，下一次同步会当成「本机还没上过云」来处理。确定吗？"
+              ok-text="取消跟随"
+              cancel-text="再想想"
+              @confirm="void forgetSyncFragment()"
+            >
+              <a-button size="small" danger>
+                不再跟随
+              </a-button>
+            </a-popconfirm>
+          </a-space>
+        </a-space>
+      </a-form-item>
+
+      <a-form-item label="私钥">
+        <a-space>
+          <a-checkbox
+            :checked="sync.status?.include_private_keys ?? false"
+            @update:checked="(v: boolean) => void savePrivateKeys(v)"
+          >
+            把私钥一起同步
+          </a-checkbox>
+          <a-tooltip>
+            <template #title>
+              默认关。私钥连同它的口令一起封进同一份密文里，只有拿着同步串的人解得开。
+              不勾的另一面是：换设备之后认证方式选「私钥」的主机要手工重新导入一次。
+            </template>
+            <span class="dim">这个开关存在本机库里，重装也不会悄悄回到默认值。</span>
+          </a-tooltip>
+        </a-space>
+      </a-form-item>
+
+      <a-form-item label="同步">
+        <a-space wrap>
+          <a-button type="primary" :loading="sync.busy" @click="void runSync()">
+            立即同步
+          </a-button>
+          <a-popconfirm
+            v-if="sync.last?.outcome === 'recreate_required'"
+            title="在云上重建一个新片段，用本机这份当起点。另一台设备仍然跟着老片段，得有人把新 id 抄过去。"
+            ok-text="重建"
+            cancel-text="取消"
+            @confirm="void runSync(true)"
+          >
+            <a-button danger :loading="sync.busy">
+              重建片段
+            </a-button>
+          </a-popconfirm>
+          <span class="dim">本机共 {{ sync.status?.hosts ?? 0 }} 台；一次大约要等十秒。</span>
+        </a-space>
+      </a-form-item>
+      <p v-if="sync.error" class="hint-line sync-error">
+        {{ sync.error }}
+      </p>
+
+      <a-divider orientation="left">
         私钥
       </a-divider>
       <a-list size="small" :data-source="hosts.identities">
@@ -389,6 +677,15 @@ function splitPattern(pattern: string): { host: string, port: number } {
 
 .hl-pattern {
   width: 220px;
+}
+
+/* 抽屉只有 420 宽：输入框给到一行能放下「输入框 + 保存」为止，其余按钮让它自己换行 */
+.sync-input {
+  width: 200px;
+}
+
+.sync-error {
+  color: var(--err);
 }
 
 /* 原生取色框默认带一圈内边距，压成和旁边小控件同高 */

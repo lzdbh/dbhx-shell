@@ -208,6 +208,12 @@ fn is_valid_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
+/// 白名单的对外入口：设置面板在用户粘完就当场拒掉明显不合法的串，
+/// 而不是等他点「立即同步」、请求拼进地址之后才报一个看不出所以然的错。
+pub fn is_valid_fragment_id(id: &str) -> bool {
+    is_valid_id(id)
+}
+
 /// 编码：URL-safe 无填充。`-_` 在双击选中时不会被截断，也不含 `=`，
 /// 用户把这个文件从网页上复制下来比对时不会因换行而变形。
 fn encode(blob: &[u8]) -> String {

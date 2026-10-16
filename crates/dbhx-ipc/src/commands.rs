@@ -9,6 +9,7 @@ pub mod local;
 pub mod log;
 pub mod session;
 pub mod sftp;
+pub mod sync;
 pub mod transfer;
 pub mod vault;
 

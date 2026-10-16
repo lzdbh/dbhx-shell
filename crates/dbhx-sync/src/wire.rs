@@ -125,7 +125,10 @@ impl WireError {
         match self {
             WireError::Connect { .. } => ErrorCode::Unreachable,
             WireError::TimedOut { .. } => ErrorCode::Timeout,
-            WireError::Unauthorized => ErrorCode::PermissionDenied,
+            // 令牌被云端拒掉就是认证失败，不能算 `PermissionDenied`：后者在这条路径上
+            // 已经是「本机解不开云上那份密文」（`VaultError::Crypto`）的专用码，
+            // 两件事挤进同一个 code，前端就没法把「去改令牌」和「去改同步串」分开说。
+            WireError::Unauthorized => ErrorCode::AuthFailed,
             // 限流和「超预算」在用户那一侧是同一件事：等一会儿再来
             WireError::RateLimited => ErrorCode::QuotaExceeded,
             WireError::NotFound => ErrorCode::NotFound,
@@ -306,7 +309,7 @@ mod tests {
     #[test]
     fn error_categories_map_to_the_codes_the_frontend_can_act_on() {
         let cases = [
-            (WireError::Unauthorized, ErrorCode::PermissionDenied),
+            (WireError::Unauthorized, ErrorCode::AuthFailed),
             (WireError::RateLimited, ErrorCode::QuotaExceeded),
             (WireError::NotFound, ErrorCode::NotFound),
             (WireError::BadBody, ErrorCode::Internal),
@@ -320,6 +323,16 @@ mod tests {
             let ipc: IpcError = err.into();
             assert_eq!(ipc.code, code);
         }
+    }
+
+    /// 「令牌被云端拒了」和「本机解不开云上那一份」必须落在不同 code 上。
+    /// 这两个码在同步这条路径上是前端唯一的分支依据——撞上之后只能猜，
+    /// 猜错就是把去换令牌的人支去重贴同步串。
+    #[test]
+    fn a_rejected_token_is_not_the_same_failure_as_an_undecryptable_cloud_copy() {
+        let token: IpcError = WireError::Unauthorized.into();
+        let sealed: IpcError = dbhx_vault::VaultError::Crypto.into();
+        assert_ne!(token.code, sealed.code, "{:?} 与 {:?} 撞了", token.code, sealed.code);
     }
 
     /// 错误文案是给用户看的，也是唯一可能被写进日志的东西：一次都不能带出令牌。
