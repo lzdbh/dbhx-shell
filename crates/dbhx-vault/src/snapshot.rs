@@ -10,6 +10,8 @@
 //! 所以「同一个 id」就等于「同一份内容」：导入时看到本地已有同 id 的密文可以直接跳过，
 //! 判断两条记录是否一致也可以直接比字节。
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use dbhx_model::{AuthMode, HostId, HostRecord, IdentityId, IdentityRecord};
@@ -79,6 +81,22 @@ impl SyncSnapshot {
 
     pub fn secret(&self, id: &str) -> Option<&SnapshotSecret> {
         self.secrets.iter().find(|(k, _)| k == id).map(|(_, v)| v)
+    }
+
+    /// 两份快照内容是否等价。忽略 `made_at_ms` 与 `device_id`：前者每次导出都换一个
+    /// 数、后者按设备就不同，两者都不表示「数据变了」。
+    ///
+    /// 密文只比 id 集合、不比字节，靠的是整条链路的一条不变量：密文条目一旦写入
+    /// 就不再原地改动，改一次口令必然新生成一个 id。所以 id 集合相等就等于凭据没变。
+    /// 反过来不比密文字节还有一层好处：同一份明文两次密封得到的 ciphertext 本来就不同
+    /// （nonce 随机），比字节会永远判定「变了」。
+    pub fn same_content(&self, other: &Self) -> bool {
+        let mine: BTreeSet<&str> = self.secrets.iter().map(|(k, _)| k.as_str()).collect();
+        let theirs: BTreeSet<&str> = other.secrets.iter().map(|(k, _)| k.as_str()).collect();
+        self.hosts == other.hosts
+            && self.identities == other.identities
+            && self.tombstones == other.tombstones
+            && mine == theirs
     }
 }
 

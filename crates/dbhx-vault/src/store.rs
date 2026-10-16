@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dbhx_model::{HostId, HostRecord, IdentityId, IdentityRecord, SecretId};
+use dbhx_model::{HostId, HostRecord, IdentityId, IdentityRecord, SecretId, SyncTarget};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -66,6 +66,9 @@ pub enum SecretKind {
     /// 云同步的同步串。存进 vault 只是为了免用户每次重贴，
     /// 它和 `LockPin` 同一类：不参与同步、不参与重密封，但必须被引用计数保住。
     SyncStr,
+    /// 云端服务的访问令牌（GitHub / Gitee）。和上面两种同一条规则：
+    /// 只被引用计数保住，绝不进云端快照，跨 IPC 也只报「配过没有」。
+    ProviderToken,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,11 +101,21 @@ struct VaultDoc {
     /// 云同步串的密文条目。`None` 表示这台设备还没配过同步。
     #[serde(default)]
     sync_str: Option<SecretId>,
-    /// 上一次同步成功时云端那份 blob 的原样副本（base64）。
+    /// 云端令牌的密文条目。和 `sync_str` 分开存：换令牌不该把同步串也弄丢，
+    /// 反过来配新令牌时也不该逼用户重贴那串 32 位字符。
+    #[serde(default)]
+    provider_token: Option<SecretId>,
+    /// 云端那一份的坐标（哪家服务 + 哪个片段）。明文存：它本身不是秘密，
+    /// 见 `dbhx_model::SyncTarget`。
+    #[serde(default)]
+    sync_target: Option<SyncTarget>,
+    /// 上一次同步完成时**本地这份快照**的副本，用本机主密钥密封。
     ///
-    /// 它就是三方合并的**基线**：里面每条密文都还是用同步密钥封着的，
-    /// 所以本地留这么一份并不额外降低安全性——拿到它和拿到云端那一份等价。
-    /// 没有基线就只能整库定胜负，那正是合并最容易默默丢数据的情形。
+    /// 它是三方合并的**基线**：没有基线就只能整库定胜负，那正是合并最容易
+    /// 默默丢数据的情形。之所以存快照而不是云端那份 blob：blob 得用同步密钥才解得开，
+    /// 而合并每次同步都要读基线一回 —— 存 blob 等于每次同步多付一次 Argon2id（实测 5s）。
+    /// 换成用本机密钥封的快照之后，读基线跟读一条普通密文一样便宜。
+    /// 安全性没有额外损失：拿到它和拿到云端那一份等价，都需要同步串才能解。
     #[serde(default)]
     sync_base: Option<String>,
 }
@@ -459,6 +472,9 @@ impl Vault {
         if self.doc.sync_str.as_ref() == Some(secret_id) {
             n += 1;
         }
+        if self.doc.provider_token.as_ref() == Some(secret_id) {
+            n += 1;
+        }
         n
     }
 
@@ -547,6 +563,9 @@ impl Vault {
 
     /// 存下同步串。**传入的必须是 `envelope::normalize` 之后的形式**：
     /// 粘贴带进来的 CRLF 只在录入这一次能看出来，之后它变成「密钥错误」就查不动了。
+    ///
+    /// 换串必须连基线一起丢：基线是从老那把锁的底子转封来的，新串对不上它，
+    /// 留着等于让下一次合并拿一份认不出的数据定胜负。
     pub fn set_sync_str(&mut self, sync_str: &[u8]) -> Result<(), VaultError> {
         let old = self.doc.sync_str.take();
         let id = self.put_secret(SecretKind::SyncStr, sync_str)?;
@@ -554,6 +573,7 @@ impl Vault {
         if let Some(old) = old {
             self.doc.secrets.remove(&old.0);
         }
+        self.doc.sync_base = None;
         self.dirty = true;
         Ok(())
     }
@@ -567,17 +587,86 @@ impl Vault {
         }
     }
 
-    /// 上一次同步的基线 blob。解出来要用同一把同步串，见 `sync::DerivedKey::from_blob`。
-    pub fn sync_base(&self) -> Option<&str> {
-        self.doc.sync_base.as_deref()
+    /// 这台设备配过云端令牌吗。UI 只显示「已配置」，永远拿不到值 ——
+    /// 令牌出库只发生在 `with_provider_token` 的回调里，而那个回调不出进程。
+    pub fn has_provider_token(&self) -> bool {
+        self.doc.provider_token.is_some()
     }
 
-    /// 记下「这次同步完成时云端是哪一份」。`None` 表示清空基线（换了 provider 时用）。
-    pub fn set_sync_base(&mut self, blob_base64: Option<String>) {
-        if self.doc.sync_base != blob_base64 {
-            self.doc.sync_base = blob_base64;
+    pub fn with_provider_token<T>(
+        &self,
+        f: impl FnOnce(&[u8]) -> Result<T, VaultError>,
+    ) -> Result<T, VaultError> {
+        let id = self
+            .doc
+            .provider_token
+            .clone()
+            .ok_or_else(|| VaultError::NotFound("provider token".into()))?;
+        self.with_secret(&id, f)
+    }
+
+    pub fn set_provider_token(&mut self, token: &[u8]) -> Result<(), VaultError> {
+        let old = self.doc.provider_token.take();
+        let id = self.put_secret(SecretKind::ProviderToken, token)?;
+        self.doc.provider_token = Some(id);
+        if let Some(old) = old {
+            self.doc.secrets.remove(&old.0);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn clear_provider_token(&mut self) {
+        if let Some(old) = self.doc.provider_token.take() {
+            self.doc.secrets.remove(&old.0);
             self.dirty = true;
         }
+    }
+
+    /// 云端那一份的坐标。`None` = 还没在上面建过片段。
+    pub fn sync_target(&self) -> Option<&SyncTarget> {
+        self.doc.sync_target.as_ref()
+    }
+
+    pub fn set_sync_target(&mut self, target: Option<SyncTarget>) {
+        if self.doc.sync_target != target {
+            self.doc.sync_target = target;
+            self.dirty = true;
+        }
+    }
+
+    /// 上一次同步的基线快照。解不开时返回 `Err`：调用方可以按「没有基线」继续合并
+    /// （结论会变保守，不会静默丢数据），但不能当成「本来就没有」直接盖过去。
+    pub fn sync_base(&self) -> Result<Option<SyncSnapshot>, VaultError> {
+        let Some(text) = self.doc.sync_base.as_deref() else {
+            return Ok(None);
+        };
+        let sealed = base64_decode(text)
+            .ok_or_else(|| VaultError::Malformed("sync baseline is not base64".into()))?;
+        let plain = open(&self.key, &sealed)?;
+        let snap: SyncSnapshot = serde_json::from_slice(&plain)
+            .map_err(|e| VaultError::Malformed(format!("sync baseline: {e}")))?;
+        snap
+            .check_version()
+            .map_err(VaultError::Malformed)?;
+        Ok(Some(snap))
+    }
+
+    /// 记下「这次同步完成时本地是哪一份」。`None` 清空基线（换云端目标时用）。
+    pub fn set_sync_base(&mut self, snap: Option<&SyncSnapshot>) -> Result<(), VaultError> {
+        let next = match snap {
+            None => None,
+            Some(s) => {
+                let json = serde_json::to_vec(s)
+                    .map_err(|e| VaultError::Malformed(format!("baseline json: {e}")))?;
+                Some(base64_encode(&seal(&self.key, &json)?))
+            }
+        };
+        if self.doc.sync_base != next {
+            self.doc.sync_base = next;
+            self.dirty = true;
+        }
+        Ok(())
     }
 
     /// 本机已有的密文条目 id，合并时用来判断「远端这条要不要导入」。
@@ -596,6 +685,28 @@ impl Vault {
         &self,
         key: &DerivedKey,
         include_private_keys: bool,
+    ) -> Result<SyncSnapshot, VaultError> {
+        self.collect_snapshot(include_private_keys, |plain| {
+            Ok(base64_encode(&crate::crypto::seal(key.inner(), plain)?))
+        })
+    }
+
+    /// 与 `export_snapshot` 同一份内容，但密文用**本机主密钥**封。
+    ///
+    /// 用途只有两个：写基线，以及判断「这次到底有没有东西要推」。
+    /// 这份绝不能上传——它的锁只有本机解得开，第二台设备拿到就是废数据。
+    pub fn local_snapshot(&self, include_private_keys: bool) -> Result<SyncSnapshot, VaultError> {
+        self.collect_snapshot(include_private_keys, |plain| {
+            Ok(base64_encode(&seal(&self.key, plain)?))
+        })
+    }
+
+    /// 两条导出路径共用的收集逻辑。「哪些记录、哪些密文进快照」这件事只允许有一处实现：
+    /// 基线如果是按另一套规则收集的，`same_content` 就会永远判定「本地变过了」。
+    fn collect_snapshot(
+        &self,
+        include_private_keys: bool,
+        reseal: impl Fn(&[u8]) -> Result<String, VaultError>,
     ) -> Result<SyncSnapshot, VaultError> {
         let mut snap = SyncSnapshot::new(self.doc.device_id.clone(), now_ms());
         snap.hosts = self.doc.hosts.clone();
@@ -620,10 +731,8 @@ impl Vault {
                 .get(&id.0)
                 .ok_or_else(|| VaultError::NotFound(format!("secret {}", id.0)))?
                 .kind;
-            // 本机主密钥解开 → 同步密钥重封，明文只活在这一对括号里
-            let cipher = self.with_secret(&id, |plain| {
-                Ok(base64_encode(&crate::crypto::seal(key.inner(), plain)?))
-            })?;
+            // 本机主密钥解开 → 换那把锁重封，明文只活在这一对括号里
+            let cipher = self.with_secret(&id, |plain| reseal(plain))?;
             snap.secrets.push((id.0.clone(), SnapshotSecret { kind, cipher }));
         }
         snap.tombstones = self.doc.tombstones.clone();
@@ -1095,14 +1204,16 @@ mod tests {
     }
 
     #[test]
-    fn neither_the_lock_pin_nor_the_sync_string_ever_leaves_the_device() {
+    fn neither_the_lock_pin_sync_string_nor_the_token_ever_leaves_the_device() {
         let (mut v, _local, dir) = sync_vault("never-leaves");
         let hid = v.upsert_host(host("db1"));
         v.set_host_password(&hid, b"pw").unwrap();
         v.set_lock_pin(b"1234").unwrap();
         v.set_sync_str(b"0123456789abcdefghijKLMNOPqrst").unwrap();
-        // 三条密文都在库里，导出只能带走口令那一条
-        assert_eq!(v.secret_count(), 3);
+        v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        // 四条密文都在库里，导出只能带走口令那一条。
+        // 云端令牌要是跟着快照上了云，就等于把「谁能改这个片段」交给了「谁能读这个片段」。
+        assert_eq!(v.secret_count(), 4);
         let snap = v.export_snapshot(&derived(MasterKey::generate()), true).unwrap();
         assert_eq!(snap.secrets.len(), 1, "只有被记录引用到的密文才参与导出");
         assert_eq!(
@@ -1293,15 +1404,19 @@ mod tests {
     }
 
     #[test]
-    fn sync_string_and_baseline_survive_gc_and_a_reopen() {
+    fn sync_string_token_and_baseline_survive_gc_and_a_reopen() {
         let dir = temp_dir("sync-state");
         let key_path = dir.join("master.key");
         let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
         v.set_sync_str(b"0123456789abcdefghijKLMNOPqrst").unwrap();
-        v.set_sync_base(Some("Zm9vLWJsb2I=".into()));
+        v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        v.set_sync_target(Some(SyncTarget { provider: dbhx_model::ProviderKind::GitHub, id: "deadbeef".into() }));
         let hid = v.upsert_host(host("临时的一台"));
         v.set_host_password(&hid, b"pw").unwrap();
-        // 一次会大规模回收孤儿密文的合并，不能把同步串这条「没人引用」的条目一起清掉
+        // 基线要能用本机密钥原样读回来，否则每次同步都等于没有基线
+        let base = v.local_snapshot(false).unwrap();
+        v.set_sync_base(Some(&base)).unwrap();
+        // 一次会大规模回收孤儿密文的合并，不能把这几条「没人引用」的条目一起清掉
         let mut remote = SyncSnapshot::new("BBB".into(), 1_000);
         remote.tombstones.push(DeletionMark {
             id: hid.0.clone(),
@@ -1309,26 +1424,52 @@ mod tests {
             deleted_at_ms: 500,
             device_id: "BBB".into(),
         });
-        let mut base = SyncSnapshot::new("AAA".into(), 400);
-        base.hosts.push(v.host(&hid).unwrap().clone());
         merge_from(
             &mut v,
             &remote,
             Some(&base),
             &derived(MasterKey::generate()),
         );
-        assert_eq!(v.secret_count(), 1, "口令条目该被回收，同步串那条得留着");
+        assert_eq!(
+            v.secret_count(),
+            2,
+            "口令条目该被回收，同步串和令牌这两条「没人引用」的得留着"
+        );
+        assert_eq!(v.sync_base().unwrap().unwrap().hosts.len(), 1, "基线里的这台主机不能跟着消失");
         v.flush().unwrap();
         drop(v);
 
         let reopened = Vault::open(&dir, KeySource::File(key_path)).unwrap();
         assert!(reopened.has_sync_str());
-        assert_eq!(reopened.sync_base().unwrap(), "Zm9vLWJsb2I=");
+        assert!(reopened.has_provider_token());
+        assert_eq!(reopened.sync_target().unwrap().id, "deadbeef");
+        let reopened_base = reopened.sync_base().unwrap().expect("重开之后基线还在");
+        assert!(reopened_base.same_content(&base), "基线读回来变了，说明它没被原样存下");
         let revealed = reopened
             .with_sync_str(|p| Ok(String::from_utf8(p.to_vec())))
             .unwrap()
             .unwrap();
         assert_eq!(revealed, "0123456789abcdefghijKLMNOPqrst");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 换同步串等于换了一把锁：老基线是用旧串的同步密钥解出来再转封的，
+    /// 留着它只会让下一次合并拿一份对不上号的底子定胜负。
+    #[test]
+    fn changing_or_forgetting_the_sync_string_always_drops_the_baseline() {
+        let (mut v, _key, dir) = sync_vault("base-drop");
+        let hid = v.upsert_host(host("一台"));
+        v.set_host_password(&hid, b"pw").unwrap();
+        let base = v.local_snapshot(false).unwrap();
+        v.set_sync_base(Some(&base)).unwrap();
+        assert!(v.sync_base().unwrap().is_some());
+
+        v.set_sync_str(b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").unwrap();
+        assert!(v.sync_base().unwrap().is_none(), "换了串还留着老基线");
+
+        v.set_sync_base(Some(&base)).unwrap();
+        v.clear_sync_str();
+        assert!(v.sync_base().unwrap().is_none());
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1353,7 +1494,14 @@ mod tests {
         .unwrap();
         let mut doc: serde_json::Value = serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
         doc["version"] = serde_json::json!(1u32);
-        for gone in ["device_id", "tombstones", "sync_str", "sync_base"] {
+        for gone in [
+            "device_id",
+            "tombstones",
+            "sync_str",
+            "sync_base",
+            "sync_target",
+            "provider_token",
+        ] {
             doc.as_object_mut().unwrap().remove(gone);
         }
         let sealed = seal(&key, &serde_json::to_vec(&doc).unwrap()).unwrap();
