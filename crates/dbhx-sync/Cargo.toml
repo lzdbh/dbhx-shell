@@ -1,0 +1,21 @@
+[package]
+name = "dbhx-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "主机列表的云同步传输层：GitHub / Gitee 片段的读写与同步编排；纯 REST，不引 git 协议也不引 C 工具链"
+
+[dependencies]
+dbhx-model.workspace = true
+dbhx-vault.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

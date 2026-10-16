@@ -220,6 +220,37 @@ pub enum HostKeyDecision {
     },
 }
 
+/// 云同步落在哪家「片段」服务上。
+///
+/// 之所以放在这一层而不是 `dbhx-sync`：它要进 vault 文档持久化，又要在 IPC 上走到
+/// 设置面板，而 `dbhx-vault` 不能反向依赖 `dbhx-sync`（那边已经依赖它）。
+///
+/// 每加一家都要先实测它的字段形状：GitHub 与 Gitee 在「创建用 `files` 哈希、
+/// 更新却用平铺 `filename`+`content`」这类细节上并不一致，靠猜写出来的解析
+/// 只会以「云端响应读不懂」的形式在用户那边失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// GitHub Gist。**实测 `public:false` 也是匿名可读的**，所以云端那份密文要按
+    /// 「谁都能下载、可以无限次离线爆破」设防，见 `dbhx-vault::envelope`。
+    GitHub,
+}
+
+/// 云端那一份的坐标：哪家服务 + 哪个片段。
+///
+/// 它**不是**秘密，可以明文存在 vault 里：片段 id 本身就是访问控制的一部分，
+/// 真正的秘密只有同步串，而那串是按密文条目存的。
+/// 之所以要存：`create` 只在第一次推送时跑一次，之后必须原地 `update`，
+/// 否则每同步一次云上就多一份，第二台设备就不知道读哪一份了。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct SyncTarget {
+    pub provider: ProviderKind,
+    /// 片段 id，取创建响应里的 `id` 字段。它会拼进请求地址，而令牌放在 header 里，
+    /// 所以 `dbhx-sync` 在发请求前过一道字符白名单：用户从网页地址栏粘来的东西
+    /// 不该有机会改变请求要去哪台机器。
+    pub id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +332,18 @@ mod tests {
         let mut out = Vec::new();
         walk(value, "", &mut out);
         out
+    }
+
+    #[test]
+    fn provider_kind_json_name_is_frozen_because_it_is_stored_and_sent() {
+        // 这个字符串同时出现在 vault 文档和 IPC 契约里：改拼法等于让老库里的
+        // `sync_target` 悄悄读不出来，而报错长得像「没配过同步」。
+        assert_eq!(serde_json::to_string(&ProviderKind::GitHub).unwrap(), "\"github\"");
+        let target = SyncTarget { provider: ProviderKind::GitHub, id: "abc123".into() };
+        assert_eq!(
+            serde_json::from_str::<SyncTarget>(&serde_json::to_string(&target).unwrap()).unwrap(),
+            target
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ members = [
   "crates/dbhx-pty",
   "crates/dbhx-session",
   "crates/dbhx-sftp",
+  "crates/dbhx-sync",
   "crates/dbhx-ipc",
   "crates/dbhx-testsrv",
   "src-tauri",
@@ -53,6 +54,24 @@ keyring = "4"
 # 离线爆破没有速率限制，内存硬参数是把显卡优势打掉的那一道。
 argon2 = "0.5"
 
+# 云同步的传输层。三样都是刻意选的：
+# - default-features = false：reqwest 默认的 native-tls 会拉 OpenSSL，交叉编译矩阵立刻崩；
+# - rustls-tls-native-roots：读**系统信任库**。装 Steam++ 或公司 SSL 审查网关的机器上，
+#   证书链由那个网关签发、根证书只进了系统库；用 rustls 自带的 webpki-roots 的话，
+#   这些用户同步功能一律连不上，而且报错只会是「证书错误」。
+# - rustls 走 ring 后端（见上面 russh 那段），别让 aws-lc-rs 混进来——它要 cmake+nasm。
+# - json：请求体是 `files → content` 的嵌套对象，手写字符串拼接等于把转义交给运气。
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls-native-roots",
+  "http2",
+  "json",
+] }
+
+# 云端片段接口的 `content` 是 JSON 字符串，而信封是任意字节：必须有一层文本编码。
+# 用它而不是 vault 里那个手写的 base64——那一份只为内部存储服务，
+# 跨网络的编解码要处理两种字母表与填充，不该由手写的查表码负责。
+base64 = "0.22"
+
 # 系统剪贴板。前端用 `navigator.clipboard` 读写会在 WebView2 上弹出原生的
 # 「xx 想要查看复制到剪贴板的文本」授权气泡——桌面应用不该有这种交互，
 # 所以剪贴板访问下沉到 Rust。纯 Rust 实现（windows-sys / objc2 / x11rb），
@@ -77,6 +96,7 @@ dbhx-telnet = { path = "crates/dbhx-telnet" }
 dbhx-pty = { path = "crates/dbhx-pty" }
 dbhx-session = { path = "crates/dbhx-session" }
 dbhx-sftp = { path = "crates/dbhx-sftp" }
+dbhx-sync = { path = "crates/dbhx-sync" }
 dbhx-ipc = { path = "crates/dbhx-ipc" }
 # 只给 dev-dependencies 用：SSH/SFTP 协议路径需要真服务器才能跑到
 dbhx-testsrv = { path = "crates/dbhx-testsrv" }

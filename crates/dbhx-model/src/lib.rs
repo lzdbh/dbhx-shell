@@ -19,5 +19,5 @@ pub use time::now_ms;
 pub use sftp::{DirListing, FileEntry, FileKind, TransferKind, TransferProgress, TransferState};
 pub use vault::{
     AuthMode, GroupMode, HostId, HostInfo, HostKeyDecision, HostRecord, IdentityId, IdentityRecord, KnownHost,
-    KnownHostSource, OsType, SecretId,
+    KnownHostSource, OsType, ProviderKind, SecretId, SyncTarget,
 };
