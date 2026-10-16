@@ -5,6 +5,7 @@ import { AppstoreOutlined, BulbFilled, BulbOutlined, CodeOutlined, ColumnWidthOu
 import { Modal, message } from 'ant-design-vue'
 
 import { startEventBridge } from '@/lib/ipc/bus'
+import { isMac } from '@/lib/platform'
 import { lastSyncAgo, summarize } from '@/lib/syncSummary'
 import { applyFontSizeAll, applyTheme, focusTerminal, setHighlightRules } from '@/lib/terminal/registry'
 import { installShortcuts, type ShortcutHandlers } from '@/lib/shortcuts'
@@ -39,6 +40,10 @@ const settings = useSettingsStore()
 const sync = useSyncStore()
 const themeStore = useThemeStore()
 const transfers = useTransfersStore()
+
+// macOS 用原生红绿灯（那颗绿的即全屏），自绘窗控整组藏掉，工具栏左侧让出灯位。
+// 见 tauri.macos.conf.json 与 FileManager.vue 的同名判断。
+const mac = isMac()
 
 const drawerOpen = ref(false)
 const findOpen = ref(false)
@@ -325,7 +330,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
       <modalHolder />
       <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
            但按钮是 clickable 标签、drag.js 自动豁免，下拉没有可点击标签必须显式关 -->
-      <a-layout-header class="bar" data-tauri-drag-region="deep">
+      <a-layout-header class="bar" :class="{ 'bar--mac': mac }" data-tauri-drag-region="deep">
         <span class="brand">dbhx shell</span>
         <!-- 顶条只放图标 + tooltip：这五个动作天天按，文字标签把条带撑到一半宽，
              而窗口宽度是要留给终端的 -->
@@ -402,7 +407,7 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
             </template>
           </a-button>
         </a-tooltip>
-        <WindowControls />
+        <WindowControls v-if="!mac" />
       </a-layout-header>
       <a-layout has-sider>
         <a-layout-sider :width="260" class="sider">
@@ -486,6 +491,16 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
   line-height: 44px;
   padding: 0 0 0 14px;
   border-bottom: 1px solid var(--line);
+}
+
+/* macOS 26 实测：tao 的 trafficLightPosition 根本不生效（y=16 与 y=22 两个包红绿灯圆心
+   都停在 16pt），那是系统默认位置——Tahoe 标题栏 32pt 高，三颗灯居中。
+   既然挪不动灯，就把这条工具栏收到 32px，让内容中线落在同一条线上。
+   78px = 灯组右边缘约 66pt 再留一点呼吸。 */
+.bar--mac {
+  height: 32px;
+  line-height: 32px;
+  padding-left: 78px;
 }
 
 .brand {

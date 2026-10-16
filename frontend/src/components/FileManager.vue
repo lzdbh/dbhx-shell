@@ -6,6 +6,7 @@ import type { FileEntry } from '@/lib/ipc/bindings'
 import { localApi } from '@/lib/ipc/client'
 import { startEventBridge } from '@/lib/ipc/bus'
 import { localJoin, localParent, parentPath } from '@/lib/format'
+import { isMac } from '@/lib/platform'
 import { antdTheme } from '@/styles/antd'
 import { useFilesStore } from '@/stores/files'
 import { useHostsStore } from '@/stores/hosts'
@@ -22,6 +23,10 @@ const files = useFilesStore()
 const hosts = useHostsStore()
 const themeStore = useThemeStore()
 const transfers = useTransfersStore()
+
+// 与主窗口同一套：macOS 用原生红绿灯，自绘窗控藏掉、工具栏左侧让出灯位。
+// 窗口那边的配置在 local.rs 的 with_platform_chrome。
+const mac = isMac()
 
 // 这个组件里 `message()` 已经是「把异常翻成中文」的那个小工具，别名导入免得撞名
 const [messageApi, msgHolder] = antdMessage.useMessage()
@@ -285,14 +290,14 @@ onBeforeUnmount(() => {
     <a-layout class="file-manager">
       <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
            窗控按钮是 clickable 标签，drag.js 会自动豁免 -->
-      <div class="bar" data-tauri-drag-region="deep">
+      <div class="bar" :class="{ 'bar--mac': mac }" data-tauri-drag-region="deep">
         <span class="title">{{ host ? host.label : '文件管理' }}</span>
         <span class="subtitle">{{ subtitle }}</span>
         <!-- 和标签栏同一个点：a-tag 的 green 是组件库预设色，跟 --ok 不是一套，
              同一件事在两个窗口里会给出两种绿 -->
         <span class="status"><span class="dot" :class="conn !== null ? 'ok' : 'down'" />{{ conn !== null ? '已连接' : '未连接' }}</span>
         <span class="spacer" />
-        <WindowControls />
+        <WindowControls v-if="!mac" />
       </div>
 
       <div class="panes">
@@ -390,6 +395,13 @@ onBeforeUnmount(() => {
   background: var(--bg-surface);
   border-bottom: 1px solid var(--line);
   flex: none;
+}
+
+/* 与主窗口同一个度量：32px 让内容中线落在红绿灯那条线上（原生灯位挪不动，见 App.vue），
+   78px 让出灯组 */
+.bar--mac {
+  height: 32px;
+  padding-left: 78px;
 }
 
 .spacer {

@@ -237,6 +237,9 @@ pub fn open_with_impl(path: String) -> Result<(), IpcError> {
 /// 去边框（标题栏由 `FileManager.vue` 自绘）配 `shadow(true)` 显式写出来：这个组合
 /// 在 Windows 上是 tao 的「with_undecorated_shadow」模式，DWM 阴影与左右/下边缘的
 /// 原生缩放都保留，只把顶部那条留给 tauri-runtime-wry 的 resize helper。
+///
+/// macOS 是另一套：原生 Overlay 标题栏 + 红绿灯，绿灯那颗就是全屏。见
+/// `with_platform_chrome` 与 `tauri.macos.conf.json`（主窗口在配置里，这里是运行期建的窗口）。
 pub fn open_file_window_impl(app: &AppHandle, host_id: HostId) -> Result<(), IpcError> {
     let label = format!("{FILE_WINDOW_PREFIX}{}", host_id.0);
     if let Some(window) = app.get_webview_window(&label) {
@@ -244,19 +247,42 @@ pub fn open_file_window_impl(app: &AppHandle, host_id: HostId) -> Result<(), Ipc
         let _ = window.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
         .title("dbhx 文件管理")
         .inner_size(1100.0, 700.0)
         .min_inner_size(760.0, 460.0)
         .resizable(true)
-        .decorations(false)
-        .shadow(true)
+        .shadow(true);
+    with_platform_chrome(builder)
         .build()
         .map_err(|e| {
             tracing::debug!(%e, "创建文件管理窗口失败");
             IpcError::new(ErrorCode::Internal, "无法打开文件管理窗口", false)
         })?;
     Ok(())
+}
+
+/// 窗口边框的平台差异。拆成两个 `#[cfg]` 函数而不是 `if cfg!(...)`：后者的两个分支
+/// 都要过编译，而 `title_bar_style` / `hidden_title` / `traffic_light_position` 在
+/// tao 上是 `#[cfg(target_os = "macos")]` 方法，在 Windows 上直接不存在。
+#[cfg(target_os = "macos")]
+fn with_platform_chrome<R: tauri::Runtime, M: Manager<R>>(
+    builder: WebviewWindowBuilder<'_, R, M>,
+) -> WebviewWindowBuilder<'_, R, M> {
+    builder
+        .decorations(true)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+    // 不设 traffic_light_position：macOS 26 实测 tao 的 inset 不生效（改 y 灯不动），
+    // 灯就停在系统默认位（32pt 标题栏居中）。前端工具栏因此在 mac 上收成 32px 去对齐，
+    // 见 `App.vue` 的 `.bar--mac`。
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_platform_chrome<R: tauri::Runtime, M: Manager<R>>(
+    builder: WebviewWindowBuilder<'_, R, M>,
+) -> WebviewWindowBuilder<'_, R, M> {
+    builder.decorations(false)
 }
 
 #[tauri::command]
