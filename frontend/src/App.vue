@@ -331,7 +331,9 @@ watch(() => settings.highlightRules, rules => { setHighlightRules(rules) }, { de
       <!-- 这条工具栏顶替了原生标题栏：整条是拖拽区（deep：子元素里也能拖），
            但按钮是 clickable 标签、drag.js 自动豁免，下拉没有可点击标签必须显式关 -->
       <a-layout-header class="bar" :class="{ 'bar--mac': mac }" data-tauri-drag-region="deep">
-        <span class="brand">dbhx shell</span>
+        <!-- mac 上这条就是原生标题栏，左边那截位置归红绿灯，再写一遍品牌名只是和
+             窗口标题重复；Windows 去边框、没有原生标题可依赖，所以留着 -->
+        <span v-if="!mac" class="brand">dbhx shell</span>
         <!-- 顶条只放图标 + tooltip：这五个动作天天按，文字标签把条带撑到一半宽，
              而窗口宽度是要留给终端的 -->
         <a-tooltip title="新建本机终端（Ctrl+T）">
