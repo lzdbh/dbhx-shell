@@ -229,7 +229,7 @@ pub enum HostKeyDecision {
 /// 上一轮据「PATCH 回 200」记下了「Gitee 更新用平铺 `filename`+`content`」，
 /// 这轮把内容长度做成可辨认的标记重测，发现那种写法回 200 却一个字也没改进云端，
 /// 真正生效的是和创建一样的 `files` 哈希。文档抄错的第三方教程就是这么来的。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     /// GitHub Gist。**实测 `public:false` 也是匿名可读的**，所以云端那份密文要按

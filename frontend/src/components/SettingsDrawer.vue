@@ -36,6 +36,10 @@ const PROVIDERS: { value: ProviderKind, label: string }[] = [
   { value: 'gitee', label: 'Gitee' },
 ]
 
+function providerLabel(provider: ProviderKind): string {
+  return PROVIDERS.find(p => p.value === provider)?.label ?? provider
+}
+
 /** 自动上锁的候选时长（分钟）。0 是「关闭」，放在选择器里而不是开关，好让「多久」和「开不开」是一件事。 */
 const IDLE_OPTIONS = [
   { value: 0, label: '不自动锁定' },
@@ -229,16 +233,28 @@ async function forgetSyncFragment(): Promise<void> {
 }
 
 /**
- * 换目的地。切之前先把「有没有跟着片段」记下来：后端在换家那一刻会连同基线
- * 一起清掉坐标，界面必须把这件事说出来，否则用户以为切回去 id 还在。
+ * 换到另一家。后端把四样配置（同步串、令牌、片段 id、基线）按家各存一份，
+ * 所以这里只是换了个槽位读：切走不清任何东西，切回来原样还在。
+ *
+ * 展开着的输入行要收掉 —— 那串东西是为上一家准备的，留在屏幕上等于下一次
+ * 点「保存」就把它贴进了另一家的槽位。
  */
 async function switchProvider(provider: ProviderKind): Promise<void> {
-  const dropped = sync.status?.fragment_id
+  const wasConfigured = sync.status?.has_sync_str || sync.status?.has_token || sync.status?.fragment_id
   if (!(await sync.setProvider(provider))) {
     messageApi.error(sync.error ?? '切换失败')
     return
   }
-  if (dropped) messageApi.warning(`已切到另一家，原来跟着的片段 ${dropped} 已经清空，要重新填 id`)
+  editStr.value = false
+  editToken.value = false
+  editFragment.value = false
+  syncStr.value = ''
+  syncToken.value = ''
+  syncFragment.value = ''
+  const after = sync.status
+  if (after && wasConfigured && !after.has_sync_str && !after.has_token && !after.fragment_id) {
+    messageApi.info(`已切到${providerLabel(provider)}：这一家在这台设备上还没配过，切回另一家时那一份原样还在`)
+  }
 }
 
 /** 勾不勾都当场落盘并回读：它决定推上去的那份里到底有没有私钥，不能只改界面。 */
@@ -660,7 +676,7 @@ function splitPattern(pattern: string): { host: string, port: number } {
                   存到哪一家
                 </div>
                 <div class="row-hint">
-                  换一家会清空当前跟着的片段 id
+                  两家各存一份配置，切走再切回来都原样还在
                 </div>
               </div>
               <div class="row-ctl">

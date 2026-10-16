@@ -22,7 +22,11 @@ use crate::sync::DerivedKey;
 /// v1 → v2（2026-10-15，为云同步做的改动）：加 `tombstones` 与 `device_id`。
 /// 没有删除标记的话，A 上删掉的主机会从 B 上次同步的快照里原样复活——
 /// 这是同步功能里最容易被当成「云端坏了」的那类 bug，而且只在第二台设备上出现。
-const DOC_VERSION: u32 = 2;
+///
+/// v2 → v3（2026-10-16）：单槽的同步配置换成按家分槽的 `sync_profiles`。
+/// 老结构里同步串、令牌、片段坐标、基线各只有一份，换一家就得把另一家的清掉，
+/// 切回去还得重贴 —— 用户报的「切换 github 和 gitee，数据没有做隔离和还原」就是这个。
+const DOC_VERSION: u32 = 3;
 
 /// 删除标记挂在哪一类记录上。合并时按 `(kind, id)` 配对。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,23 +102,47 @@ struct VaultDoc {
     /// 本机安装标识，首次写盘时生成后固定不变。合并时跨设备定序用它。
     #[serde(default)]
     device_id: String,
-    /// 云同步串的密文条目。`None` 表示这台设备还没配过同步。
+    /// 每台云端服务各一份的同步配置，键就是那一家。
+    ///
+    /// 为什么要分槽：同步串、令牌、片段坐标、基线这四样**全都属于某一家** ——
+    /// GitHub 的串解不开 Gitee 的片段，Gitee 的令牌在 api.github.com 上只是一张废条。
+    /// 合成一份的话，换家只有「清掉」这一条路可走，于是切回去等于从零配置。
     #[serde(default)]
-    sync_str: Option<SecretId>,
-    /// 云端令牌的密文条目。和 `sync_str` 分开存：换令牌不该把同步串也弄丢，
-    /// 反过来配新令牌时也不该逼用户重贴那串 32 位字符。
-    #[serde(default)]
-    provider_token: Option<SecretId>,
-    /// 云端那一份的坐标（哪家服务 + 哪个片段）。明文存：它本身不是秘密，
-    /// 见 `dbhx_model::SyncTarget`。
-    #[serde(default)]
-    sync_target: Option<SyncTarget>,
-    /// 用户在设置里选的那一家。**必须和 `sync_target` 分开存**：片段坐标只有在
-    /// 第一次推送成功之后才存在，而「推给谁」这个决定在推送之前就要用到 ——
-    /// 只靠 `sync_target` 的话，Gitee 用户的第一次同步会默默建到 GitHub 上去。
-    /// 已有坐标时以坐标里那一家为准（那个 id 只在其所属的那家有效）。
+    sync_profiles: BTreeMap<ProviderKind, SyncProfile>,
+    /// 当前生效的那一家，也就是上面那个 map 的键。`None` = 还没选过，按 GitHub 算
+    /// （v2 及以前只有那一家能用，老库升级后不该突然变成没配过）。
+    /// 它必须单独存着：片段坐标只有在第一次推送成功之后才存在，而「推给谁」这个
+    /// 决定在推送之前就要用到 —— 只靠坐标的话，Gitee 用户的第一次同步会默默建到 GitHub 上去。
     #[serde(default)]
     sync_provider: Option<ProviderKind>,
+    /// 「同步私钥」开关，默认关。存在 vault 而不是前端偏好里：它决定推上去的那份
+    /// 里到底有没有私钥，属于「这台设备怎么同步」的一部分——重装或换设备之后
+    /// 悄悄回到默认值，等于让用户以为老样子，实际推上去的内容少了一整块。
+    /// 这一项**不按家分**：勾它说的是「我愿不愿意让私钥离开这台机器」，跟去哪一家无关。
+    #[serde(default)]
+    sync_private_keys: bool,
+    // ---- 以下四样是 v2 的单槽遗留字段：只为读老文件而存在，迁移后一律是 None，
+    // 靠 `skip_serializing_if` 保证它们再也写不回盘上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_str: Option<SecretId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_token: Option<SecretId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_target: Option<SyncTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_base: Option<String>,
+}
+
+/// 一家的同步配置。字段含义见 `VaultDoc` 上原来的注释：同步串与令牌是密文条目 id，
+/// 分开存是因为换令牌不该把同步串也弄丢，反过来也不该逼用户重贴那 32 个字符。
+///
+/// 片段只存 id 不存 `SyncTarget`：那一家就是这个 map 的键，写两遍就有对不上的一天 ——
+/// 而「坐标里的 provider 和选的那家不一致」正是老结构要靠清字段来防的那种状态。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SyncProfile {
+    sync_str: Option<SecretId>,
+    provider_token: Option<SecretId>,
+    fragment_id: Option<String>,
     /// 上一次同步完成时**本地这份快照**的副本，用本机主密钥密封。
     ///
     /// 它是三方合并的**基线**：没有基线就只能整库定胜负，那正是合并最容易
@@ -122,13 +150,9 @@ struct VaultDoc {
     /// 而合并每次同步都要读基线一回 —— 存 blob 等于每次同步多付一次 Argon2id（实测 5s）。
     /// 换成用本机密钥封的快照之后，读基线跟读一条普通密文一样便宜。
     /// 安全性没有额外损失：拿到它和拿到云端那一份等价，都需要同步串才能解。
-    #[serde(default)]
-    sync_base: Option<String>,
-    /// 「同步私钥」开关，默认关。存在 vault 而不是前端偏好里：它决定推上去的那份
-    /// 里到底有没有私钥，属于「这台设备怎么同步」的一部分——重装或换设备之后
-    /// 悄悄回到默认值，等于让用户以为老样子，实际推上去的内容少了一整块。
-    #[serde(default)]
-    sync_private_keys: bool,
+    ///
+    /// 基线也必须按家存：它说的是「这一家的云上现在就是这一份」。
+    base: Option<String>,
 }
 
 fn current_version() -> u32 {
@@ -139,13 +163,34 @@ impl VaultDoc {
     /// 把老版本升到当前结构。返回**是否改动过**，改动意味着必须落盘——
     /// `device_id` 这类字段每进程换一个，跨设备定序就成了掷骰子。
     ///
-    /// 迁移必须逐级做（v1→v2→v3…），不能一步跳：将来加 v3 时，
-    /// 这里要保证 v1 的文件也能把 v2 该补的东西补上。
+    /// 每一段都必须能接住「从更早的版本一路升上来」：v1 的文件也要把 v2、v3 该补的补上，
+    /// 所以按 `version < N` 逐级做，不能一步跳。
     fn migrate_to_current(&mut self) -> bool {
         let mut changed = false;
-        if self.version < 2 {
-            if self.device_id.is_empty() {
-                self.device_id = new_id();
+        // 空设备号就补，**不看版本号**：这段原先挂在 `version < 2` 下面，于是每个新装的
+        // 本机（版本号天生是最新的）都带着空 id 去同步 —— 跨设备定序和墓碑归属都会退化成
+        // 「大家都叫同一个名字」。新建的空库也走这条路径，第一次落盘时把它固定下来。
+        if self.device_id.is_empty() {
+            self.device_id = new_id();
+            changed = true;
+        }
+        if self.version < 3 {
+            // 单槽配置搬进那一家名下的槽位。归属取「选的那家」，没有选过就看坐标里
+            // 那一家，再没有就是 GitHub —— 必须和 v2 代码里 `provider_of` 的取法逐字一致，
+            // 否则升级完的第一次同步会去一个空槽位里找，症状是「配好了却说没配」。
+            let provider = legacy_provider(self.sync_provider, self.sync_target.as_ref());
+            let legacy = SyncProfile {
+                sync_str: self.sync_str.take(),
+                provider_token: self.provider_token.take(),
+                fragment_id: self.sync_target.take().map(|t| t.id),
+                base: self.sync_base.take(),
+            };
+            let has_anything = legacy.sync_str.is_some()
+                || legacy.provider_token.is_some()
+                || legacy.fragment_id.is_some()
+                || legacy.base.is_some();
+            if has_anything {
+                *self.sync_profiles.entry(provider).or_default() = legacy;
                 changed = true;
             }
         }
@@ -155,6 +200,14 @@ impl VaultDoc {
         }
         changed
     }
+}
+
+/// 老那一份单槽配置属于哪家：选过就用选的，否则看片段坐标里那一家，否则 GitHub。
+/// v2 的 `provider_of` 就是这么取的，迁移必须沿用同一个口径，两边才会指向同一个槽位。
+fn legacy_provider(chosen: Option<ProviderKind>, target: Option<&SyncTarget>) -> ProviderKind {
+    chosen
+        .or_else(|| target.map(|t| t.provider))
+        .unwrap_or(ProviderKind::GitHub)
 }
 
 /// 加密 vault。`path` 是文档落盘位置，`dirty` 让「只读查询」不必重写文件。
@@ -479,12 +532,16 @@ impl Vault {
         if self.doc.lock_pin.as_ref() == Some(secret_id) {
             n += 1;
         }
-        // 同步串和 PIN 同理：没有任何主机引用它，但它绝不能被回收逻辑当成孤儿
-        if self.doc.sync_str.as_ref() == Some(secret_id) {
-            n += 1;
-        }
-        if self.doc.provider_token.as_ref() == Some(secret_id) {
-            n += 1;
+        // 同步串和 PIN 同理：没有任何主机引用它，但它绝不能被回收逻辑当成孤儿。
+        // 必须遍历**所有**槽位：切到另一家不等于把这一家的凭据丢了，
+        // 只数当前那一家会让切走之后的第一次落盘顺手删掉它。
+        for profile in self.doc.sync_profiles.values() {
+            if profile.sync_str.as_ref() == Some(secret_id) {
+                n += 1;
+            }
+            if profile.provider_token.as_ref() == Some(secret_id) {
+                n += 1;
+            }
         }
         n
     }
@@ -558,18 +615,34 @@ impl Vault {
 
     // ---- 云同步 ----
 
+    /// 这一次读写落在哪家名下。设置里换一家，后面所有 accessor 就都换到另一槽，
+    /// 于是「切走再切回来」看到的是同四样东西，而不是被清空后的空槽。
+    pub fn sync_provider(&self) -> ProviderKind {
+        self.doc.sync_provider.unwrap_or(ProviderKind::GitHub)
+    }
+
+    /// 生效那一家的配置。`None` = 那一家还没配过任何东西。
+    fn profile(&self) -> Option<&SyncProfile> {
+        self.doc.sync_profiles.get(&self.sync_provider())
+    }
+
+    /// 同上，写路径用：没有就当场建一个空槽。
+    fn profile_mut(&mut self) -> &mut SyncProfile {
+        let provider = self.sync_provider();
+        self.doc.sync_profiles.entry(provider).or_default()
+    }
+
     /// 这台设备存过的同步串（归一化后的那一版）。明文只在回调里存在。
     pub fn with_sync_str<T>(&self, f: impl FnOnce(&[u8]) -> Result<T, VaultError>) -> Result<T, VaultError> {
         let id = self
-            .doc
-            .sync_str
-            .clone()
+            .profile()
+            .and_then(|p| p.sync_str.clone())
             .ok_or_else(|| VaultError::NotFound("sync string".into()))?;
         self.with_secret(&id, f)
     }
 
     pub fn has_sync_str(&self) -> bool {
-        self.doc.sync_str.is_some()
+        self.profile().is_some_and(|p| p.sync_str.is_some())
     }
 
     /// 存下同步串。**传入的必须是 `envelope::normalize` 之后的形式**：
@@ -578,22 +651,34 @@ impl Vault {
     /// 换串必须连基线一起丢：基线是从老那把锁的底子转封来的，新串对不上它，
     /// 留着等于让下一次合并拿一份认不出的数据定胜负。
     pub fn set_sync_str(&mut self, sync_str: &[u8]) -> Result<(), VaultError> {
-        let old = self.doc.sync_str.take();
+        let provider = self.sync_provider();
+        let old = self
+            .doc
+            .sync_profiles
+            .get(&provider)
+            .and_then(|p| p.sync_str.clone());
         let id = self.put_secret(SecretKind::SyncStr, sync_str)?;
-        self.doc.sync_str = Some(id);
+        {
+            let profile = self.profile_mut();
+            profile.sync_str = Some(id);
+            profile.base = None;
+        }
         if let Some(old) = old {
             self.doc.secrets.remove(&old.0);
         }
-        self.doc.sync_base = None;
         self.dirty = true;
         Ok(())
     }
 
-    /// 忘记这台设备上的同步串。不动云端那份数据，也不动基线之外的任何东西。
+    /// 忘记这台设备上的同步串。不动云端那份数据，也不动这一家之外的任何东西。
     pub fn clear_sync_str(&mut self) {
-        if let Some(old) = self.doc.sync_str.take() {
+        let provider = self.sync_provider();
+        let Some(profile) = self.doc.sync_profiles.get_mut(&provider) else {
+            return;
+        };
+        if let Some(old) = profile.sync_str.take() {
             self.doc.secrets.remove(&old.0);
-            self.doc.sync_base = None;
+            profile.base = None;
             self.dirty = true;
         }
     }
@@ -601,7 +686,7 @@ impl Vault {
     /// 这台设备配过云端令牌吗。UI 只显示「已配置」，永远拿不到值 ——
     /// 令牌出库只发生在 `with_provider_token` 的回调里，而那个回调不出进程。
     pub fn has_provider_token(&self) -> bool {
-        self.doc.provider_token.is_some()
+        self.profile().is_some_and(|p| p.provider_token.is_some())
     }
 
     pub fn with_provider_token<T>(
@@ -609,17 +694,21 @@ impl Vault {
         f: impl FnOnce(&[u8]) -> Result<T, VaultError>,
     ) -> Result<T, VaultError> {
         let id = self
-            .doc
-            .provider_token
-            .clone()
+            .profile()
+            .and_then(|p| p.provider_token.clone())
             .ok_or_else(|| VaultError::NotFound("provider token".into()))?;
         self.with_secret(&id, f)
     }
 
     pub fn set_provider_token(&mut self, token: &[u8]) -> Result<(), VaultError> {
-        let old = self.doc.provider_token.take();
+        let provider = self.sync_provider();
+        let old = self
+            .doc
+            .sync_profiles
+            .get(&provider)
+            .and_then(|p| p.provider_token.clone());
         let id = self.put_secret(SecretKind::ProviderToken, token)?;
-        self.doc.provider_token = Some(id);
+        self.profile_mut().provider_token = Some(id);
         if let Some(old) = old {
             self.doc.secrets.remove(&old.0);
         }
@@ -628,15 +717,26 @@ impl Vault {
     }
 
     pub fn clear_provider_token(&mut self) {
-        if let Some(old) = self.doc.provider_token.take() {
+        let provider = self.sync_provider();
+        let Some(profile) = self.doc.sync_profiles.get_mut(&provider) else {
+            return;
+        };
+        if let Some(old) = profile.provider_token.take() {
             self.doc.secrets.remove(&old.0);
             self.dirty = true;
         }
     }
 
-    /// 云端那一份的坐标。`None` = 还没在上面建过片段。
-    pub fn sync_target(&self) -> Option<&SyncTarget> {
-        self.doc.sync_target.as_ref()
+    /// 云端那一份的坐标。`None` = 这一家还没建过片段。
+    ///
+    /// 里面的 `provider` 是当场补上去的（槽位 key 就是那一家），所以这个字段
+    /// 不可能再出现「坐标说的是 gitee、选的是 github」这种自相矛盾的状态。
+    pub fn sync_target(&self) -> Option<SyncTarget> {
+        let provider = self.sync_provider();
+        self.profile()?
+            .fragment_id
+            .clone()
+            .map(|id| SyncTarget { provider, id })
     }
 
     /// 记下云端坐标。**坐标一变，基线必须一起作废**：基线说的是「云上现在就是这一份」，
@@ -645,35 +745,25 @@ impl Vault {
     /// 设备始终拉到老数据」，而界面上一切正常。
     ///
     /// 同 id 重复设置不触发清除，所以 `sync_once` 每次推完照常刷新基线。
+    /// 传进来的 `provider` 不参与判断：这一家之外的槽位不由这里改。
     pub fn set_sync_target(&mut self, target: Option<SyncTarget>) {
-        if self.doc.sync_target != target {
-            self.doc.sync_target = target;
-            self.doc.sync_base = None;
+        let next = target.map(|t| t.id);
+        let profile = self.profile_mut();
+        if profile.fragment_id != next {
+            profile.fragment_id = next;
+            profile.base = None;
             self.dirty = true;
         }
     }
 
-    /// 设置里选的那一家。`None` = 还没选过。
-    ///
-    /// 与 `sync_target` 的关系：坐标里那一家优先（那个 id 只在那一处解得开），
-    /// 这个字段只在**还没有坐标**时起作用，决定第一次推送把片段建到哪家。
-    pub fn sync_provider(&self) -> Option<ProviderKind> {
-        self.doc.sync_provider
-    }
-
-    /// 换一家。带着别家的片段坐标换家没有意义（那个 id 在另一处根本解不开），
-    /// 所以顺手把坐标清掉，**基线也一起清**：基线说的是「云上现在就是这一份」，
-    /// 新那家还没有那一份；留着它，下一次同步会把「本地还没推上去」误判成
-    /// 「两边已经一致」，于是永远不去新那家建片段。
+    /// 换到另一家。**只做这一件事**：四样配置本来就各存各的槽位，切走不必清、
+    /// 切回来自动就是原来那一份 —— v2 在这里清坐标和基线，正是用户报的
+    /// 「切换 github 和 gitee，数据没有做隔离和还原」。
     pub fn set_sync_provider(&mut self, provider: ProviderKind) {
         if self.doc.sync_provider == Some(provider) {
             return;
         }
         self.doc.sync_provider = Some(provider);
-        if self.doc.sync_target.as_ref().map(|t| t.provider) != Some(provider) {
-            self.doc.sync_target = None;
-            self.doc.sync_base = None;
-        }
         self.dirty = true;
     }
 
@@ -692,7 +782,7 @@ impl Vault {
     /// 上一次同步的基线快照。解不开时返回 `Err`：调用方可以按「没有基线」继续合并
     /// （结论会变保守，不会静默丢数据），但不能当成「本来就没有」直接盖过去。
     pub fn sync_base(&self) -> Result<Option<SyncSnapshot>, VaultError> {
-        let Some(text) = self.doc.sync_base.as_deref() else {
+        let Some(text) = self.profile().and_then(|p| p.base.as_deref()) else {
             return Ok(None);
         };
         let sealed = base64_decode(text)
@@ -706,7 +796,9 @@ impl Vault {
         Ok(Some(snap))
     }
 
-    /// 记下「这次同步完成时本地是哪一份」。`None` 清空基线（换云端目标时用）。
+    /// 记下「这次同步完成时本地是哪一份」，写在当前那一家名下。
+    ///
+    /// `None` 清空：换片段坐标时由 `set_sync_target` 自己清，这里不给第二条路。
     pub fn set_sync_base(&mut self, snap: Option<&SyncSnapshot>) -> Result<(), VaultError> {
         let next = match snap {
             None => None,
@@ -716,8 +808,9 @@ impl Vault {
                 Some(base64_encode(&seal(&self.key, &json)?))
             }
         };
-        if self.doc.sync_base != next {
-            self.doc.sync_base = next;
+        let profile = self.profile_mut();
+        if profile.base != next {
+            profile.base = next;
             self.dirty = true;
         }
         Ok(())
@@ -1508,10 +1601,10 @@ mod tests {
     }
 
     /// 选的那一家要能单独落盘：第一次推送成功之前云上还没有坐标，那时唯一记得住的就是这个选择。
-    /// 换成另一家时坐标与基线一起作废 —— 那个 id 在新那家根本解不开，而留着基线会让
-    /// 下一次同步把「还没推」读成「已经一致」。
+    /// 换家只是换个槽位读 —— 另一家的坐标与基线**必须原样留着**：那个 id 在新那家根本解不开，
+    /// 可切回去时它又是唯一还能用的坐标。
     #[test]
-    fn the_chosen_provider_survives_a_reopen_and_a_switch_voids_the_old_fragment() {
+    fn each_provider_slot_keeps_its_own_fragment_and_baseline() {
         let dir = temp_dir("provider-choice");
         let key_path = dir.join("master.key");
         let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
@@ -1519,24 +1612,98 @@ mod tests {
         assert!(v.sync_target().is_none(), "还没建过片段时不该凭空冒出坐标");
         let hid = v.upsert_host(host("一台"));
         v.set_host_password(&hid, b"pw").unwrap();
-        let base = v.local_snapshot(false).unwrap();
-        v.set_sync_base(Some(&base)).unwrap();
+        // 顺序照 `sync_once`：先记坐标，再落基线 —— 反过来写的话坐标一变就把基线清了
         v.set_sync_target(Some(SyncTarget {
             provider: dbhx_model::ProviderKind::Gitee,
             id: "3d0rmjto24pfie6bawxsu73".into(),
         }));
+        let base = v.local_snapshot(false).unwrap();
+        v.set_sync_base(Some(&base)).unwrap();
         // 重复选同一家不该把已经建好的坐标抹掉：那只是用户把下拉框点回原处
         v.set_sync_provider(dbhx_model::ProviderKind::Gitee);
-        assert_eq!(v.sync_target().map(|t| t.id.as_str()), Some("3d0rmjto24pfie6bawxsu73"));
+        assert_eq!(v.sync_target().map(|t| t.id).as_deref(), Some("3d0rmjto24pfie6bawxsu73"));
         v.flush().unwrap();
         drop(v);
 
         let mut reopened = Vault::open(&dir, KeySource::File(key_path)).unwrap();
-        assert_eq!(reopened.sync_provider(), Some(dbhx_model::ProviderKind::Gitee), "选的一家没存住");
+        assert_eq!(reopened.sync_provider(), dbhx_model::ProviderKind::Gitee, "选的一家没存住");
         reopened.set_sync_provider(dbhx_model::ProviderKind::GitHub);
-        assert!(reopened.sync_target().is_none(), "换家之后还留着 gitee 的 id，下一次会把它拼进 github 的地址");
-        assert!(reopened.sync_base().unwrap().is_none(), "换家之后留着基线，下一次同步会把「还没推」当成「已经一致」");
+        assert!(reopened.sync_target().is_none(), "github 那一格本来就是空的，gitee 的 id 不该跟着过来");
+        assert!(reopened.sync_base().unwrap().is_none(), "基线也是按家存的，切到没同步过的那家等于没有基线");
+        reopened.set_sync_provider(dbhx_model::ProviderKind::Gitee);
+        assert_eq!(reopened.sync_target().map(|t| t.id).as_deref(), Some("3d0rmjto24pfie6bawxsu73"), "切回去坐标却没了");
+        assert!(reopened.sync_base().unwrap().is_some(), "切回去基线也没了，下一次同步会白推一次");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 老库（v2 那四样单槽字段）必须原地搬到它所属那一家名下，而且搬完就不再写回盘：
+    /// 迁移口径要和 v2 的 `provider_of` 一致，否则升级完第一次点同步就报「没配过」。
+    #[test]
+    fn a_v2_vault_moves_its_single_sync_slot_under_the_right_provider() {
+        for chosen in [None, Some(dbhx_model::ProviderKind::Gitee)] {
+            let dir = temp_dir("migrate-sync");
+            let key_path = dir.join("master.key");
+            let key = KeySource::File(key_path.clone()).load_or_create().unwrap();
+            {
+                let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
+                // 先定哪家再配凭据 —— 和设置抽屉里的顺序一致，四样才会落进同一个槽位
+                if let Some(c) = chosen {
+                    v.set_sync_provider(c);
+                }
+                v.set_sync_str(b"0123456789abcdefghijKLMNOPqrst").unwrap();
+                v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+                // v2 里换家会清坐标，所以「选了 gitee + 坐标写着 gitee」才是真实的老状态
+                v.set_sync_target(Some(SyncTarget {
+                    provider: chosen.unwrap_or(dbhx_model::ProviderKind::GitHub),
+                    id: "deadbeef".into(),
+                }));
+                let base = v.local_snapshot(false).unwrap();
+                v.set_sync_base(Some(&base)).unwrap();
+                v.flush().unwrap();
+            }
+            // 把手上的文档倒回 v2 形状：版本号改回 2，四样重新摊平回单槽字段，槽位清空。
+            // 从**真写出来过的** v3 文档反推，比手写一份 v2 JSON 更接近真实老库。
+            let raw = base64_decode(&String::from_utf8(std::fs::read(dir.join("vault.json")).unwrap()).unwrap()).unwrap();
+            let mut doc: serde_json::Value = serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
+            doc["version"] = serde_json::json!(2u32);
+            let obj = doc.as_object_mut().unwrap();
+            let profiles = obj.remove("sync_profiles").unwrap_or(serde_json::json!({}));
+            let key_name = obj
+                .get("sync_provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("github")
+                .to_string();
+            let profile = profiles.get(&key_name).cloned().unwrap_or(serde_json::json!({}));
+            obj.insert("sync_str".into(), profile["sync_str"].clone());
+            obj.insert("provider_token".into(), profile["provider_token"].clone());
+            obj.insert("sync_base".into(), profile["base"].clone());
+            obj.insert(
+                "sync_target".into(),
+                profile["fragment_id"]
+                    .as_str()
+                    .map(|id| serde_json::json!({ "provider": key_name, "id": id }))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            let sealed = seal(&key, &serde_json::to_vec(&doc).unwrap()).unwrap();
+            std::fs::write(dir.join("vault.json"), base64_encode(&sealed).as_bytes()).unwrap();
+
+            let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
+            let want = chosen.unwrap_or(dbhx_model::ProviderKind::GitHub);
+            assert_eq!(v.sync_provider(), want, "迁移不该改动用户选的那一家");
+            assert!(v.has_sync_str(), "{want:?} 那一格里应当躺着老那把串");
+            assert!(v.has_provider_token());
+            assert_eq!(v.sync_target().map(|t| t.id).as_deref(), Some("deadbeef"));
+            assert!(v.sync_base().unwrap().is_some(), "基线也得跟着搬过来，否则升完版第一次同步会白推");
+            v.flush().unwrap();
+            let raw = base64_decode(&String::from_utf8(std::fs::read(dir.join("vault.json")).unwrap()).unwrap()).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
+            assert_eq!(doc["version"], serde_json::json!(DOC_VERSION));
+            for gone in ["sync_str", "provider_token", "sync_target", "sync_base"] {
+                assert!(doc.get(gone).is_none(), "{gone} 是 v2 的单槽字段，升上来后不该再写回盘上");
+            }
+            assert!(doc["sync_profiles"].is_object(), "四样配置现在住在按家分的槽位里");
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     /// 「同步私钥」决定推上去的包里有没有私钥，必须跨重启记住：勾过一次、重装之后
@@ -1612,6 +1779,25 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// 新装的库也得有自己的设备号。它原先只在 `version < 2` 的分支里补，
+    /// 而新建的库版本号天生是最新的 —— 于是每个新装的本机都带着空号去同步，
+    /// 跨设备定序和墓碑归属都退化成「大家都叫同一个名字」。
+    #[test]
+    fn a_brand_new_vault_gets_one_device_id_and_keeps_it() {
+        let dir = temp_dir("new-device-id");
+        let key_path = dir.join("master.key");
+        let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
+        let first = v.device_id().to_string();
+        assert!(!first.is_empty(), "新库没设备号，之后推上去的墓碑就没人认领");
+        let hid = v.upsert_host(host("一台"));
+        v.set_host_password(&hid, b"pw").unwrap();
+        v.flush().unwrap();
+        drop(v);
+
+        assert_eq!(Vault::open(&dir, KeySource::File(key_path)).unwrap().device_id(), first, "设备号换进程就变了");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// v1 老库（没有 device_id、没有删除标记、没有同步字段）必须原地升上来，
     /// 而且 `device_id` 只能生成一次——每进程换一个，跨设备定序就成了掷骰子。
     #[test]
@@ -1640,6 +1826,7 @@ mod tests {
             "sync_base",
             "sync_target",
             "sync_provider",
+            "sync_profiles",
             "provider_token",
         ] {
             doc.as_object_mut().unwrap().remove(gone);

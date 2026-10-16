@@ -16,7 +16,7 @@
 //!   而整个片段删除是真删：删完再读是 404），所以两家一律按「旧密文会留着」设防 ——
 //!   多换一次盐不要钱，漏设防要钱。
 
-use dbhx_model::{ProviderKind, SyncTarget};
+use dbhx_model::SyncTarget;
 use dbhx_vault::envelope;
 use dbhx_vault::snapshot::{MergeInput, MergePlan, MergePolicy, SyncSnapshot};
 use dbhx_vault::store::new_id;
@@ -124,14 +124,12 @@ pub async fn sync_once(
     let sync_str = vault.with_sync_str(|p| Ok(envelope::normalize(&String::from_utf8_lossy(p))))?;
     let token =
         vault.with_provider_token(|p| Ok(Zeroizing::new(String::from_utf8_lossy(p).into_owned())))?;
-    // 选的那一家优先。换家时 vault 会把别家的坐标连同基线一起清掉，
-    // 所以这里不会遇到「设置里选 Gitee、坐标却是 GitHub 的片段」这种没意义的组合。
-    let provider = vault
-        .sync_provider()
-        .or_else(|| vault.sync_target().map(|t| t.provider))
-        .unwrap_or(ProviderKind::GitHub);
-    let had_target = vault.sync_target().is_some();
-    let client = SyncClient::new(provider, vault.sync_target().map(|t| t.id.clone()), token);
+    // 这一家同时是 vault 里那份配置的**槽位号**：同步串、令牌、坐标、基线四样都从
+    // 同一个槽取，所以不会出现「设置里选 Gitee、坐标却是 GitHub 的片段」这种组合。
+    let provider = vault.sync_provider();
+    let target = vault.sync_target();
+    let had_target = target.is_some();
+    let client = SyncClient::new(provider, target.map(|t| t.id), token);
 
     // 基线读不出来就按「没有基线」继续：合并结论会变保守（宁可转存冲突副本），
     // 但绝不能把它当成「本来就没有」，那等于允许新设备直接盖掉云上那一份。
@@ -263,7 +261,7 @@ mod tests {
     use crate::wire::{Method, Response, WireError};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use dbhx_model::{AuthMode, Endpoint, HostId, HostRecord, OsType, Protocol, TerminalEncoding};
+    use dbhx_model::{AuthMode, Endpoint, HostId, HostRecord, OsType, Protocol, ProviderKind, TerminalEncoding};
     use dbhx_vault::{KeySource, MasterKey};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -387,6 +385,13 @@ mod tests {
         v
     }
 
+    /// 把**当前生效那一家**名下的凭据配齐。换家之后必须重新走这一步：
+    /// 同步串与令牌各按各的家存着，切过去不等于把另一家的搬过来。
+    fn arm_current_provider(v: &mut Vault) {
+        v.set_sync_str(SYNC_STR.as_bytes()).unwrap();
+        v.set_provider_token(FAKE_TOKEN).unwrap();
+    }
+
     fn gist_json(content: &str) -> serde_json::Value {
         serde_json::json!({
             "id": "abc123",
@@ -456,6 +461,9 @@ mod tests {
         let dir = temp_dir("gitee-first");
         let mut v = vault_with_host(&dir, "本机的一台");
         v.set_sync_provider(ProviderKind::Gitee);
+        // 凭据也按家存：切过去之后这一格还是空的，得配上才能同步 ——
+        // 这正是 `sync_once` 报 `not_configured` 的那条例程，不是 bug。
+        arm_current_provider(&mut v);
         let fake = Fake::new();
         fake.ok(serde_json::json!({ "id": "3d0rmjto24pfie6bawxsu73" }));
         let report = sync_once(&mut v, &fake, false).await.unwrap();
@@ -469,9 +477,12 @@ mod tests {
 
     /// 换家 = 换地方，不是把同一个 id 搬到另一台机器上去读。
     ///
-    /// 清掉坐标之后必须连基线一起清：基线说的是「云上现在就是这一份」，
-    /// 而新那家还没有那一份。留着它，下一次同步会把「还没推」读成「已经一致」，
-    /// 于是永远不去新那家建片段 —— 用户看到的现象是「点了同步，什么也没发生」。
+    /// 新那家本来就是空槽，所以第一次同步必须去建片段：留着老那家的坐标，
+    /// 拼出来的地址在另一台机器上根本读不开；留着老那家的基线，下一次同步会把
+    /// 「还没推」读成「已经一致」，于是永远不去新那家建片段 —— 用户看到的现象是
+    /// 「点了同步，什么也没发生」。
+    ///
+    /// 反过来切回老那家时，坐标与基线都得原样还在：那是用户唯一还能接上的那份历史。
     #[tokio::test]
     async fn switching_provider_moves_the_sync_to_the_new_host_instead_of_reusing_the_id() {
         let dir = temp_dir("switch-provider");
@@ -483,7 +494,8 @@ mod tests {
 
         v.set_sync_provider(ProviderKind::Gitee);
         assert!(v.sync_target().is_none(), "GitHub 那个片段 id 拼到 gitee.com 上根本读不开");
-        assert!(v.sync_base().unwrap().is_none(), "基线得跟着清掉，否则下一次同步以为已经一致");
+        assert!(v.sync_base().unwrap().is_none(), "新那家的槽位是空的，不该带着 github 的基线去同步");
+        arm_current_provider(&mut v);
 
         let fake = Fake::new();
         fake.ok(serde_json::json!({ "id": "3d0rmjto24pfie6bawxsu73" }));
@@ -491,6 +503,11 @@ mod tests {
         assert_eq!(report.outcome, SyncOutcome::Created, "换家之后第一次同步该在新那家建一份");
         assert_eq!(fake.methods(), vec![Method::Post], "换家只该建新的，不该去动老那家");
         assert_eq!(fake.last_url(), "https://gitee.com/api/v5/gists");
+
+        v.set_sync_provider(ProviderKind::GitHub);
+        assert_eq!(v.sync_target().map(|t| t.id).as_deref(), Some("deadbeef"), "切回 github 却找不到原来那个片段");
+        assert!(v.sync_base().unwrap().is_some(), "切回 github 基线却没了，下一次会白推一整份上去");
+        assert_eq!(v.sync_target().map(|t| t.provider), Some(ProviderKind::GitHub));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -649,7 +666,7 @@ mod tests {
         }
         let report = sync_once(&mut a, &transport, false).await.expect("A 首同步失败");
         assert_eq!(report.outcome, SyncOutcome::Created);
-        let target = a.sync_target().cloned().expect("没记下新建的片段坐标");
+        let target = a.sync_target().expect("没记下新建的片段坐标");
         assert_eq!(target.provider, provider, "编排层把新建的片段记到了另一家名下");
         b.set_sync_target(Some(target.clone()));
 

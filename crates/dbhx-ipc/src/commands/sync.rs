@@ -43,22 +43,15 @@ pub struct SyncStatus {
     pub hosts: usize,
 }
 
-/// 这台设备实际会同步到哪一家。取法必须与 `sync_once` 里逐字一致，
-/// 否则会出现「面板显示一家、请求打到另一家」。
-fn provider_of(vault: &dbhx_vault::Vault) -> ProviderKind {
-    vault
-        .sync_provider()
-        .or_else(|| vault.sync_target().map(|t| t.provider))
-        .unwrap_or(ProviderKind::GitHub)
-}
-
+/// 这台设备实际会同步到哪一家。它就是 vault 里那份配置的槽位号，
+/// 与 `sync_once` 取的是同一个 —— 取法只要分岔，就会出现「面板显示一家、请求打到另一家」。
 pub fn status_impl(core: &Core) -> SyncStatus {
     let vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
     SyncStatus {
-        provider: provider_of(&vault),
+        provider: vault.sync_provider(),
         has_sync_str: vault.has_sync_str(),
         has_token: vault.has_provider_token(),
-        fragment_id: vault.sync_target().map(|t| t.id.clone()),
+        fragment_id: vault.sync_target().map(|t| t.id),
         include_private_keys: vault.sync_private_keys(),
         hosts: vault.hosts().len(),
     }
@@ -108,7 +101,8 @@ pub fn set_token_impl(core: &Core, text: Option<Zeroizing<String>>) -> Result<()
     Ok(())
 }
 
-/// 选一家。换家时 vault 会把别家的坐标连同基线一起清掉，这里不必再补一刀。
+/// 换到另一家。四样配置本来就各存各的槽位，这里只改「读哪个槽」：
+/// 切走不清任何东西，切回来原样还在。
 ///
 /// 不吃 `require_unlocked`：它既不读出凭据也不改动凭据，只是换一个目的地。
 pub fn set_provider_impl(core: &Core, provider: ProviderKind) -> Result<(), IpcError> {
@@ -130,7 +124,7 @@ pub fn set_fragment_impl(core: &Core, id: Option<String>) -> Result<(), IpcError
                 false,
             ));
         }
-        Some(id) => Some(SyncTarget { provider: provider_of(&vault), id: id.to_string() }),
+        Some(id) => Some(SyncTarget { provider: vault.sync_provider(), id: id.to_string() }),
     };
     // 坐标一变，基线由 vault 一起作废；这里不留「只改 id」的旁路
     vault.set_sync_target(next);
@@ -416,18 +410,65 @@ mod tests {
         assert_eq!(status_impl(&core).fragment_id.as_deref(), Some("3d0rmjto24pfie6bawxsu73"));
     }
 
-    /// 换一家时坐标一起没掉，这是 vault 侧的规矩；命令层要保证界面看得见这件事，
-    /// 否则用户以为「切回去 id 还在」。
+    /// 两家各存各的一份：切到另一家看到的是一个空槽，切回来四样都还在。
+    /// 这条钉住的是用户报的那个现象 —— v2 的结构里换家会把另一家的坐标连同基线清掉，
+    /// 于是「切回去」等于从零重配。
     #[tokio::test]
-    async fn switching_provider_moves_the_fragment_with_it() {
+    async fn each_provider_keeps_its_own_config_when_switching_back() {
         let (core, _rx) = tests_harness("sync-switch", crate::state::fake_dialer());
         set_provider_impl(&core, ProviderKind::Gitee).unwrap();
+        set_str_impl(&core, Some(Zeroizing::new(SYNC_STR.into()))).unwrap();
+        set_token_impl(&core, Some(Zeroizing::new("gitee_token_FAKE".into()))).unwrap();
         set_fragment_impl(&core, Some("3d0rmjto24pfie6bawxsu73".into())).unwrap();
-        assert_eq!(status_impl(&core).provider, ProviderKind::Gitee);
+
+        set_provider_impl(&core, ProviderKind::GitHub).unwrap();
+        let github = status_impl(&core);
+        assert_eq!(github.provider, ProviderKind::GitHub);
+        assert!(!github.has_sync_str, "gitee 那把串不该出现在 github 的槽里");
+        assert!(!github.has_token);
+        assert!(github.fragment_id.is_none(), "gitee 的 id 拼到 github.com 上根本读不开");
+
+        // 在另一家重新配一遍，切回去时两边不能互相污染
+        set_str_impl(&core, Some(Zeroizing::new("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".into()))).unwrap();
+        set_token_impl(&core, Some(Zeroizing::new(TOKEN.into()))).unwrap();
+        set_provider_impl(&core, ProviderKind::Gitee).unwrap();
+        let back = status_impl(&core);
+        assert_eq!(back.provider, ProviderKind::Gitee);
+        assert!(back.has_sync_str, "切回 gitee 得还是原来那把串");
+        assert!(back.has_token, "切回 gitee 令牌也还在");
+        assert_eq!(back.fragment_id.as_deref(), Some("3d0rmjto24pfie6bawxsu73"));
+        // 布尔只说明「有东西」，值才对得上号：读出这一格里存的那把串
+        let revealed = core
+            .vault
+            .lock()
+            .unwrap()
+            .with_sync_str(|p| Ok(String::from_utf8(p.to_vec())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(revealed, SYNC_STR, "切回 gitee 拿到的却是 github 那把串，说明槽位没分开");
+
+        // 换过的另一家也不该被这次切换动过
         set_provider_impl(&core, ProviderKind::GitHub).unwrap();
         let status = status_impl(&core);
-        assert_eq!(status.provider, ProviderKind::GitHub);
-        assert!(status.fragment_id.is_none(), "gitee 的 id 不该留在切到 github 的配置里");
+        assert!(status.has_sync_str && status.has_token, "github 那份得自己留着");
+        assert!(status.fragment_id.is_none());
+    }
+
+    /// 换家必须连着落盘：光改内存里的选择，重启后又回到 GitHub 那个槽，
+    /// 用户会以为「配过的 gitee 又没了」。
+    #[tokio::test]
+    async fn the_choice_of_provider_survives_a_reopen() {
+        let (core, _rx) = tests_harness("sync-switch-persist", crate::state::fake_dialer());
+        set_provider_impl(&core, ProviderKind::Gitee).unwrap();
+        set_str_impl(&core, Some(Zeroizing::new(SYNC_STR.into()))).unwrap();
+        set_fragment_impl(&core, Some("3d0rmjto24pfie6bawxsu73".into())).unwrap();
+        let dir = core.dir().to_path_buf();
+        drop(core);
+        let reopened =
+            dbhx_vault::Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
+        assert_eq!(reopened.sync_provider(), ProviderKind::Gitee);
+        assert_eq!(reopened.sync_target().map(|t| t.id).as_deref(), Some("3d0rmjto24pfie6bawxsu73"));
+        assert!(reopened.has_sync_str());
     }
 
     #[tokio::test]
