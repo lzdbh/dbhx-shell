@@ -53,10 +53,14 @@ const groupOptions = computed(() => {
   return [...new Set(names)].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN')).map(name => ({ value: name, label: name }))
 })
 
-// tags 模式能顺手敲个新组名，但表单只留最后一个：保存的是主机身上的一个字段，不是一串标签
-watch(() => form.group, (next) => {
-  if (Array.isArray(next)) form.group = String(next[next.length - 1] ?? '').trim()
-})
+// tags 模式只吃数组：喂给它空串会被 normalize 成 `['']`，界面上就长出一个没有字的 × 标签。
+// 表单这里仍然只有一个组名，所以取最后一个，多余的不留。
+const groupTags = computed(() => (form.group ? [form.group] : []))
+
+function onGroupChange(next: unknown): void {
+  const last = Array.isArray(next) ? next[next.length - 1] : next
+  form.group = String(last ?? '').trim()
+}
 
 /**
  * 表单照着哪台机器灌。
@@ -185,11 +189,12 @@ async function revealStored(): Promise<void> {
       </a-form-item>
       <a-form-item label="分组">
         <a-select
-          v-model:value="form.group"
+          :value="groupTags"
           mode="tags"
           :options="groupOptions"
           placeholder="选择分组，可输入新建；留空表示未分组"
           allow-clear
+          @change="onGroupChange"
         />
       </a-form-item>
       <a-form-item label="协议">
