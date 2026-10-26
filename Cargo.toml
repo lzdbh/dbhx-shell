@@ -78,6 +78,15 @@ base64 = "0.22"
 # 交叉 cargo check 不需要目标平台的 C 工具链。
 arboard = { version = "3", default-features = false }
 
+# 原生「选目录」对话框：设置页的下载目录与日志目录。
+# 刻意关默认 feature：`wayland` 只为给对话框挂父窗口，我们不挂，却要把
+# wayland-client/protocols 那一整套拖进 linux 构建；另一条后端 `gtk3` 要 pkg-config +
+# C 工具链，交叉 cargo check 矩阵立刻崩（同上面 rusqlite/arboard 那两处理由）。
+# 只留 `xdg-portal`：它在运行时 dlopen `libdbus-1.so`，编译期零 C 依赖，没装 portal 的
+# 机器上 rfd 自己退到 zenity。这两个 feature 一个都不开时 rfd 的 build.rs 直接 panic，
+# 所以 `xdg-portal` 不能删。
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
 # IPC 类型生成：tauri-specta 对 Tauri 2 的支持仍在 rc 线，
 # 且 specta 必须与 tauri-specta 的 rc 号严格对齐，勿单独升级
 tauri = { version = "2", features = [] }

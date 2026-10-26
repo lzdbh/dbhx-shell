@@ -426,8 +426,8 @@ export const useFilesStore = defineStore('files', () => {
    *
    * `dir` 省略时落到设置里的下载目录（内嵌面板的老行为）；双栏文件窗口会显式传本机栏
    * 的当前目录，让「下载」就是把右边选中的东西放到左边正看着的那个文件夹。
-   * 没有用系统保存对话框：那需要 `tauri-plugin-dialog`（Cargo 依赖 + capabilities 授权 +
-   * npm 包三处同时加）。目录为空时直接给出可执行的提示，不静默失败。
+   * 下载这一步不弹系统保存框：一次批量下载弹 N 个框太吵，落点要么在设置里选好（那边有
+   * 「选择…」的原生对话框），要么就是本机栏正显示的目录。目录为空时给出可执行的提示，不静默失败。
    */
   async function download(connection: number, targets: string[], dir?: string): Promise<{ ok: boolean, error: string | null }> {
     const p = panels.get(connection)

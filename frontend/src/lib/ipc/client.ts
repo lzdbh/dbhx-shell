@@ -149,6 +149,11 @@ export const transferApi = {
 export const localApi = {
   home: () => unwrap(commands.localHome()),
   drives: () => commands.localDrives(),
+  /**
+   * 弹原生的「选择文件夹」对话框，取消返回 `null`（那不是错误，别 unwrap）。
+   * `startPath` 是对话框开在哪个目录，设置页把当前已存的值传进来。
+   */
+  pickDir: (startPath: string | null) => commands.localPickDir(startPath),
   list: (path: string | null) => unwrap(commands.localList(path)),
   mkdir: (path: string) => unwrap(commands.localMkdir(path)),
   /** 建空文件；同名会拒，绝不截断已有内容。 */

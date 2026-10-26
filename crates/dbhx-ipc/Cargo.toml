@@ -14,6 +14,8 @@ dbhx-sftp.workspace = true
 dbhx-ssh.workspace = true
 dbhx-sync.workspace = true
 dbhx-vault.workspace = true
+# 原生目录选择框，只给 local_pick_dir 用
+rfd.workspace = true
 # tauri::command / specta 的宏展开里直接引用了 ::serde 与 ::serde_json 路径，
 # 即使源码没有显式使用也不能删。
 serde.workspace = true

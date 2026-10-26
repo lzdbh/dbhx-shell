@@ -32,8 +32,11 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": [],
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "category": "DeveloperTool",
+    "shortDescription": "dbhx shell 远程终端",
+    "longDescription": "基于 Tauri 2 的 SSH / telnet 终端与 SFTP 文件管理客户端。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

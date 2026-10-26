@@ -71,6 +71,7 @@ export const commands = {
 	transferRunning: () => typedError<BatchInfo[], IpcError>(__TAURI_INVOKE("plugin:dbhx|transfer_running")),
 	localHome: () => typedError<string, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_home")),
 	localDrives: () => __TAURI_INVOKE<string[]>("plugin:dbhx|local_drives"),
+	localPickDir: (defaultPath: string | null) => __TAURI_INVOKE<string | null>("plugin:dbhx|local_pick_dir", { defaultPath }),
 	localList: (path: string | null) => typedError<DirListing, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_list", { path })),
 	localMkdir: (path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_mkdir", { path })),
 	localCreateFile: (path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_create_file", { path })),

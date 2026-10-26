@@ -54,6 +54,7 @@ fn main() {
                     "transfer_running",
                     "local_home",
                     "local_drives",
+                    "local_pick_dir",
                     "local_list",
                     "local_mkdir",
                     "local_create_file",

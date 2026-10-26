@@ -2,7 +2,8 @@
 //!
 //! 这里是唯一直接摸本机磁盘的命令层。之所以放会话层之外、单独成文件，是因为它
 //! 与 SSH/vault 毫无关系——它读的是用户自己机器上的目录，不碰任何凭据，也不进
-//! transport 池。前端的双栏文件窗口（本机 ↔ 远端）左半边就靠这一组命令。
+//! transport 池。前端的双栏文件窗口（本机 ↔ 远端）左半边就靠这一组命令，
+//! 设置页那两个目录输入框旁边的「选择…」也是（`local_pick_dir` 弹原生对话框）。
 //!
 //! 两条铁律沿用全项目约定：
 //! 1. **OS 的英文错误不外泄**。`std::io::Error` 的 Display 是英文（"Access is
@@ -113,6 +114,26 @@ pub fn home_impl() -> Result<String, IpcError> {
 /// 本机根级入口（盘符 / `/`）。
 pub fn drives_impl() -> Vec<String> {
     drive_roots()
+}
+
+/// 弹原生的「选择文件夹」对话框，回用户选中的绝对路径。取消就是 `None`，不是错误。
+///
+/// 起始目录优先用调用方传的那个——设置页把当前已存的值原样送进来，改目录时对话框就开在
+/// 用户正看着的地方；没传则回到家目录。路径不存在时不用额外判断：rfd 会自己回落到默认位置。
+///
+/// **必须 `async`**：这条要等用户在对话框里点下「选择」或「取消」为止，同步命令会把整条
+/// 事件循环钉在那儿——所有窗口的输入都停。
+pub async fn pick_dir_impl(default_path: Option<String>) -> Option<String> {
+    let start = default_path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(home_dir);
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("选择目录");
+    if let Some(dir) = start {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_folder().await.map(|picked| picked.path().display().to_string())
 }
 
 /// 列本机目录。`path` 为空时回到家目录。
@@ -295,6 +316,14 @@ pub async fn local_home() -> Result<String, IpcError> {
 #[specta::specta]
 pub async fn local_drives() -> Vec<String> {
     drives_impl()
+}
+
+// 这条命令壳刻意不写 doc comment（`///`）：它会原样进 bindings.ts 的 JSDoc，而对话框
+// 这条前端看一眼签名就懂了。async 的理由写在 `pick_dir_impl` 上。
+#[tauri::command]
+#[specta::specta]
+pub async fn local_pick_dir(default_path: Option<String>) -> Option<String> {
+    pick_dir_impl(default_path).await
 }
 
 #[tauri::command]

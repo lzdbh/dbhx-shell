@@ -12,7 +12,7 @@ import {
 } from '@ant-design/icons-vue'
 
 import { formatTime } from '@/lib/format'
-import { clipboardApi } from '@/lib/ipc/client'
+import { clipboardApi, localApi } from '@/lib/ipc/client'
 import type { ProviderKind } from '@/lib/ipc/bindings'
 import { lastSyncAgo, summarize } from '@/lib/syncSummary'
 import { useHostkeysStore } from '@/stores/hostkeys'
@@ -118,6 +118,8 @@ const editToken = ref(false)
 const editFragment = ref(false)
 const pinOpen = ref(false)
 const importOpen = ref(false)
+/** 正在等原生目录对话框的那一格：按钮转圈，顺带挡住重复点击。 */
+const pickingDir = ref<'downloadDir' | 'logDir' | null>(null)
 
 const lastText = computed(() => (sync.last ? summarize(sync.last) : '这台机器还没同步过'))
 const lastAgo = computed(() => lastSyncAgo(sync.lastSyncAt))
@@ -279,6 +281,24 @@ async function runSync(recreate = false): Promise<void> {
 
 function describe(e: unknown): string {
   return e && typeof e === 'object' && 'message' in e ? String((e as { message: unknown }).message) : '操作失败'
+}
+
+/**
+ * 弹系统原生的「选择文件夹」，把选中的绝对路径写进设置里那一格。
+ *
+ * 用户取消时后端回 `null`——那是正常收尾，已存的值原样留着，不清空。
+ * 起始目录用当前已存的值，改目录时对话框就开在用户正看着的那个文件夹。
+ */
+async function pickDir(target: 'downloadDir' | 'logDir'): Promise<void> {
+  pickingDir.value = target
+  try {
+    const picked = await localApi.pickDir(settings[target] || null)
+    if (picked) settings[target] = picked
+  } catch (e) {
+    messageApi.error(describe(e))
+  } finally {
+    pickingDir.value = null
+  }
 }
 
 async function addIdentity(): Promise<void> {
@@ -535,13 +555,17 @@ function splitPattern(pattern: string): { host: string, port: number } {
                 </div>
               </div>
               <div class="row-ctl">
-                <!-- 没接系统保存对话框：目录由用户写死，下载按钮才知道往哪放 -->
+                <!-- 目录由「选择…」弹原生对话框挑，也可以直接粘；下载按钮只认这里存死的值，
+                     不在下载那一刻弹框（一次批量下载弹 N 次框太吵） -->
                 <a-input
                   v-model:value="settings.downloadDir"
                   size="small"
                   class="ctl-wide"
                   placeholder="D:\Downloads 或 /home/dong/Downloads"
                 />
+                <a-button size="small" :loading="pickingDir === 'downloadDir'" @click="void pickDir('downloadDir')">
+                  选择…
+                </a-button>
               </div>
             </div>
             <div class="row">
@@ -561,6 +585,9 @@ function splitPattern(pattern: string): { host: string, port: number } {
                   class="ctl-wide"
                   placeholder="留空则用应用数据目录下的 logs"
                 />
+                <a-button size="small" :loading="pickingDir === 'logDir'" @click="void pickDir('logDir')">
+                  选择…
+                </a-button>
               </div>
             </div>
           </div>
