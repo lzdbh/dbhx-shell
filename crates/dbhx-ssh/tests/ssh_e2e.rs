@@ -201,3 +201,96 @@ async fn a_rejected_host_key_reads_as_a_key_problem_not_a_network_one() {
 
     server.shutdown().await;
 }
+
+/* ── sudo 提权那条通道 ─────────────────────────────────── */
+
+/// 提权失败的断言入口。`ChannelStream` 没有 `Debug`，所以 `expect_err` 在这里用不了
+/// （和 `transport.rs` 里 `dial_err` 同一个处境）；顺手把意外成功的流关掉，
+/// 免得服务器侧留一条等着 SFTP 报文的僵尸通道。
+async fn elevate_err(transport: &SshTransport, sudo_user: &str, password: &str) -> SshError {
+    match transport.open_sftp_elevated(sudo_user, password).await {
+        Err(err) => err,
+        Ok(stream) => {
+            drop(stream);
+            panic!("这一次提权本该失败，却交出了流")
+        }
+    }
+}
+
+/// 提权成功的形状：口令作为**数据**到达远端，就绪标记回来后交出一条可用的流。
+///
+/// 「流可用」这一半在 `dbhx-sftp` 的 e2e 里对着真 SFTP 握手断言（那边才有客户端）；
+/// 这里只管连接层：交出来的是流而不是错误，且远端看到的正是我们想让它看到的字节。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_elevated_open_delivers_the_password_as_data_not_as_argv() {
+    let server = TestServer::start(spec()).await.unwrap();
+    let transport = login(&server).await;
+
+    let stream = transport
+        .open_sftp_elevated("root", "dbhx-test")
+        .await
+        .expect("口令正确且 sudoers 放行时应当交出流");
+
+    let observed = server.observed();
+    assert_eq!(observed.sudo_passwords, vec!["dbhx-test".to_string()], "口令应当作为通道的第一行数据到达");
+    let command = observed.execs.iter().find(|c| c.contains("sudo -k -A -u")).expect("提权 exec 应当到达服务器");
+    assert!(!command.contains("dbhx-test"), "口令绝不能进命令串（远端进程表里看得见）：{command}");
+    assert!(command.contains("-u 'root'"), "提权用户要被引号包住：{command}");
+
+    drop(stream);
+    transport.close().await;
+    server.shutdown().await;
+}
+
+/// sudoers 不放行时必须说清楚是「这台机器不允许」，而不是给一条看不懂的协议错误。
+///
+/// 这条同时守住了那个关键时序：`exec` 的 `Success` 先到、拒绝的话后到。
+/// 客户端要是拿 `Success` 当提权成功，这段拒绝就会当成 SFTP 报文喂进解析器，
+/// 用户看到的是一条谁也解释不了的长度字段错误。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_elevated_open_without_sudo_rights_says_the_machine_refused_it() {
+    let server = TestServer::start(spec().with_sudo_denied()).await.unwrap();
+    let transport = login(&server).await;
+
+    let err = elevate_err(&transport, "root", "dbhx-test").await;
+    assert!(matches!(err, SshError::ElevateDenied(_)), "收到 {err:?}");
+    // 过一遍 IPC：用户在 UI 上看到的就是这一份，分类与可重试性都必须在这里也对
+    let ipc = dbhx_model::IpcError::from(err);
+    assert!(ipc.message.contains("不允许") && ipc.message.contains("sudo"), "{}", ipc.message);
+    assert!(!ipc.message.contains("sudoers file"), "英文原文不该直接透给用户：{}", ipc.message);
+    assert!(!ipc.retryable, "重试同一条 sudo 不会改变远端 sudoers");
+
+    transport.close().await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_sudo_password_is_named_as_a_password_problem() {
+    let server = TestServer::start(spec()).await.unwrap();
+    let transport = login(&server).await;
+
+    let err = elevate_err(&transport, "root", "not-it").await;
+    let SshError::ElevateDenied(message) = err else { panic!("应当是提权被拒，收到 {err:?}") };
+    assert!(message.contains("口令不正确"), "要和「机器不放行」分得清清楚楚：{message}");
+    assert_eq!(server.observed().sudo_passwords, vec!["not-it".to_string()]);
+
+    transport.close().await;
+    server.shutdown().await;
+}
+
+/// 空口令与超长口令在本地就拒掉：一次都不该碰服务器。
+///
+/// 远端对空口令的反应是「`read` 拿到了空行，于是继续等下一条」——症状是卡满
+/// 15 秒超时。那种等待既花用户的钱又解释不了自己。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_sudo_password_never_reaches_the_server() {
+    let server = TestServer::start(spec()).await.unwrap();
+    let transport = login(&server).await;
+
+    let err = elevate_err(&transport, "root", "").await;
+    assert!(matches!(err, SshError::InvalidInput(_)), "{err:?}");
+    assert!(server.observed().execs.is_empty(), "本地就该拦下来，一条 exec 都不该发出去");
+
+    transport.close().await;
+    server.shutdown().await;
+}

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::server::{Auth, Msg, RunningServerHandle, Server as _, Session as ServerSession};
-use russh::{Channel, ChannelId};
+use russh::{Channel, ChannelId, ChannelMsg};
 use tokio::net::TcpListener;
 
 use crate::sftp::SftpHandler;
@@ -35,6 +35,8 @@ pub struct TestSpec {
     /// 谁先到只看那一瞬间的调度。客户端如果在「等 Success」时把先到的 `Data` 扔掉，
     /// 症状就是连上主机后横幅时有时无——而且这段字节永远不会重发。
     pub banner_before_success: bool,
+    /// sudo 是否放行这条 `exec`。关掉它就是那台「`app is not in the sudoers file`」的机器。
+    pub sudo_allows: bool,
 }
 
 impl TestSpec {
@@ -52,12 +54,19 @@ impl TestSpec {
             banner: None,
             accept_publickey: true,
             banner_before_success: false,
+            sudo_allows: true,
         }
     }
 
     /// 让登录横幅抢在 `shell` 的 `Success` 之前发出，模拟真 sshd 的那个竞争。
     pub fn with_banner_before_success(mut self) -> Self {
         self.banner_before_success = true;
+        self
+    }
+
+    /// 让 sudo 拒绝当前用户：提权那条路要能对着「远端 sudo 不允许」这一支断言。
+    pub fn with_sudo_denied(mut self) -> Self {
+        self.sudo_allows = false;
         self
     }
 
@@ -85,6 +94,12 @@ pub struct Observed {
     pub execs: Vec<String>,
     /// 打开过的子系统名
     pub subsystems: Vec<String>,
+    /// 提权 `exec` 收到的口令行（去掉结尾换行）。
+    ///
+    /// 成对断言用的：客户端的命令串里**不该**有口令，而口令本身**该**到得了远端。
+    /// 只看一头都抓不住 bug——只查命令串会漏掉「口令根本没送出去」，只查收没收到会
+    /// 漏掉「口令被拼进 argv、进了远端进程表」。
+    pub sudo_passwords: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -105,6 +120,8 @@ pub struct TestSession {
     /// russh 在把字节喂给通道的同时**也会**调用 `Handler::data`，
     /// 不认出来的话就会拿 SFTP 报文当终端输入做行回显，两边都会读到脏数据。
     subsystems: HashSet<ChannelId>,
+    /// 正在等提权口令的通道。
+    elevating: HashMap<ChannelId, Elevating>,
 }
 
 struct ChannelState {
@@ -112,14 +129,84 @@ struct ChannelState {
     cwd: String,
 }
 
+/// 一条提权通道在服务器侧的情形。
+struct Elevating {
+    /// 攒着的原始字节：一次 `read` 只给半截口令是真机会发生的事，
+    /// 而「按行边界」正是被测点之一，不能在这里假设一次 `data` 就是一条完整口令。
+    pending: Vec<u8>,
+}
+
 impl TestSession {
     fn new(shared: Shared) -> Self {
-        Self { shared, channels: HashMap::new(), pending: HashMap::new(), subsystems: HashSet::new() }
+        Self { shared, channels: HashMap::new(), pending: HashMap::new(), subsystems: HashSet::new(), elevating: HashMap::new() }
     }
 
     fn note<T>(&self, field: impl FnOnce(&mut Observed) -> T) {
         let mut observed = self.shared.observed.lock().unwrap_or_else(|p| p.into_inner());
         field(&mut observed);
+    }
+
+    /// 假装远端那台机器上的 sudo：收口令、认或不认、认了就前台起一个 sftp-server。
+    ///
+    /// 三条分支各对应一类客户端 bug：
+    /// * 口令不完整（还没到换行）⇒ 什么都不回。这测的是「按行边界攒字节」，
+    ///   客户端若在半个口令上就判定就绪，报出来的就是垃圾。
+    /// * 口令不对 / sudoers 不放行 ⇒ 只发原文再退出，**不发**就绪标记。客户端若把
+    ///   `exec` 的 `Success` 当成提权成功，这段原文就会当成 SFTP 报文糊进解析器。
+    /// * 放行 ⇒ 发标记，然后把这条通道交给真的 SFTP 报文循环，于是后续可以照常
+    ///   收发目录，端到端地证明「这条线确实能当 SFTP 线用」。
+    async fn elevation(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut ServerSession,
+    ) -> Result<(), russh::Error> {
+        let mut state = self.elevating.remove(&channel).expect("调用方刚确认过这张表里有这条通道");
+        state.pending.extend_from_slice(data);
+        let Some(newline) = state.pending.iter().position(|b| *b == b'\n') else {
+            self.elevating.insert(channel, state);
+            return Ok(());
+        };
+        let password = String::from_utf8_lossy(&state.pending[..newline]).trim_end_matches('\r').to_string();
+        self.note(|o| o.sudo_passwords.push(password.clone()));
+
+        let (right_password, allowed, user) = (
+            password == self.shared.spec.password,
+            self.shared.spec.sudo_allows,
+            self.shared.spec.username.clone(),
+        );
+        // 逐字照抄 Debian 系的两句原话：客户端的分类表就是照着这些原文写的，
+        // 换成别的说法就等于用自己的假设去测自己的假设。
+        let refusal = if !right_password {
+            "sudo: 1 incorrect password attempt\r\n".to_string()
+        } else if !allowed {
+            format!("sudo: {user} is not in the sudoers file. This incident will be reported.\r\n")
+        } else {
+            String::new()
+        };
+        if !refusal.is_empty() {
+            session.data(channel, refusal.into_bytes())?;
+            session.exit_status_request(channel, 1)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            return Ok(());
+        }
+
+        session.data(channel, format!("{READY_MARKER}\n").into_bytes())?;
+        let Some(mut raw) = self.pending.remove(&channel) else {
+            // 原始通道已经被别的请求拿走了：这在这种测试里不该发生，
+            // 宁可让客户端等超时，也不回一句看起来像成功的假确认。
+            tracing::debug!(?channel, "提权通道没有可用的原始通道");
+            return Ok(());
+        };
+        // russh 把同一份字节**同时**塞进通道队列和 `Handler::data`。真机上这些字节被
+        // shell 的 `read` 吃掉了，sftp-server 的 stdin 从标记之后才开始；这里不排掉的话，
+        // 它看到的第一个「报文头」是一行口令，症状是 SFTP 握手永远等不到应答。
+        drain_password(&mut raw, newline + 1).await;
+        self.subsystems.insert(channel);
+        let handler = SftpHandler::new(Arc::clone(&self.shared.spec.fs), self.shared.spec.home.clone());
+        russh_sftp::server::run(raw.into_stream(), handler).await;
+        Ok(())
     }
 }
 
@@ -146,6 +233,40 @@ fn prompt(cwd: &str) -> Vec<u8> {
 
 /// 假 os-release。命令层的系统探测（`dbhx-ipc::osdetect`）要有稳定的远端答案可断言。
 const OS_RELEASE: &str = "NAME=\"Ubuntu\"\nVERSION=\"24.04.1 LTS (Noble Numbat)\"\nID=ubuntu\nID_LIKE=debian\n";
+
+/// `dbhx-ssh` 提权脚本的指纹。测试服务器不解析 shell，只认这条自己人发的命令。
+///
+/// 认的是 `-k -A -u` 这串**必需**的选项组合：客户端换写法时这里会认不出来，
+/// 症状是提权用例挂在超时上——那是一条响亮且指向正确的失败，不会被误判成「远端同意了」。
+const SUDO_FINGERPRINT: &str = "sudo -k -A -u";
+
+/// 提权成功后由**被提权的那个 shell** 打印的就绪标记，与 `dbhx-ssh` 里的常量同值。
+///
+/// 两边各写一份是刻意的：如果测试服务器从生产代码 import 它，那客户端解析逻辑就算写错
+/// 也能自洽通过；分开写才能抓住「协议两端对就绪的理解不一致」。
+const READY_MARKER: &str = "DBHX-ELEVATE-OK";
+
+/// 把已经交给「shell 的 `read`」的那些字节从通道队列里排掉。
+///
+/// russh 把同一份字节**同时**塞进通道队列和 `Handler::data`。真机上口令那一行被
+/// shell 的 `read` 吃掉了，sftp-server 的 stdin 从就绪标记之后才开始；这里不排掉的话，
+/// 它看到的第一个「报文头」是一行口令，症状是 SFTP 握手永远等不到应答。
+///
+/// `want` 是口令行含换行的总字节数。排不完只可能是客户端的写法变了，那时提权用例会
+/// 挂在 SFTP 握手超时上——一条响亮且指向这里的失败，比少排几个字节、
+/// 让报文解析器读到半行口令好。
+async fn drain_password(channel: &mut Channel<Msg>, want: usize) {
+    let mut left = want;
+    while left > 0 {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => left = left.saturating_sub(data.len()),
+            Some(other) => {
+                tracing::debug!(?other, "排空提权口令时收到非数据消息，忽略");
+            }
+            None => return,
+        }
+    }
+}
 
 impl russh::server::Handler for TestSession {
     type Error = russh::Error;
@@ -228,6 +349,13 @@ impl russh::server::Handler for TestSession {
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).to_string();
         self.note(|o| o.execs.push(command.clone()));
+        // 提权那条 exec 走另一条路：真 sshd 在这里发完确认就 fork 子进程了，
+        // sudo 后来认不认这次口令**与这条确认无关**。照抄这个形状，客户端才会
+        // 在「等 Success」上写出真机上会犯的错，也就才测得出就绪标记是不是必要的。
+        if command.contains(SUDO_FINGERPRINT) {
+            self.elevating.insert(channel, Elevating { pending: Vec::new() });
+            return session.channel_success(channel);
+        }
         session.channel_success(channel)?;
         let cwd = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_else(|| self.shared.spec.home.clone());
         // 只实现目录跟随探针与系统探测可能用到的那几条，其余命令一律空输出 + 退出码 0
@@ -275,6 +403,11 @@ impl russh::server::Handler for TestSession {
         // 于是看到一堆「长度字段为 1」的垃圾，症状是握手永远等不到应答。
         if self.subsystems.contains(&channel) {
             return Ok(());
+        }
+        // 提权通道的字节是「用户的 sudo 口令」，不是终端输入：回显它等于把口令写进
+        // 客户端接下来要判定的那一段证据里。
+        if self.elevating.contains_key(&channel) {
+            return self.elevation(channel, data, session).await;
         }
         // `\r` 结尾才算一行；没有换行的按键（方向键、Ctrl-C）原样回显，
         // 这样才能测「一次 read 只拿到半截转义序列」那种真实切分。
@@ -335,6 +468,7 @@ impl russh::server::Handler for TestSession {
         self.channels.remove(&channel);
         self.pending.remove(&channel);
         self.subsystems.remove(&channel);
+        self.elevating.remove(&channel);
         Ok(())
     }
 }

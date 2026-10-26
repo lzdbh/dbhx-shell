@@ -56,6 +56,8 @@ export const commands = {
 	vaultClearLockPin: () => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_clear_lock_pin")),
 	sftpOpenForSession: (session: SessionId) => typedError<PanelInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_open_for_session", { session })),
 	sftpOpenForHost: (hostId: HostId) => typedError<PanelInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_open_for_host", { hostId })),
+	/**  把当前面板提权成 `sudo_user`：口令只用于这一次 `sudo -A`。 */
+	sftpOpenElevated: (connection: number, sudoUser: string, password: string) => typedError<PanelInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_open_elevated", { connection, sudoUser, password })),
 	sftpBrowse: (connection: number, path: string | null) => typedError<DirListing, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_browse", { connection, path })),
 	sftpMkdir: (connection: number, path: string, recursive: boolean) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_mkdir", { connection, path, recursive })),
 	sftpCreateFile: (connection: number, path: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_create_file", { connection, path })),
@@ -429,6 +431,13 @@ export type PanelInfo = {
 	listing: DirListing,
 	/**  面板是否跟随终端目录；关掉它之后 `SftpCwdChanged` 就不再来了 */
 	following: boolean,
+	/**
+	 *  提权面板提权给了谁；`None` 是普通身份。
+	 * 
+	 *  前端靠它在标题上挂「root」标记：用户必须能一眼看出这个面板的写入是以谁的身份
+	 *  发生的——这也是提权失败时宁可报错、绝不退回普通身份的另一半理由。
+	 */
+	sudo_user: string | null,
 };
 
 /**  私钥有口令保护但 vault 里没存口令。只给身份名，不给密钥内容。 */

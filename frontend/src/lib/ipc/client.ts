@@ -116,6 +116,15 @@ export const sftpApi = {
   /** 从终端 tab 打开：复用那条 transport，不会重新登录。 */
   openForSession: (session: SessionId) => unwrap(commands.sftpOpenForSession(session)),
   openForHost: (hostId: HostId) => unwrap(commands.sftpOpenForHost(hostId)),
+  /**
+   * 把面板提权成 `sudoUser`。口令只在这一跳里存在：调用方不要把 `password` 存进
+   * store 的字段或任何响应式对象，传出去就该立刻失去引用（后端立刻封进 `Zeroizing`）。
+   *
+   * `connection` 是用户此刻正看着的那个面板号，普通面板和提权面板都收——
+   * 后端按它反查 transport，前端不需要知道提权面板另有一个号。
+   */
+  openElevated: (connection: number, sudoUser: string, password: string) =>
+    unwrap(commands.sftpOpenElevated(connection, sudoUser, password)),
   browse: (connection: number, path: string | null) =>
     unwrap(commands.sftpBrowse(connection, path)),
   mkdir: (connection: number, path: string, recursive: boolean) => unwrap(commands.sftpMkdir(connection, path, recursive)),

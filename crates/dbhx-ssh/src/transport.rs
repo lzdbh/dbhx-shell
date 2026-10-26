@@ -33,6 +33,7 @@ use dbhx_model::{LiveEndpoint, PtySize};
 use russh::ChannelStream;
 use russh::client::{Handle, Msg};
 use tokio::sync::{mpsc, oneshot, watch};
+use zeroize::Zeroizing;
 
 use crate::auth::{authenticate, Credential};
 use crate::channel::{confirm, Exec, Shell, SplitChannel};
@@ -40,6 +41,7 @@ use crate::config::DialOptions;
 use crate::error::SshError;
 use crate::handler::{ClientHandler, CloseReason, KeyCheck, SessionState, SshEvent};
 use crate::hostkey::ServerKey;
+use crate::sudo_sftp::{elevated_open, validate_inputs};
 
 /// actor 的请求队列长度。开通道是低频操作，8 足够堆出可观测的排队；
 /// 真正的并发预算在会话层（lease / SFTP 并发数）里管。
@@ -91,6 +93,12 @@ enum Request {
     OpenExec { command: String, reply: Reply<Exec> },
     /// 给 dbhx-sftp 用：subsystem 建好后把裸流交出去，之后 SFTP 报文不再过 actor
     OpenSubsystem { name: String, reply: Reply<ChannelStream<Msg>> },
+    /// 提权版的裸流：与 `OpenSubsystem` 同为「交出一条 SFTP 线」，但通道里跑的是
+    /// 被 sudo 拉起来的 sftp-server，而不是 sshd 自己的 subsystem。
+    ///
+    /// 口令单独一条字段并包在 `Zeroizing` 里：actor 队列可能积压，
+    /// 明文在队列里多躺一秒就多一份可被读出来的副本。
+    OpenSftpElevated { sudo_user: String, password: Zeroizing<String>, reply: Reply<ChannelStream<Msg>> },
     Shutdown,
 }
 
@@ -225,6 +233,31 @@ impl SshTransport {
     pub async fn open_subsystem(&self, name: &str) -> Result<ChannelStream<Msg>, SshError> {
         self.require_authenticated()?;
         self.call(|reply| Request::OpenSubsystem { name: name.to_string(), reply }).await
+    }
+
+    /// 用当前登录用户的 sudo 口令起一条提权后的 SFTP 线。
+    ///
+    /// 口令只在这一次调用期间存在，且绝不进 vault、不进日志、不进远端命令串（见
+    /// [`crate::sudo_sftp`]）。失败一律原样抛出：调用方不允许「提权不行就用普通身份」，
+    /// 那等于骗用户说他看的是 root 的目录。
+    ///
+    /// 代价写在这里而不是藏起来：actor 是单线程排队，提权最长要等满 `ELEVATE_TIMEOUT`，
+    /// 这期间同一条连接上的其它开通道请求会排队。文件面板是低频操作，接受。
+    pub async fn open_sftp_elevated(
+        &self,
+        sudo_user: &str,
+        password: &str,
+    ) -> Result<ChannelStream<Msg>, SshError> {
+        self.require_authenticated()?;
+        // 本地检查在入队之前做：空口令不该占用 actor 一次往返，也不该把它的明文
+        // 复制进一个马上就会失败的请求里。
+        validate_inputs(sudo_user, password)?;
+        self.call(|reply| Request::OpenSftpElevated {
+            sudo_user: sudo_user.to_string(),
+            password: Zeroizing::new(password.to_string()),
+            reply,
+        })
+        .await
     }
 
     /// 未认证就开通道属于上层 bug，但必须在这一层就拦住：
@@ -396,6 +429,10 @@ async fn handle_request(
             let _ = reply.send(open_subsystem(handle, &name).await);
             false
         }
+        Request::OpenSftpElevated { sudo_user, password, reply } => {
+            let _ = reply.send(open_sftp_elevated(handle, endpoint, &sudo_user, &password).await);
+            false
+        }
         Request::Shutdown => true,
     }
 }
@@ -441,6 +478,21 @@ async fn open_subsystem(
         tracing::warn!(name, count = early.len(), "子系统确认前收到意外数据，已丢弃");
     }
     Ok(channel.into_stream())
+}
+
+/// 提权 SFTP：开一条 session 通道，交进 [`elevated_open`] 走完 pty + exec + sudo 握手。
+///
+/// 与 `open_subsystem` 分开而不是共用一条路径：subsystem 的确认阶段「不可能有输出」，
+/// 提权的确认阶段**必须**接管输出——那些字节正是失败原因的全部证据。混在一起写，
+/// 就会被 `open_subsystem` 那句「收到意外数据就丢弃」的错误假设污染。
+async fn open_sftp_elevated(
+    handle: &mut Handle<ClientHandler>,
+    endpoint: &LiveEndpoint,
+    sudo_user: &str,
+    password: &str,
+) -> Result<ChannelStream<Msg>, SshError> {
+    let channel = handle.channel_open_session().await?;
+    elevated_open(channel, endpoint, sudo_user, password).await
 }
 
 #[cfg(test)]

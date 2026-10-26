@@ -39,6 +39,7 @@ fn main() {
                     "vault_clear_lock_pin",
                     "sftp_open_for_session",
                     "sftp_open_for_host",
+                    "sftp_open_elevated",
                     "sftp_browse",
                     "sftp_mkdir",
                     "sftp_create_file",

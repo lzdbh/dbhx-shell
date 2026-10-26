@@ -72,26 +72,31 @@ pub fn spawn(core: Arc<Core>) -> bool {
 }
 
 /// 终端报了新目录 ⇒ 问一下门控 ⇒ 该跳就跳。
+///
+/// 一条 transport 上可能同时开着普通面板和提权面板，两个号都要问一遍：各自的门控
+/// 自己决定跳不跳（提权面板默认是被用户锁住的），所以这里只做扇出，不做判断。
 async fn follow_cwd(core: &Core, session: SessionId, path: &str) {
     let Some(key) = core.sessions.transport_key(session) else { return };
-    let connection = core.conn_id_of(&key);
+    // 先保证普通面板的号在表里（号先于面板存在），再取这条 transport 上的全部号
+    core.conn_id_of(&key);
+    for connection in core.conn_ids_for_key(&key) {
+        // 段一：锁内只做决定。段二 `apply_decision` 里的导航是网络往返，
+        // 绝不能抱着面板锁等它
+        let Ok(decision) = core.decide(connection, |gate, blacklist| {
+            let generation = gate.generation();
+            gate.report(generation, Some(path), CwdSource::Osc7, blacklist)
+        }) else {
+            // 这个号上没有开着的文件面板：终端的 `cd` 本来就无处可跟
+            continue;
+        };
 
-    // 段一：锁内只做决定。段二 `apply_decision` 里的导航是网络往返，
-    // 绝不能抱着面板锁等它
-    let Ok(decision) = core.decide(connection, |gate, blacklist| {
-        let generation = gate.generation();
-        gate.report(generation, Some(path), CwdSource::Osc7, blacklist)
-    }) else {
-        // 这台主机没有开着的文件面板：终端的 `cd` 本来就无处可跟
-        return;
-    };
-
-    let followed = core.apply_decision(connection, decision).await;
-    // 只把「用户能感知的结果」发出去：NothingReported / WeakerSource 这类内部记账
-    // 发过去只会让面板多画一次 loading
-    match followed.hold {
-        Some(hold) if !worth_telling(hold) => {}
-        _ => core.emit(BusEvent::SftpFollowed(followed)),
+        let followed = core.apply_decision(connection, decision).await;
+        // 只把「用户能感知的结果」发出去：NothingReported / WeakerSource 这类内部记账
+        // 发过去只会让面板多画一次 loading
+        match followed.hold {
+            Some(hold) if !worth_telling(hold) => {}
+            _ => core.emit(BusEvent::SftpFollowed(followed)),
+        }
     }
 }
 

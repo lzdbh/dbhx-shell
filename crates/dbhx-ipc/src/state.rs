@@ -122,11 +122,17 @@ impl Awaits {
 /// 面板、黑名单、跟随门控都按这个号说话，而不是按 `TransportKey`——键里带 endpoint，
 /// 用户改主机时键会变，号不变的话登记表就会指向已经换掉的目标。
 /// 因此号**跟着键走**：同一个键复用同一个号，键不再被任何面板持有时销号。
+///
+/// 提权面板另记一张表：同一个键上允许「普通身份」和「root 身份」两个面板并存
+/// （用户从普通面板点「提权」时不该把原面板顶掉），共用一张表的话后开的会覆盖先开的，
+/// 两边看到的目录与黑名单记账会互相窜。号仍从同一个计数器取，保证全局不撞车。
 #[derive(Default)]
 pub struct ConnIds {
     next: AtomicU32,
     by_key: HashMap<TransportKey, u32>,
     by_id: HashMap<u32, TransportKey>,
+    elevated_by_key: HashMap<(TransportKey, String), u32>,
+    elevated_by_id: HashMap<u32, (TransportKey, String)>,
 }
 
 impl ConnIds {
@@ -140,11 +146,54 @@ impl ConnIds {
         id
     }
 
+    /// 提权面板的号：按 `(键, 提权到的用户)` 记。
+    ///
+    /// 用户记里带上 `sudo_user` 是因为同一台机器上可能提权给不同的账号；前端拿着
+    /// 同一个号复用同一个面板，不会每点一次就多开一条通道。
+    pub fn of_elevated(&mut self, key: &TransportKey, sudo_user: &str) -> u32 {
+        let at = (key.clone(), sudo_user.to_string());
+        if let Some(id) = self.elevated_by_key.get(&at) {
+            return *id;
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        self.elevated_by_key.insert(at.clone(), id);
+        self.elevated_by_id.insert(id, at);
+        id
+    }
+
     pub fn key_of(&self, id: u32) -> Option<&TransportKey> {
         self.by_id.get(&id)
     }
 
+    /// 这个号背后的 transport，提权面板也算。
+    ///
+    /// 「对着面板点提权」只需要前端交出它正在显示的那个号：普通面板和提权面板都能
+    /// 反查到同一条 transport，命令层因此不必要求前端记住两种号的对应关系。
+    pub fn transport_of(&self, id: u32) -> Option<&TransportKey> {
+        self.by_id.get(&id).or_else(|| self.elevated_by_id.get(&id).map(|(key, _)| key))
+    }
+
+    /// 这条 transport 上所有已登记的号（普通 + 提权），升序。
+    ///
+    /// 终端报了新目录时用它做扇出：每个开着的面板各自决定跳不跳，
+    /// 提权面板不会因为号不同而被漏掉。
+    pub fn ids_of(&self, key: &TransportKey) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.by_key.get(key).copied().into_iter().collect();
+        ids.extend(
+            self.elevated_by_key
+                .iter()
+                .filter(|((at_key, _), _)| at_key == key)
+                .map(|(_, id)| *id),
+        );
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn forget(&mut self, id: u32) -> Option<TransportKey> {
+        if let Some(at) = self.elevated_by_id.remove(&id) {
+            self.elevated_by_key.remove(&at);
+            return Some(at.0);
+        }
         match self.by_id.remove(&id) {
             Some(key) => {
                 self.by_key.remove(&key);
@@ -155,11 +204,11 @@ impl ConnIds {
     }
 
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.by_id.len() + self.elevated_by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.by_id.is_empty() && self.elevated_by_id.is_empty()
     }
 }
 
@@ -174,10 +223,17 @@ pub struct Panel {
     pub gate: FollowGate,
     /// 面板当前显示的目录（归一化后的绝对路径）
     pub shown: String,
+    /// 提权面板提权给了谁；普通面板是 `None`。
+    ///
+    /// 只记用户名，口令在这条通道建立的那一刻就用完了，不留任何副本。
+    pub sudo_user: Option<String>,
 }
 
-/// SFTP 面板登记表。同一 transport 只有一个面板：两个面板跟同一个终端会互相拽，
-/// 而且第二条 SFTP subsystem 通道纯属浪费。
+/// SFTP 面板登记表，按连接号索引。
+///
+/// 同一个身份在一条 transport 上只有一个面板：两个面板跟同一个终端会互相拽，
+/// 而且第二条 SFTP subsystem 通道纯属浪费。提权面板是**另一个身份**，占另一个号
+/// （见 `ConnIds`），所以它和普通面板可以并存。
 #[derive(Default)]
 pub struct Panels {
     entries: HashMap<u32, Panel>,
@@ -229,6 +285,11 @@ pub struct PanelInfo {
     pub listing: dbhx_model::DirListing,
     /// 面板是否跟随终端目录；关掉它之后 `SftpCwdChanged` 就不再来了
     pub following: bool,
+    /// 提权面板提权给了谁；`None` 是普通身份。
+    ///
+    /// 前端靠它在标题上挂「root」标记：用户必须能一眼看出这个面板的写入是以谁的身份
+    /// 发生的——这也是提权失败时宁可报错、绝不退回普通身份的另一半理由。
+    pub sudo_user: Option<String>,
 }
 
 /// 命令层的共享状态。
@@ -396,6 +457,21 @@ impl Core {
     /// 号先于面板存在：拨号失败也保留号，同一台主机重试时前端的黑名单/门控记账才不跳号。
     pub fn conn_id_of(&self, key: &TransportKey) -> u32 {
         self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).of(key)
+    }
+
+    /// 提权面板的连接号（同一个 `(transport, 提权用户)` 复用同一个号）。
+    pub fn elevated_conn_id_of(&self, key: &TransportKey, sudo_user: &str) -> u32 {
+        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).of_elevated(key, sudo_user)
+    }
+
+    /// 面板号反查 transport：普通面板和提权面板都算。
+    pub fn conn_key(&self, connection: u32) -> Option<TransportKey> {
+        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).transport_of(connection).cloned()
+    }
+
+    /// 这条 transport 上已登记的全部面板号。终端报目录时按它扇出。
+    pub fn conn_ids_for_key(&self, key: &TransportKey) -> Vec<u32> {
+        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).ids_of(key)
     }
 
     pub fn conn_id_count(&self) -> usize {
@@ -834,6 +910,51 @@ mod tests {
         ids.forget(first);
         assert!(ids.key_of(first).is_none(), "销号后不能再反查到键");
         assert_eq!(ids.of(&key), ids.of(&key), "重新登记仍要给出同一个号");
+    }
+
+    #[test]
+    fn the_elevated_panel_gets_its_own_number_on_the_same_transport() {
+        let key = sample_key("db7");
+        let mut ids = ConnIds::default();
+        let plain = ids.of(&key);
+        let root = ids.of_elevated(&key, "root");
+
+        assert_ne!(plain, root, "两个面板共用一个号的话后开的会把先开的顶掉");
+        assert_eq!(ids.of_elevated(&key, "root"), root, "同一台机器重复提权要复用同一个面板");
+        assert_eq!(ids.key_of(plain), Some(&key), "普通面板仍按原来的表记账");
+        assert_eq!(ids.transport_of(root), Some(&key), "提权号也要能反查到 transport");
+
+        // 另一台机器同名的提权用户是另一个面板：号不能串
+        assert_ne!(ids.of_elevated(&sample_key("db8"), "root"), root);
+        // 同一台机器提权给不同账号也各自一个号
+        assert_ne!(ids.of_elevated(&key, "www-data"), root);
+    }
+
+    #[test]
+    fn one_terminal_directory_report_reaches_every_panel_on_the_transport() {
+        let key = sample_key("db9");
+        let mut ids = ConnIds::default();
+        let root = ids.of_elevated(&key, "root");
+        let plain = ids.of(&key);
+        assert_eq!(ids.ids_of(&key), vec![plain.min(root), plain.max(root)], "扇出要覆盖两个面板，且顺序稳定");
+
+        // 别的 transport 的面板不能被牵进来
+        assert_eq!(ids.ids_of(&sample_key("db10")), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn closing_one_panel_only_forgets_that_panel() {
+        let key = sample_key("db11");
+        let mut ids = ConnIds::default();
+        let plain = ids.of(&key);
+        let root = ids.of_elevated(&key, "root");
+
+        ids.forget(root);
+        assert_eq!(ids.transport_of(plain), Some(&key), "关掉提权面板不能把普通面板的号也销掉");
+        assert!(ids.transport_of(root).is_none(), "销掉的号不该再反查到任何 transport");
+
+        ids.forget(plain);
+        assert!(ids.is_empty(), "两个号都销完登记表就该空");
     }
 
     #[tokio::test]

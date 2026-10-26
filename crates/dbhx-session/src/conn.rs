@@ -15,6 +15,7 @@ use dbhx_ssh::{
     SubsystemStream, SshTransport,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
+use zeroize::Zeroizing;
 
 use crate::error::SessionError;
 use crate::key::TransportKey;
@@ -45,6 +46,18 @@ pub trait PooledConnection: Send + Sync + 'static {
 
     /// SFTP 面板用：拿到 subsystem 裸流之后，SFTP 报文不再经过池。
     fn open_subsystem(&self, name: String) -> BoxFuture<'_, Result<SubsystemStream, SshError>>;
+
+    /// 提权版 SFTP 裸流：同一条已认证 transport 上，用 `sudo_user` 的身份起一条
+    /// 跑在 sudo 里的 sftp-server。口令按值交出并包在 `Zeroizing` 里——它从命令行
+    /// 一路到远端 `sudo -A` 之间只活在这条调用栈上，不落 vault、不进日志。
+    ///
+    /// 失败必须原样往上抛。上层不许写「提权不行就退回普通身份」：用户点的是提权，
+    /// 悄悄降级等于让他以为自己在管 root 的文件。
+    fn open_sftp_elevated(
+        &self,
+        sudo_user: String,
+        password: Zeroizing<String>,
+    ) -> BoxFuture<'_, Result<SubsystemStream, SshError>>;
 
     /// 主动关闭。淘汰路径必须走它而不能只 drop——supervisor 任务还握着一条句柄，
     /// 光靠 drop 到不了对端。
@@ -118,6 +131,14 @@ impl PooledConnection for SshConnection {
 
     fn open_subsystem(&self, name: String) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
         Box::pin(async move { self.transport.open_subsystem(&name).await })
+    }
+
+    fn open_sftp_elevated(
+        &self,
+        sudo_user: String,
+        password: Zeroizing<String>,
+    ) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
+        Box::pin(async move { self.transport.open_sftp_elevated(&sudo_user, &password).await })
     }
 
     fn close(&self) -> BoxFuture<'_, ()> {

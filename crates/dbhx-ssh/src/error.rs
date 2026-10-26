@@ -36,6 +36,17 @@ pub enum SshError {
     #[error("服务器拒绝了 {request}")]
     RequestRefused { request: &'static str },
 
+    /// 参数在本地就能判定不合法（空用户名、超长口令）。发出去只会浪费一次远端往返。
+    #[error("输入不合法: {0}")]
+    InvalidInput(String),
+
+    /// sudo 提权没跑起来。`message` 已经是给用户看的中文（见 `sudo_sftp::classify_elevate_failure`）。
+    ///
+    /// 这一类**绝不能**被上层当成「那就用普通身份继续」：用户点的是提权，
+    /// 悄悄降级等于让他以为自己在管 root 的文件目录。
+    #[error("{0}")]
+    ElevateDenied(String),
+
     #[error("连接已关闭")]
     Closed,
 
@@ -78,6 +89,10 @@ impl From<SshError> for IpcError {
             SshError::RequestRefused { request } => {
                 IpcError::new(ErrorCode::ChannelClosed, format!("服务器拒绝 {request}"), true)
             }
+            SshError::InvalidInput(r) => IpcError::new(ErrorCode::InvalidInput, r, false),
+            // 提权失败的原因已经在本层翻成中文，重试同一条命令不会改变远端 sudoers，
+            // 所以 retryable=false：UI 只该给用户「换个用户/口令再试」的入口。
+            SshError::ElevateDenied(r) => IpcError::new(ErrorCode::PermissionDenied, r, false),
             SshError::Closed => IpcError::new(ErrorCode::ChannelClosed, "连接已关闭", true),
             SshError::Io(io) => IpcError::new(ErrorCode::Io, io.to_string(), true),
             // russh 的内部错误文本可能带主机名甚至用户名，只透出类型不带原文
@@ -105,6 +120,23 @@ mod tests {
     fn unreachable_is_retryable_but_auth_failed_is_not() {
         assert!(IpcError::from(SshError::Unreachable("refused".into())).retryable);
         assert!(!IpcError::from(SshError::AuthFailed).retryable);
+    }
+
+    #[test]
+    fn elevate_denied_keeps_the_reason_and_offers_no_retry() {
+        // 「远端 sudo 不允许」是这句话本身，不能被翻成一句通用的权限错误——
+        // 用户需要知道该去改 sudoers 而不是再点一次。
+        let e: IpcError = SshError::ElevateDenied("远端 sudo 不允许当前用户使用 sudo，提权失败".into()).into();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert!(e.message.contains("sudo"), "{}", e.message);
+        assert!(!e.retryable, "重试同一条 sudo 命令不会改变远端 sudoers");
+    }
+
+    #[test]
+    fn invalid_input_is_not_retryable() {
+        let e: IpcError = SshError::InvalidInput("提权口令不能为空".into()).into();
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert!(!e.retryable);
     }
 
     #[test]

@@ -8,6 +8,9 @@
 //! * `transport`：`client::Handle` 不 `Clone` 且 drop 即断连，所以用 actor 独占。
 //! * `channel`：`request_*` 返回 `Ok` 不代表服务器接受，必须自己 `wait()` 到 Success。
 //! * `auth`：RSA 要协商 hash，纯密码认证要能降级到 keyboard-interactive。
+//!
+//! 提权看文件走 `sudo_sftp`：SFTP 子系统的人身份在认证那一刻就定了，所以那是
+//! 「exec 一条跑 sudo 的前台 sftp-server，把通道字节当 SFTP 线」的独立形态。
 
 pub mod auth;
 pub mod channel;
@@ -15,6 +18,7 @@ pub mod config;
 pub mod error;
 pub mod handler;
 pub mod hostkey;
+pub mod sudo_sftp;
 pub mod transport;
 
 pub use auth::{Credential, key_is_encrypted};

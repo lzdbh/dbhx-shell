@@ -21,10 +21,10 @@ use zeroize::Zeroizing;
 
 const BUDGET: Duration = Duration::from_secs(10);
 
-/// 拨过去、认证、开 sftp 子系统、走完 SFTP 握手。
+/// 拨过去并认证完。
 ///
 /// 返回 `SshTransport` 是为了让它活到用例结束：它一 drop，通道就没了。
-async fn sftp(server: &TestServer) -> (SshTransport, SftpClient) {
+async fn login(server: &TestServer) -> SshTransport {
     let endpoint =
         LiveEndpoint { host: server.host(), port: server.port(), username: "app".to_string() };
     let transport = SshTransport::dial(DialOptions::new(endpoint), Box::new(TrustAll))
@@ -32,8 +32,29 @@ async fn sftp(server: &TestServer) -> (SshTransport, SftpClient) {
         .expect("握手应当成功");
     let credential = Credential::Password(Zeroizing::new("dbhx-test".to_string()));
     transport.authenticate(credential).await.expect("口令应当正确");
+    transport
+}
+
+/// 走 sftp 子系统拿一条 SFTP 线。
+async fn sftp(server: &TestServer) -> (SshTransport, SftpClient) {
+    let transport = login(server).await;
     let stream = transport.open_subsystem("sftp").await.expect("sftp 子系统应当可用");
     let client = SftpClient::connect(stream).await.expect("SFTP 握手应当成功");
+    (transport, client)
+}
+
+/// 走 **sudo 提权通道**拿一条 SFTP 线。
+///
+/// 这个 helper 本身就是那条断言：被 sudo 前台起来的 sftp-server，通道字节和
+/// subsystem 的是同一种东西，能原样喂给同一个报文客户端。下面的用例只是把这条线
+/// 拿去干和子系统那条完全一样的活，一模一样地成。
+async fn elevated(server: &TestServer) -> (SshTransport, SftpClient) {
+    let transport = login(server).await;
+    let stream = transport
+        .open_sftp_elevated("root", "dbhx-test")
+        .await
+        .expect("提权通道应当交出可用的流");
+    let client = SftpClient::connect(stream).await.expect("提权通道上的 SFTP 握手应当成功");
     (transport, client)
 }
 
@@ -83,6 +104,24 @@ async fn browse_resolves_the_path_and_lists_directories_first() {
     assert_eq!(big.size, 4096, "size 直接来自属性报文，错了就是服务端没给或客户端读错字段");
     assert_eq!(listing.entries[0].kind, dbhx_model::FileKind::Dir);
     assert_eq!(listing.entries[1].kind, dbhx_model::FileKind::Symlink);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_elevated_channel_lists_the_same_directories() {
+    // 提权那条线跑的是**同一套**报文客户端：握手、版本号、readdir、属性位图全都得
+    // 照常工作。这里不测 sudo 的语义（那在 dbhx-ssh 的 e2e 里），只测「通道字节
+    // 到 SFTP 报文之间没有夹带东西」——就绪标记没漏进线里、raw 模式真的生效。
+    let server = started().await;
+    let (_transport, client) = elevated(&server).await;
+
+    let listing = tokio::time::timeout(BUDGET, client.browse("/home/app")).await.unwrap().unwrap();
+    assert_eq!(
+        listing.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+        ["logs", "latest", "readme.link", "big.bin", "readme.md"],
+        "提权面板看到的目录必须和 subsystem 那条一模一样"
+    );
 
     server.shutdown().await;
 }

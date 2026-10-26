@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use dbhx_ipc::commands::log::{start_impl as start_log_impl, stop_impl as stop_log_impl};
 use dbhx_ipc::commands::session::{close_impl as close_session_impl, open_remote_impl, write_impl};
-use dbhx_ipc::commands::sftp::{browse_impl, chmod_impl, close_impl as close_panel_impl, create_file_impl, mkdir_impl, open_for_session_impl, rename_impl, set_following_impl};
+use dbhx_ipc::commands::sftp::{browse_impl, chmod_impl, close_impl as close_panel_impl, create_file_impl, mkdir_impl, open_elevated_impl, open_for_session_impl, rename_impl, set_following_impl};
 use dbhx_ipc::commands::transfer::download_impl;
 use dbhx_ipc::commands::vault::{HostDraft, UserReply, reply_impl, set_password_impl, upsert_host_impl};
 use dbhx_ipc::events::{BusEvent, FollowHold, TermData};
@@ -192,6 +192,88 @@ async fn terminal_cd_then_panel_then_download_reuse_one_login() {
     let followed = set_following_impl(core.as_ref(), panel.connection, true).await.unwrap();
     assert_eq!(followed.listing.as_ref().map(|l| l.path.as_str()), Some("/home/app"), "恢复跟随时要补跳");
     assert_eq!(core.panel_shown(panel.connection).as_deref(), Some("/home/app"));
+
+    close_panel_impl(core.as_ref(), panel.connection).await.unwrap();
+    close_session_impl(core.as_ref(), session.id).await.unwrap();
+    server.shutdown().await;
+}
+
+/// 提权看文件的完整接缝：免登录复用 + 各占一个号 + 停在用户正看着的目录。
+///
+/// 这一段在 `dbhx-ssh`/`dbhx-sftp` 各有用例，但那两边测的是「通道」；这里测的是
+/// 命令层把它接成面板之后的那些决定——号给错、面板被顶掉、起点跳到 `/root`，
+/// 都只有在这一层才看得见。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_elevated_panel_shares_the_login_and_keeps_the_directory() {
+    let server = started_server().await;
+    let (core, mut rx) = live_core("elevate");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
+        .await
+        .expect("远端 shell 应当开起来");
+    await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
+    write_impl(core.as_ref(), session.id, b"cd /home/app/logs\r".to_vec()).await.unwrap();
+    await_event(&core, &mut rx, "终端切换目录", cwd_reported("/home/app/logs")).await;
+    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
+
+    let root = open_elevated_impl(core.as_ref(), panel.connection, "root".into(), Zeroizing::new("dbhx-test".into()))
+        .await
+        .expect("提权面板应当开起来");
+
+    assert_eq!(root.sudo_user.as_deref(), Some("root"), "面板要带上它是以谁的身份在读写");
+    assert_ne!(root.connection, panel.connection, "提权面板要占另一个号，不能把普通面板顶掉");
+    assert_eq!(root.listing.path, "/home/app/logs", "提权后停在用户正看着的目录，不是 root 的家目录");
+    assert_eq!(root.following, false, "提权面板默认不跟终端的命令行跑");
+    assert_eq!(core.panels.lock().unwrap().len(), 2, "两个面板要同时在表里");
+    assert_eq!(server.observed().auth_attempts.len(), 1, "提权绝不能重新登录");
+
+    // 口令走的是通道数据，不进远端命令行：两头都断言，缺一头都抓不住另一半 bug
+    let seen = server.observed();
+    assert_eq!(seen.sudo_passwords, vec!["dbhx-test".to_string()], "sudo 要拿到口令");
+    assert!(seen.execs.iter().all(|c| !c.contains("dbhx-test")), "命令行里不许出现口令：{:?}", seen.execs);
+
+    // 提权面板上照常列目录
+    let refreshed = browse_impl(core.as_ref(), root.connection, None).await.unwrap();
+    assert_eq!(refreshed.path, "/home/app/logs");
+
+    // 关掉提权面板不影响普通面板：它还留着，号也没被顺手销掉
+    close_panel_impl(core.as_ref(), root.connection).await.unwrap();
+    assert_eq!(core.panels.lock().unwrap().len(), 1);
+    assert!(browse_impl(core.as_ref(), panel.connection, None).await.is_ok());
+
+    close_panel_impl(core.as_ref(), panel.connection).await.unwrap();
+    close_session_impl(core.as_ref(), session.id).await.unwrap();
+    server.shutdown().await;
+}
+
+/// 远端 sudo 说不行，就必须把「不行」原样交给用户。
+///
+/// 这条用例盯的是最坏的一类 bug：提权失败后「好歹把普通身份的目录显示出来」，
+/// 用户会以为自己正拿着 root 的手改文件。这里断言**没有任何新面板**、错误码是
+/// 权限问题、且不可重试。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_sudo_is_reported_and_never_degrades_to_the_plain_identity() {
+    let server = server_running(TestSpec::new().with_fs(sample_fs()).with_sudo_denied()).await;
+    let (core, mut rx) = live_core("elevate-denied");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize::default()).await.expect("shell 应当开起来");
+    await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
+    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
+
+    let err = open_elevated_impl(core.as_ref(), panel.connection, "root".into(), Zeroizing::new("dbhx-test".into()))
+        .await
+        .expect_err("sudoers 拒绝了就不该有面板");
+    assert_eq!(err.code, ErrorCode::PermissionDenied, "{:?}", err.code);
+    assert!(err.message.contains("不允许"), "要说人话：{}", err.message);
+    assert!(!err.retryable, "远端 sudoers 不会因为再点一次就变：{}", err.message);
+    assert!(!err.message.contains("dbhx-test"), "错误文案里不能出现口令：{}", err.message);
+
+    assert_eq!(core.panels.lock().unwrap().len(), 1, "失败绝不能留下第二个面板");
+    assert_eq!(browse_impl(core.as_ref(), panel.connection, None).await.unwrap().path, "/home/app");
 
     close_panel_impl(core.as_ref(), panel.connection).await.unwrap();
     close_session_impl(core.as_ref(), session.id).await.unwrap();

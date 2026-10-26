@@ -4,18 +4,23 @@
 //! 拿到一条 SFTP subsystem 通道。做法是拿终端会话的 `TransportKey` 向池要第二个
 //! lease —— 命中池就不碰凭据，这一点在 `dbhx-session` 里有专门的去重与判等测试。
 //!
+//! 「提权开面板」在此基础上再走一步：同一个键上再起一条**跑在 sudo 里的** sftp-server
+//! （`dbhx-ssh::sudo_sftp`）。它和普通面板各占一个连接号、可以并存；口令只在这一次
+//! 调用里存在，失败直接报错，没有「退回普通身份」的分支。
+//!
 //! 命令层持有一切异步等待之外的东西：`Mutex<Panels>` 的 guard 一律在 `await` 之前释放，
 //! 否则一次慢速 `browse` 会把所有面板的命令钉住。
 
 use std::sync::Arc;
 
 use dbhx_model::{DirListing, ErrorCode, HostId, IpcError, Protocol, SessionId};
-use dbhx_session::{LeaseKind, TransportKey};
+use dbhx_session::{Lease, LeaseKind, TransportKey};
 use dbhx_sftp::{CwdSource, FollowGate, SftpClient};
 use dbhx_sftp::path;
+use zeroize::Zeroizing;
 
 use crate::events::SftpFollowed;
-use crate::state::{Core, Panel, PanelInfo};
+use crate::state::{Core, Panel, PanelInfo, not_found_panel};
 
 /// 从终端 tab 打开面板：复用那条 transport，并尽量停在终端当前目录。
 pub async fn open_for_session_impl(core: &Core, session: SessionId) -> Result<PanelInfo, IpcError> {
@@ -55,7 +60,6 @@ async fn open_panel(core: &Core, key: TransportKey, terminal_cwd: Option<&str>) 
     }
 
     let lease = core.pool.acquire(key.clone(), LeaseKind::Sftp).await?;
-    let endpoint = lease.endpoint().clone();
     let stream = lease.open_subsystem("sftp".to_string()).await?;
     let client = SftpClient::connect(stream).await?;
 
@@ -69,6 +73,64 @@ async fn open_panel(core: &Core, key: TransportKey, terminal_cwd: Option<&str>) 
         Some(p) => Some(p),
         None => client.canonicalize(".").await.ok(),
     };
+
+    register_panel(core, connection, lease, client, raw_start, terminal_cwd, None).await
+}
+
+/// 提权开面板：在**同一条已认证 transport** 上起一条跑在 sudo 里的 sftp-server。
+///
+/// `connection` 是用户当前看着的那个面板的号（普通面板或另一个提权面板都行）：前端只
+/// 需要说「把这个面板提权成 root」，不必知道 transport 的键长什么样。
+///
+/// 口令只在参数里活到通道建起来那一刻：不进 vault、不进日志、不进远端命令行（见
+/// `dbhx_ssh::sudo_sftp`）。失败原样抛出——这里没有任何「退回普通身份」的分支。
+pub async fn open_elevated_impl(
+    core: &Core,
+    connection: u32,
+    sudo_user: String,
+    password: Zeroizing<String>,
+) -> Result<PanelInfo, IpcError> {
+    core.require_unlocked()?;
+    let key = core.conn_key(connection).ok_or_else(|| not_found_panel(connection))?;
+    let target = core.elevated_conn_id_of(&key, &sudo_user);
+    if let Some(info) = existing_panel(core, target) {
+        return Ok(info);
+    }
+
+    // 起点的选择和普通面板不同：普通面板跟着终端的目录，提权面板接着**用户正在看的
+    // 那个目录**。提权是为了在同一处改权限属主，而不是为了跳到 root 的家目录。
+    let lease = core.pool.acquire(key.clone(), LeaseKind::Sftp).await?;
+    let shown = core.panel_shown(connection);
+    let stream = lease.open_sftp_elevated(sudo_user.clone(), password).await?;
+    let client = SftpClient::connect(stream).await?;
+
+    let from_panel = match shown {
+        Some(dir) => client.canonicalize(&dir).await.ok(),
+        None => None,
+    };
+    let raw_start = match from_panel {
+        Some(p) => Some(p),
+        None => client.canonicalize(".").await.ok(),
+    };
+
+    register_panel(core, target, lease, client, raw_start, None, Some(sudo_user)).await
+}
+
+/// 建好客户端之后公共的那一段：定起点、列目录、把面板挂上登记表。
+///
+/// 提权和普通两条路径共用它，于是「面板显示的目录」和「门控记账的目录」只可能从
+/// 一处写入。区别只在跟随：普通面板从终端那一跳开起来，就该继续跟着终端走；
+/// 提权面板停在用户正在看的那个目录，不能被另一个身份的命令行拽来拽去。
+async fn register_panel(
+    core: &Core,
+    connection: u32,
+    lease: Lease,
+    client: SftpClient,
+    raw_start: Option<String>,
+    terminal_cwd: Option<&str>,
+    sudo_user: Option<String>,
+) -> Result<PanelInfo, IpcError> {
+    let endpoint = lease.endpoint().clone();
     let start = raw_start
         .map(|p| path::normalize(&p))
         .ok_or_else(|| IpcError::new(ErrorCode::Unreachable, "远端目录解析失败，请检查 sftp subsystem 是否可用", true))?;
@@ -82,11 +144,22 @@ async fn open_panel(core: &Core, key: TransportKey, terminal_cwd: Option<&str>) 
         let generation = gate.generation();
         gate.report(generation, terminal_cwd, CwdSource::Osc7, &blacklist);
     }
+    if sudo_user.is_some() {
+        gate.user_browsed(&listing.path);
+    }
+    let following = gate.is_following();
+    let shown_sudo = sudo_user.clone();
 
-    core.panels.lock().unwrap_or_else(|p| p.into_inner())
-        .insert(Panel { connection, client: client.clone(), lease, gate, shown: listing.path.clone() });
+    core.panels.lock().unwrap_or_else(|p| p.into_inner()).insert(Panel {
+        connection,
+        client,
+        lease,
+        gate,
+        shown: listing.path.clone(),
+        sudo_user,
+    });
 
-    Ok(PanelInfo { connection, endpoint, listing, following: true })
+    Ok(PanelInfo { connection, endpoint, listing, following, sudo_user: shown_sudo })
 }
 
 /// 已经开着的面板：直接把当前展示的状态回给前端，不开新通道。
@@ -98,6 +171,7 @@ fn existing_panel(core: &Core, connection: u32) -> Option<PanelInfo> {
         endpoint: panel.lease.endpoint().clone(),
         listing: DirListing { path: panel.shown.clone(), entries: vec![] },
         following: panel.gate.is_following(),
+        sudo_user: panel.sudo_user.clone(),
     })
 }
 
@@ -215,6 +289,18 @@ pub async fn sftp_open_for_host(core: State<'_>, host_id: HostId) -> Result<Pane
     open_for_host_impl(&core, host_id).await
 }
 
+/// 把当前面板提权成 `sudo_user`：口令只用于这一次 `sudo -A`。
+#[tauri::command]
+#[specta::specta]
+pub async fn sftp_open_elevated(
+    core: State<'_>,
+    connection: u32,
+    sudo_user: String,
+    password: String,
+) -> Result<PanelInfo, IpcError> {
+    open_elevated_impl(&core, connection, sudo_user, Zeroizing::new(password)).await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn sftp_browse(core: State<'_>, connection: u32, path: Option<String>) -> Result<DirListing, IpcError> {
@@ -322,6 +408,40 @@ mod tests {
         assert!(matches!(err.code, ErrorCode::ChannelClosed | ErrorCode::Unreachable), "{:?}", err.code);
         assert_eq!(core.panels.lock().unwrap().len(), 0);
         assert_eq!(core.conn_id_count(), 1, "拨号失败也要留号：同一主机重试不该换号");
+    }
+
+    #[tokio::test]
+    async fn elevating_a_panel_that_was_never_opened_reports_the_same_shape_as_a_missing_one() {
+        // 前端只会带着它正看着的那个号来提权；号认不出来就是面板没了，不该走到拨号
+        let (core, _rx) = crate::state::tests_harness("elevate-no-panel", crate::state::fake_dialer());
+        let err = open_elevated_impl(&core, 42, "root".into(), Zeroizing::new("hunter2".into())).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(!err.retryable);
+        assert_eq!(core.conn_id_count(), 0, "反查不到 transport 就不该登记任何号");
+    }
+
+    #[tokio::test]
+    async fn a_locked_app_refuses_elevation_before_it_touches_the_pool() {
+        let (core, _rx) = crate::state::tests_harness("elevate-locked", crate::state::fake_dialer());
+        let connection = core.conn_id_of(&sample_key("db12"));
+        core.locked.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let err = open_elevated_impl(&core, connection, "root".into(), Zeroizing::new("hunter2".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Locked);
+        assert!(!err.message.contains("hunter2"), "错误文案里不能带出口令：{}", err.message);
+        assert_eq!(core.conn_id_count(), 1, "被锁挡住时不该多出一个提权号");
+        assert_eq!(core.panels.lock().unwrap().len(), 0);
+    }
+
+    fn sample_key(host: &str) -> TransportKey {
+        TransportKey::new(
+            HostId("h9".into()),
+            dbhx_model::LiveEndpoint { host: host.into(), port: 22, username: "app".into() },
+            dbhx_model::AuthRef::Agent,
+            0,
+        )
     }
 
     fn add_host(core: &Arc<Core>, host: &str) -> HostId {

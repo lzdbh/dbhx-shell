@@ -18,6 +18,7 @@ use dbhx_ssh::{
     SubsystemStream, TrustAll,
 };
 use tokio::sync::watch;
+use zeroize::Zeroizing;
 
 /// 假连接：只实现池真正会用到的那几件事（状态、关闭、等关闭）。
 struct FakeConn {
@@ -68,6 +69,14 @@ impl PooledConnection for FakeConn {
     fn open_subsystem(
         &self,
         _name: String,
+    ) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
+        Box::pin(async { Err(SshError::Closed) })
+    }
+
+    fn open_sftp_elevated(
+        &self,
+        _sudo_user: String,
+        _password: Zeroizing<String>,
     ) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
         Box::pin(async { Err(SshError::Closed) })
     }
