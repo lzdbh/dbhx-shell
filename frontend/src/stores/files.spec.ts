@@ -11,6 +11,7 @@ vi.mock('../lib/ipc/client', () => ({
   sftpApi: {
     openForSession: vi.fn(),
     openForHost: vi.fn(),
+    openElevated: vi.fn(),
     browse: vi.fn(),
     setFollowing: vi.fn(),
     setEditing: vi.fn(),
@@ -50,12 +51,13 @@ function listing(path: string, names: string[]): DirListing {
   return { path, entries: names.map(name => entry(name)) }
 }
 
-function panelInfo(connection: number, path: string, following = true): PanelInfo {
+function panelInfo(connection: number, path: string, following = true, sudoUser: string | null = null): PanelInfo {
   return {
     connection,
     endpoint: { host: '10.0.0.1', port: 22, username: 'app' },
     listing: listing(path, ['app.log']),
     following,
+    sudo_user: sudoUser,
   }
 }
 
@@ -131,6 +133,34 @@ describe('files store', () => {
     await files.close(3)
     expect(files.panelForSession(1)).toBeUndefined()
     expect(files.open.length).toBe(0)
+  })
+})
+
+describe('提权面板', () => {
+  /** 后端的提权面板是**另一个号**：普通面板要继续活着，退出提权才不用重新拨通道。 */
+  it('registers the elevated panel beside the plain one and remembers the identity', async () => {
+    const files = useFilesStore()
+    await files.openForSession(1)
+    mock.openElevated.mockResolvedValue(panelInfo(9, '/etc', false, 'root'))
+
+    const opened = await files.openElevated(3, 'root', 'hunter2')
+    expect(mock.openElevated).toHaveBeenCalledWith(3, 'root', 'hunter2')
+    expect(opened?.connection).toBe(9)
+    expect(opened?.sudoUser).toBe('root')
+    expect(files.panel(3)?.sudoUser).toBeNull()
+    expect(files.lastConnection).toBe(9)
+  })
+
+  it('keeps the plain panel and says why sudo refused', async () => {
+    const files = useFilesStore()
+    await files.openForSession(1)
+    mock.openElevated.mockRejectedValue(new Error('远端 sudo 不允许用户 app 提权'))
+
+    expect(await files.openElevated(3, 'root', 'hunter2')).toBeNull()
+    expect(files.openError).toContain('不允许')
+    expect(files.panel(3)).toBeDefined()
+    expect(files.open.length).toBe(1)
+    expect(files.lastConnection).toBe(3)
   })
 })
 

@@ -132,6 +132,13 @@ function localOpen(entry: FileEntry): void {
 /* ── 远端栏 ────────────────────────────────────────────── */
 
 const conn = ref<number | null>(null)
+/**
+ * 这条窗口里的**普通身份**面板号。
+ *
+ * 提权面板是另一个号、另一个面板，两者在后端并存；这里留住原来那个，
+ * 「退出提权」才能直接换回去而不用重新开一次（重开要再拨一条 subsystem 通道）。
+ */
+const plainConn = ref<number | null>(null)
 const remoteError = ref<string | null>(null)
 const remoteSelected = ref<string[]>([])
 
@@ -140,11 +147,15 @@ const remotePath = computed(() => panel.value?.path ?? '')
 const remoteEntries = computed<FileEntry[]>(() => panel.value?.entries ?? [])
 const remoteLoading = computed(() => panel.value?.loading ?? false)
 const remoteBusy = computed(() => panel.value?.busy ?? null)
+/** 这个面板是不是提权来的——决定工具栏那个按钮是「提权」还是「退出提权」。 */
+const elevated = computed(() => panel.value?.sudoUser ?? null)
 
 async function openRemote(): Promise<void> {
   const opened = await files.openForHost(props.hostId)
-  if (opened) conn.value = opened.connection
-  else remoteError.value = files.openError
+  if (opened) {
+    conn.value = opened.connection
+    plainConn.value = opened.connection
+  } else remoteError.value = files.openError
 }
 
 async function browseRemote(target: string | null): Promise<void> {
@@ -187,6 +198,75 @@ function remoteOpen(entry: FileEntry): void {
   if (conn.value === null) return
   if (entry.kind === 'dir') void browseRemote(entry.path)
   else void files.editRemote(conn.value, entry)
+}
+
+/* ── 提权看文件 ────────────────────────────────────────── */
+
+/**
+ * 提权对话框的状态。
+ *
+ * `password` 是 `a-input-password` 双向绑定不得不开的响应式字段——这是全流程里明文
+ * 唯一停留的地方：提交和取消都立刻清掉它，绝不写进 store，也绝不在重试时复用（每次
+ * 都要求用户重新敲，后端拿到就封进 `Zeroizing`）。
+ */
+const elevate = reactive({
+  open: false,
+  user: 'root',
+  password: '',
+  busy: false,
+  error: null as string | null,
+})
+
+function askElevate(): void {
+  elevate.user = 'root'
+  elevate.password = ''
+  elevate.error = null
+  elevate.busy = false
+  elevate.open = true
+}
+
+function cancelElevate(): void {
+  elevate.password = ''
+  elevate.open = false
+}
+
+async function submitElevate(): Promise<void> {
+  if (conn.value === null) return
+  const user = elevate.user.trim()
+  const password = elevate.password
+  elevate.password = ''
+  if (user === '') {
+    elevate.error = '请填写要提权到的用户'
+    return
+  }
+  if (password === '') {
+    elevate.error = '请填写当前用户的登录口令'
+    return
+  }
+  elevate.busy = true
+  // 从提权面板再提权（换一个用户）时不动 plainConn：它始终指着普通身份那一个
+  const from = conn.value
+  const opened = await files.openElevated(from, user, password)
+  elevate.busy = false
+  if (!opened) {
+    // 后端在这里只会给「远端 sudo 不允许」或「口令不对」这类结论。绝不能退回去用
+    // 普通身份显示——那样用户会以为自己正拿着 root 的手改文件。
+    elevate.error = files.openError ?? '提权失败，远端 sudo 不允许该用户'
+    return
+  }
+  if (elevated.value === null) plainConn.value = from
+  elevate.open = false
+  elevate.error = null
+  conn.value = opened.connection
+}
+
+/** 关掉提权面板，回到普通身份那一个。原面板一直挂在后端，不需要重新拨通道。 */
+async function exitElevate(): Promise<void> {
+  if (conn.value === null || plainConn.value === null) return
+  const closed = conn.value
+  conn.value = plainConn.value
+  await files.close(closed)
+  await browseRemote(null)
 }
 
 /* ── 两栏之间传输 ──────────────────────────────────────── */
@@ -280,8 +360,10 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   stopWatch?.()
   stopBridge?.()
-  // close 里会把这台主机的编辑往返一起收掉：窗口没了还留一个轮询在改远端文件是不能接受的
-  if (conn.value !== null) void files.close(conn.value)
+  // close 里会把这台主机的编辑往返一起收掉：窗口没了还留一个轮询在改远端文件是不能接受的。
+  // 提权面板和普通面板是两个号，两个都得关——只关当前那个会把另一个连同它的 lease 留在后端。
+  const opened = new Set([conn.value, plainConn.value].filter((v): v is number => v !== null))
+  for (const connection of opened) void files.close(connection)
 })
 </script>
 
@@ -299,6 +381,8 @@ onBeforeUnmount(() => {
         <!-- 和标签栏同一个点：a-tag 的 green 是组件库预设色，跟 --ok 不是一套，
              同一件事在两个窗口里会给出两种绿 -->
         <span class="status"><span class="dot" :class="conn !== null ? 'ok' : 'down'" />{{ conn !== null ? '已连接' : '未连接' }}</span>
+        <!-- 提权身份必须写在明面上：这一栏的每次写入都是以它发生的 -->
+        <span v-if="elevated !== null" class="sudo">以 {{ elevated }} 查看</span>
         <span class="spacer" />
         <WindowControls v-if="!mac" />
       </div>
@@ -367,8 +451,45 @@ onBeforeUnmount(() => {
           @drop="paths => void uploadPaths(paths)"
           @editing="remoteEditing"
           @dismiss="remoteError = null"
-        />
+        >
+          <template #tools>
+            <a-button v-if="elevated === null" size="small" :disabled="conn === null" @click="askElevate">
+              提权
+            </a-button>
+            <a-button v-else size="small" @click="void exitElevate()">
+              退出提权
+            </a-button>
+          </template>
+        </FilePane>
       </div>
+
+      <!-- 提权：口令只用于这一次 sudo，不进 vault、不进日志、不进远端命令行 -->
+      <a-modal
+        v-model:open="elevate.open"
+        title="以 sudo 提权查看远端文件"
+        ok-text="提权"
+        cancel-text="取消"
+        :confirm-loading="elevate.busy"
+        :mask-closable="false"
+        @ok="void submitElevate()"
+        @cancel="cancelElevate()"
+      >
+        <a-alert
+          message="口令只用于这一次提权"
+          description="用它把当前登录用户的口令交给远端 sudo，不会存进本机凭据库；提权失败只会报错，不会退回普通身份继续显示。"
+          type="info"
+          show-icon
+        />
+        <a-form layout="vertical" style="margin-top: 12px">
+          <a-form-item label="提权到的用户">
+            <a-input v-model:value="elevate.user" placeholder="root" autocomplete="off" />
+          </a-form-item>
+          <a-form-item :label="`当前用户的口令（${subtitle}）`">
+            <a-input-password v-model:value="elevate.password" autocomplete="off" @press-enter="void submitElevate()" />
+          </a-form-item>
+        </a-form>
+        <p v-if="elevate.error" class="elevate-error">{{ elevate.error }}</p>
+      </a-modal>
 
       <TransferTray />
       <!-- 右键菜单的浮层：文件窗口是另一个 webview，`App.vue` 里那个实例在这儿不存在，
@@ -451,6 +572,19 @@ onBeforeUnmount(() => {
 
 .dot.down {
   background: var(--warn);
+}
+
+/* 提权身份标记：刻意用警告色而不是主色，它代表「这一栏的写操作权限更大」 */
+.sudo {
+  font-size: 12px;
+  color: var(--warn);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+
+.elevate-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--warn);
 }
 
 .panes {

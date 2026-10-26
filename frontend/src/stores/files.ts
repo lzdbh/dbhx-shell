@@ -28,6 +28,13 @@ export interface FilePanel {
   error: string | null
   /** 后台正在这栏里做什么（外部编辑器往返）。`null` 表示空闲。 */
   busy: string | null
+  /**
+   * 这个面板是以谁的身份在读写（`sudo` 提权过），`null` 是登录用户本人。
+   *
+   * 必须显示出来：用户点了提权就该看得见自己正拿着 root 的手改文件。
+   * 后端在建通道那一刻用完口令就丢，这里只有用户名。
+   */
+  sudoUser: string | null
 }
 
 /** 门控的「停在这里」原因翻成用户看得懂的话。 */
@@ -87,16 +94,7 @@ export const useFilesStore = defineStore('files', () => {
     try {
       const info: PanelInfo = await sftpApi.openForSession(session)
       const existing = panels.get(info.connection)
-      const created = existing ?? reactive({
-        connection: info.connection,
-        path: info.listing.path,
-        entries: info.listing.entries,
-        following: info.following,
-        hold: null,
-        loading: false,
-        error: null,
-        busy: null,
-      } satisfies FilePanel)
+      const created = existing ?? newPanel(info, info.following)
       if (existing) applyListing(created, info.listing)
       panels.set(info.connection, created)
       bySession.set(session, info.connection)
@@ -113,16 +111,7 @@ export const useFilesStore = defineStore('files', () => {
   async function openForHost(hostId: string): Promise<FilePanel | null> {
     try {
       const info: PanelInfo = await sftpApi.openForHost(hostId)
-      const created = panels.get(info.connection) ?? reactive({
-        connection: info.connection,
-        path: info.listing.path,
-        entries: info.listing.entries,
-        following: false,
-        hold: null,
-        loading: false,
-        error: null,
-        busy: null,
-      } satisfies FilePanel)
+      const created = panels.get(info.connection) ?? newPanel(info, false)
       if (panels.has(info.connection)) applyListing(created, info.listing)
       panels.set(info.connection, created)
       lastConnection.value = info.connection
@@ -132,6 +121,44 @@ export const useFilesStore = defineStore('files', () => {
       openError.value = describeIpcError(normalizeIpcError(err))
       return null
     }
+  }
+
+  /**
+   * 把用户正看着的那个面板提权成 `sudoUser`。
+   *
+   * 提权面板是**另一个面板**（后端另发一个 connection 号，和普通面板并存），
+   * 原面板在后台还活着，所以「退出提权」只是关掉这一个、把号换回去，不重新登录。
+   *
+   * `password` 在这条语句里就交给后端了：不要把它存进 store、ref 或任何响应式对象，
+   * 也不要在失败后重试时复用——那等于让明文在 JS 堆上多活一轮。
+   */
+  async function openElevated(connection: number, sudoUser: string, password: string): Promise<FilePanel | null> {
+    try {
+      const info: PanelInfo = await sftpApi.openElevated(connection, sudoUser, password)
+      const created = panels.get(info.connection) ?? newPanel(info, false)
+      if (panels.has(info.connection)) applyListing(created, info.listing)
+      panels.set(info.connection, created)
+      lastConnection.value = info.connection
+      openError.value = null
+      return created
+    } catch (err) {
+      openError.value = describeIpcError(normalizeIpcError(err))
+      return null
+    }
+  }
+
+  function newPanel(info: PanelInfo, following: boolean): FilePanel {
+    return reactive({
+      connection: info.connection,
+      path: info.listing.path,
+      entries: info.listing.entries,
+      following,
+      hold: null,
+      loading: false,
+      error: null,
+      busy: null,
+      sudoUser: info.sudo_user ?? null,
+    } satisfies FilePanel)
   }
 
   /** 打开失败的原因，只有调用点的 toast 需要它。 */
@@ -505,6 +532,7 @@ export const useFilesStore = defineStore('files', () => {
     panelForSession,
     openForSession,
     openForHost,
+    openElevated,
     browse,
     enter,
     toggleFollow,
