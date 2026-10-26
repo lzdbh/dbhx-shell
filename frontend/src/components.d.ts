@@ -32,7 +32,6 @@ declare module 'vue' {
     AProgress: typeof import('ant-design-vue/es')['Progress']
     ASegmented: typeof import('ant-design-vue/es')['Segmented']
     ASelect: typeof import('ant-design-vue/es')['Select']
-    ASelectOptGroup: typeof import('ant-design-vue/es')['SelectOptGroup']
     ASelectOption: typeof import('ant-design-vue/es')['SelectOption']
     AskModal: typeof import('./components/AskModal.vue')['default']
     ASpin: typeof import('ant-design-vue/es')['Spin']
