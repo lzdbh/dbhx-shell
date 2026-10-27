@@ -111,7 +111,18 @@ jobs:
 
       # dbhx-ipc 的 codegen 测试会重新生成 frontend/src/lib/ipc/bindings.ts。
       - name: cargo test
-        run: cargo test --workspace
+        shell: bash -eo pipefail {0}
+        run: |
+          mkdir -p .ci-logs
+          cargo test --workspace 2>&1 | tee .ci-logs/cargo-test.log
+
+      # 同 check：annotation 只留退出码，哪个用例在哪个平台炸的要自己捞。
+      - name: Upload cargo test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-test-${{ matrix.os }}
+          path: .ci-logs/cargo-test.log
 
       # bindings.ts 是提交进仓库的生成物：Rust 契约改了但忘了重生成，这里就红。
       - name: Fail on generated-binding drift
