@@ -153,22 +153,28 @@ jobs:
       - uses: swatinem/rust-cache@v2
 
       - name: Build the test binaries
-        shell: bash -uo pipefail {0}
+        shell: bash -o pipefail {0}
         run: |
           mkdir -p .ci-logs
           cargo build --tests -p dbhx-pty -p dbhx-ipc 2>&1 | tee .ci-logs/probe-build.log
 
       - name: Run and watch
-        shell: bash -uo pipefail {0}
+        shell: bash -o pipefail {0}
+        # 这个 step 的 stdout 在网页上也取不到（job log 端点在这台机器上 404），
+        # 所以所有话都往 .ci-logs/probe.log 里写一份，靠 artifact 运回来。
         run: |
           mkdir -p .ci-logs
           LOG=.ci-logs/probe.log
+          echo "== 探针开始 $(date -u +%FT%TZ)" > "$LOG"
+
           {
             echo "== sw_vers"; sw_vers
-            echo "== SHELL=$SHELL HOME=$HOME USER=$USER"
-            echo "== passwd 里的 shell（portable-pty 在 \$SHELL 为空时读这个）"
-            dscl . -read "/Users/$USER" UserShell || echo "dscl 读不到"
+            echo "== SHELL=${SHELL:-<未设置>} HOME=${HOME:-<未设置>} USER=${USER:-<未设置>}"
+            echo "== passwd 里的 shell（portable-pty 在 SHELL 为空时读这个）"
+            dscl . -read "/Users/${USER:-runner}" UserShell || echo "dscl 读不到"
             echo "== portable-pty 版本"; grep -A2 'name = "portable-pty"' Cargo.lock
+            echo "== 测试二进制"
+            ls -l target/debug/deps/dbhx_pty-* target/debug/deps/dbhx_ipc-* | grep -v '\.d$'
           } >> "$LOG" 2>&1
 
           BIN_PTY=$(ls -t target/debug/deps/dbhx_pty-* 2>/dev/null | grep -v '\.d$' | head -1)
@@ -177,24 +183,27 @@ jobs:
 
           # 起一个测试二进制，最多看 75 秒。退出就报退出码；还活着就抓现场再掐掉。
           watch() {
-            local name=$1; shift
+            name=$1; shift
             echo "==== $name: $*" | tee -a "$LOG"
             "$@" > "/tmp/$name.out" 2>&1 &
-            local pid=$! waited=0
+            pid=$!; waited=0
             while [ "$waited" -lt 75 ]; do
               if ! kill -0 "$pid" 2>/dev/null; then
-                wait "$pid"; local rc=$?
+                wait "$pid"; rc=$?
                 echo "$name 在 ${waited}s 内退出，rc=$rc" | tee -a "$LOG"
-                tail -20 "/tmp/$name.out" | tee -a "$LOG"
+                tail -25 "/tmp/$name.out" | tee -a "$LOG"
                 return "$rc"
               fi
               sleep 5; waited=$((waited + 5))
             done
             echo "$name 卡住：抓现场" | tee -a "$LOG"
-            ps -axww -o pid,ppid,state,wchan,command \
-              | grep -iE "dbhx_|/bin/(ba)?sh|zsh|login|echo" | grep -v grep >> "$LOG" || true
-            sample "$pid" 2 -mayDie >> "$LOG" 2>&1 || echo "sample 失败" >> "$LOG"
-            tail -20 "/tmp/$name.out" | tee -a "$LOG"
+            {
+              echo "-- ps --"
+              ps -axww -o pid,ppid,state,wchan,command | grep -iE "dbhx_|/bin/(ba)?sh|zsh|login|echo" | grep -v grep
+              echo "-- sample $pid --"
+              sample "$pid" 2 -mayDie
+            } >> "$LOG" 2>&1 || echo "现场抓取失败" >> "$LOG"
+            tail -25 "/tmp/$name.out" | tee -a "$LOG"
             kill -9 "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             return 124
@@ -213,7 +222,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-pty-probe
-          path: .ci-logs/probe*.log
+          # 只写死的文件名，不用通配：@actions/glob 的通配搜索会跳过以 `.` 开头的
+          # 目录，`.ci-logs/probe*.log` 匹配不到任何东西（上一次就是这么把日志弄丢的）。
+          path: |
+            .ci-logs/probe.log
+            .ci-logs/probe-build.log
+          if-no-files-found: error
 
   frontend:
     name: frontend build
