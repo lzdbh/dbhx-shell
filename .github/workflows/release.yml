@@ -41,22 +41,28 @@ jobs:
           - label: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
           - label: windows-arm64
             os: windows-latest
             target: aarch64-pc-windows-msvc
+            rust_targets: aarch64-pc-windows-msvc
           # universal-apple-darwin 一次产出含 x86_64 + aarch64 两个切片的 .dmg/.app，
           # 比拆成两个 job 再合并 dmg 省事，且 mac 用户不需要知道自己该下哪个。
+          # 但它是 Tauri 的合成 triple，rustup 里没有，所以装的是两个真 slice target。
           - label: macos-universal
             os: macos-latest
             target: universal-apple-darwin
+            rust_targets: x86_64-apple-darwin,aarch64-apple-darwin
           - label: linux-x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
           # aarch64 用原生 arm64 runner：Debian/Ubuntu 没有 libwebkit2gtk-4.1-dev 的
           # arm64 交叉包，交叉打包在 x64 runner 上装不出依赖。
           - label: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v5
@@ -86,7 +92,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -119,7 +125,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          releaseTag: ${{ github.event.inputs.tag || github.ref_name }}
+          # 输入名是 tagName，不是 releaseTag：写错的话五条 job 会把包全打完，
+          # 再在上传 Release 那一步一起报 "Unexpected input(s)"，白烧一小时 runner。
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
           projectPath: src-tauri
           args: --target ${{ matrix.target }} --verbose
 
