@@ -196,10 +196,3 @@ build.rs 里编 C，交叉 arm64 直接崩），存储层不引 `rusqlite/bundle
 - telnet 的 IAC 状态机带跨包重组与 `0xFF` 转义；协商策略只认 ECHO / SGA / STATUS / NAWS
   这四个选项，对端要启用就接受、请求我方启用的一律 `DONT`，其余选项礼貌拒绝。
   真实 telnet 服务器上的端到端表现**未验证**（离线用纯函数与进程内 TCP 服务器钉住了协议本身）
-
-## 与 Netcatty 的关系
-
-行为规格参考了 GPL-3.0 的 Netcatty，但这是**干净室重写**：本仓库不包含它的任何代码，
-`Netcatty-main/` 与它的 zip 都在 `.gitignore` 里，只是本地只读参考。
-有几条规则确实是照着它的行为抄的（判等用实时 endpoint、最后一个 lease 不等于断开、
-SFTP 复用同一条连接），抄的是**规则**，实现与注释全部重写。

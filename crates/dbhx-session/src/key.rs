@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use dbhx_model::{AuthRef, HostId, LiveEndpoint};
 
-/// Netcatty 用 10 元组（含跳板链指纹、代理指纹、协议、sudo 等）。M1 只有 SSH + vault
+/// 参考实现用 10 元组（含跳板链指纹、代理指纹、协议、sudo 等）。M1 只有 SSH + vault
 /// 凭据，所以只保留真正会改变「连到哪、以谁的身份、按什么算法偏好」的四个量。
 /// 将来加跳板机时在这里补 `jump_fingerprint`，不要另起一套键。
 ///

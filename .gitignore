@@ -12,10 +12,6 @@ src-tauri/gen/
 # 注意：frontend/src/lib/ipc/bindings.ts 是生成物但**要提交**，
 # CI 会重新生成并 diff，用来抓 Rust 与 TS 契约漂移。
 
-# 参考实现（GPL-3.0，只读参考，绝不提交进本仓库）
-Netcatty-main/
-Netcatty-main.zip
-
 # 编辑器与系统
 .idea/
 .vscode/
