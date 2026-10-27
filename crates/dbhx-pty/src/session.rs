@@ -19,7 +19,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dbhx_model::PtySize;
 use portable_pty::{native_pty_system, Child, ChildKiller, MasterPty};
@@ -41,6 +41,12 @@ const IDLE_POLL: Duration = Duration::from_millis(20);
 /// 单次读缓冲。终端输出的突发（`cat` 大文件）会远超这个值，
 /// 靠 chunk 分片喂给前端反而更顺，不必在此放大。
 const READ_CHUNK: usize = 8 * 1024;
+
+/// 「我们主动终止」之后等子进程咽气的时间，以及 SIGHUP 无效后再强杀的同样的时间。
+/// 两段的量级都由「人关掉一个标签页后愿意为主进程退出等多久」决定，而不是由
+/// 子进程的实际退出速度决定：正常 shell 收到 SIGHUP 是毫秒级的事，2 秒纯属富余，
+/// 真正吃满这两段的只有「改了信号处置、赖着不死」的进程——那种情况下继续等毫无意义。
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// 会话向外界吐的事件。
 #[derive(Debug)]
@@ -332,11 +338,9 @@ fn spawn_owner(
                 // 上层显式 kill，或会话句柄全部 drop（用户关了标签页）：都是「我们主动终止」。
                 // shell 收到 SIGHUP 后会正常退出并给出退出码；上层若要区分自己发起的终止，
                 // 记住自己调用过 kill 即可，不必在这里造第三种状态。
-                // `kill()` 自带宽限（Unix 先 SIGHUP 再强杀，Windows 直接 TerminateProcess），
-                // 所以紧随其后的阻塞 wait 不会长期挂住线程。
                 Ok(OwnerCmd::Stop) | Err(TryRecvError::Disconnected) => {
                     let _ = killer.kill();
-                    exit = child.wait().ok().map(PtyExit::from_status);
+                    exit = reap_after_stop(child.as_mut());
                     break;
                 }
                 Err(TryRecvError::Empty) => std::thread::sleep(IDLE_POLL),
@@ -361,6 +365,86 @@ fn spawn_owner(
         // 离开作用域时 drop master：这会让 reader 收到 EOF，事件流随之结束
     });
 }
+
+/// 主动终止后的回收。**不能直接用 `Child::wait()`**：portable-pty 在 Unix 上给的
+/// killer（`ProcessSignaller`）只发一发 SIGHUP 就返回 Ok，既不保证进程死了、
+/// 也不替我们收尸。子进程要是改了 SIGHUP 的处置（`less`、`vim`、任何显式
+/// `trap '' HUP` 的脚本都会），紧随其后的无界 `wait` 就永久占死一个阻塞线程；
+/// 而 tokio 运行时的 drop 要等阻塞线程池清完，于是「关掉一个本地终端」会升级成
+/// 「整个进程再也不退出」——macOS 上 `cargo test` 挂满 CI 就是这么来的。
+///
+/// 所以这里自己掐表：宽限期内轮询 `try_wait`，到期升级成 SIGKILL 再等一轮，
+/// 还等不到就放弃。返回 `None` 的语义与「查询出错」那条分支一致——事件流照常结束，
+/// 只是不给退出码，绝不编造一个。
+fn reap_after_stop(child: &mut (dyn Child + Send + Sync)) -> Option<PtyExit> {
+    match wait_within(child, KILL_GRACE) {
+        Waited::Exited(status) => Some(PtyExit::from_status(status)),
+        Waited::Timeout => {
+            force_kill(child);
+            match wait_within(child, KILL_GRACE) {
+                Waited::Exited(status) => Some(PtyExit::from_status(status)),
+                Waited::Timeout => {
+                    tracing::warn!("子进程强杀后仍未在预算内回收，放弃等待");
+                    None
+                }
+                Waited::Failed => None,
+            }
+        }
+        Waited::Failed => None,
+    }
+}
+
+enum Waited {
+    Exited(portable_pty::ExitStatus),
+    Timeout,
+    Failed,
+}
+
+fn wait_within(child: &mut (dyn Child + Send + Sync), budget: Duration) -> Waited {
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Waited::Exited(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return Waited::Timeout;
+                }
+                std::thread::sleep(IDLE_POLL);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "pty 子进程状态查询失败");
+                return Waited::Failed;
+            }
+        }
+    }
+}
+
+/// 最后一招。portable-pty 用 `setsid()` 起子进程，它自己就是组长，所以按 pid 发
+/// SIGKILL 即可；shell 起的子命令由随后 drop master 时内核对前台进程组补的那发
+/// SIGHUP 收尾，不归我们管——我们只保证「等在自己面前的这个进程」一定能死。
+///
+/// 本 crate 里唯一需要越过 `unsafe_code = "deny"` 的地方：std 的 `Child::kill`
+/// 语义就是这个，但它被 `dyn Child` 抹掉了，只能自己发信号。
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn force_kill(child: &mut (dyn Child + Send + Sync)) {
+    let Some(pid) = child.process_id() else { return };
+    // SAFETY: kill(2) 只要一个合法的 pid；pid 来自我们自己持有的子进程，
+    // 进程表里没有这个 pid 时它返回 ESRCH，不会误伤别的内存。
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // ESRCH = 已经死了（只是还没收尸），是正常情况；其余才是真出事。
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            tracing::debug!(error = %err, "pty 子进程强杀失败");
+        }
+    }
+}
+
+/// Windows 上 `killer.kill()` 走的是 `TerminateProcess`，本来就是立即且强制的，
+/// 到不了这里；到了也只能干等，保留同一套预算语义。
+#[cfg(windows)]
+fn force_kill(_child: &mut (dyn Child + Send + Sync)) {}
 
 #[cfg(test)]
 mod tests {
@@ -477,6 +561,22 @@ mod tests {
         session.kill();
         let (_, exit) = drain(&mut session).await;
         assert!(exit.is_some(), "kill 之后必须给出退出事件，否则 UI 不知道标签页可以回收");
+    }
+
+    /// 对 SIGHUP 免疫的子进程也必须收尾。portable-pty 在 Unix 上的 killer 只发一发
+    /// SIGHUP 就报 Ok，早先这里紧跟一个无界 `Child::wait`：这种进程不把信号当回事，
+    /// owner 线程就永久占死，运行时 drop 再等阻塞线程池——整个测试进程再也不退出。
+    /// 用 `read` 而不是 `sleep`：不派孙进程，pty 从句柄不会在别人手里多留 20 秒。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_ignores_sighup_is_force_reaped() {
+        let spec = LocalSpec::default().program("/bin/sh").args(&["-c", "trap '' HUP; read -r line"]);
+        let mut session = LocalSession::spawn(&spec).unwrap();
+        session.kill();
+        let (_, exit) = drain(&mut session).await;
+        let exit = exit.expect("强杀之后仍要给出退出事件");
+        // 只断「被信号打死」：信号名走的是 strsignal，随系统语言变，不该拿来断言。
+        assert!(exit.signal.is_some() && exit.code.is_none(), "不是信号终止：{exit:?}");
     }
 
     #[tokio::test]

@@ -42,6 +42,9 @@ russh = { version = "0.64", default-features = false, features = [
 ] }
 russh-sftp = "3"
 portable-pty = "0.9"
+# 只有 dbhx-pty 在 unix 上用：SIGHUP 打不死时补一发 SIGKILL。已经在依赖图里
+# （portable-pty → filedescriptor → libc），不是新增下载。
+libc = "0.2"
 
 # 存储层刻意不用 rusqlite/bundled：那会在 build.rs 里跑 cc，
 # 交叉 aarch64-pc-windows-msvc 的 cargo check 需要目标三元组的 C 编译器，CI 矩阵会因此崩。

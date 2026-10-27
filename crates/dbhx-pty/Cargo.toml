@@ -12,5 +12,9 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# unix 上 SIGHUP 无效时的最后一招（见 session.rs 的 force_kill）
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true
