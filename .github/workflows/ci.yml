@@ -110,8 +110,13 @@ jobs:
       - uses: swatinem/rust-cache@v2
 
       # dbhx-ipc 的 codegen 测试会重新生成 frontend/src/lib/ipc/bindings.ts。
+      # timeout 是给「挂死」留的出口：macOS 上这条曾连着跑了 2.5 小时没结束，
+      # 而默认的 360 分钟上限意味着一个死锁的测试要占着一台机器半天，且什么日志
+      # 都不留。掐在这里，下面的 artifact 就能告诉我们停在哪个 `Running unittests`
+      # 之后（编译慢也会在这里露出来：日志末尾是 Compiling 就说明不是挂）。
       - name: cargo test
         shell: bash -eo pipefail {0}
+        timeout-minutes: 40
         run: |
           mkdir -p .ci-logs
           cargo test --workspace 2>&1 | tee .ci-logs/cargo-test.log
