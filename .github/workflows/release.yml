@@ -1,10 +1,15 @@
 name: release
 
-# 打 tag（或手动指定 tag）即触发多端产物构建，并汇总到一个 GitHub Release。
+# 打 tag（或手动指定 tag）即触发多端产物构建，并由 release job 汇总到一个 GitHub Release。
 # 平台矩阵与 ci.yml 的 cargo check 矩阵对齐：Windows x64/arm64、macOS universal、
 # Linux x86_64/aarch64。aarch64-pc-windows-msvc 是在 x64 runner 上交叉链接的
-# （Tauri 会取 VS 的 arm64 工具链 + arm64 版 WiX/NSIS 模板），产物能不能真装到
-# arm64 机器上只能等装机验证，本地没有 arm 设备可跑。
+# （Tauri 取 VS 的 arm64 工具链 + arm64 版 WiX/NSIS 模板），能不能真装到 arm64 机器上
+# 只能等装机验证，本地没有 arm 设备可跑。
+#
+# 为什么不走 tauri-action：它会吞掉底层报错，只留一句 "Release not found or created"
+# （同一份 permissions 下用 curl/gh 建 Release 是通的，见 token-probe 那一轮的结论），
+# 而且失败时把自己上传的 workflow artifact 一并删掉，等于什么都拿不到。
+# 所以打包用 `pnpm tauri build`，产物走 artifact，Release 由收尾 job 的 gh 组装。
 
 on:
   push:
@@ -17,13 +22,27 @@ on:
         required: true
         type: string
 
+# contents: write —— gh 建 Release；actions: read —— release job 下载各平台的 artifact。
+# 一旦显式声明 permissions，未列出的作用域就变成 none，少写一个就是在猜。
 permissions:
   contents: write
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "22"
   PNPM_VERSION: "11.18.0"
+  # 上传 artifact 用的 glob；与下面 Locate 那步的 find 条件是同一份清单，
+  # 免得两处漂移成「传上来的 artifact 里 release job 找不到包」。
+  BUNDLE_GLOBS: |
+    src-tauri/target/**/release/bundle/**/*.msi
+    src-tauri/target/**/release/bundle/**/*.exe
+    src-tauri/target/**/release/bundle/**/*.dmg
+    src-tauri/target/**/release/bundle/**/*.deb
+    src-tauri/target/**/release/bundle/**/*.rpm
+    src-tauri/target/**/release/bundle/**/*.AppImage
+    src-tauri/target/**/release/bundle/**/*.appimage
+    src-tauri/target/**/release/bundle/**/updater/*.sig
 
 jobs:
   build:
@@ -120,16 +139,35 @@ jobs:
           mkdir -p "$BUILD_LOG_DIR"
           pnpm --filter frontend build 2>&1 | tee "$BUILD_LOG_DIR/frontend.log"
 
+      # 不用 tauri-action：它唯一的价值是把「打包 + 传 Release」包在一起，而 Release
+      # 那半正是它吞报错的地方；打包本身只是一条 `tauri build`。本地 frontend/package.json
+      # 已有 @tauri-apps/cli，`pnpm tauri` 就是同一个 CLI，且日志全在 run 输出里。
+      # --no-build：前端在上面一步已经建过（还留了日志），别再让 beforeBuildCommand 跑第二遍。
       - name: Build release artifacts
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm tauri build --target "${{ matrix.target }}" --no-build --verbose
+
+      # glob 一条都不匹配时 upload-artifact 直接判红，所以先自己确认一遍，
+      # 让失败信息是「没打出包」而不是「artifact 上传失败」。
+      - name: Locate bundles
+        run: |
+          echo "bundle files:"
+          find src-tauri/target -type f \
+            \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' \
+               -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.appimage' \
+               -o -name '*.sig' \) -print
+          count=$(find src-tauri/target -type f \( -name '*.msi' -o -name '*.exe' \
+                 -o -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' \
+                 -o -name '*.AppImage' -o -name '*.appimage' \) | wc -l)
+          echo "installers: $count"
+          test "$count" -ge 1
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
         with:
-          # 输入名是 tagName，不是 releaseTag：写错的话五条 job 会把包全打完，
-          # 再在上传 Release 那一步一起报 "Unexpected input(s)"，白烧一小时 runner。
-          tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          projectPath: src-tauri
-          args: --target ${{ matrix.target }} --verbose
+          name: bundles-${{ matrix.label }}
+          path: ${{ env.BUNDLE_GLOBS }}
+          if-no-files-found: error
+          retention-days: 7
 
       # GitHub 的 annotation 只留最后一行，真实报错（vue-tsc 诊断、pnpm 的 ERR_*）
       # 全在中段；而 run log 的下载端点要鉴权，本机没 token 下不动。
@@ -155,3 +193,40 @@ jobs:
           path: ${{ runner.temp }}/build-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundles-*
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: Create or refresh release
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find dist-artifacts -type f \
+            \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' \
+               -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.appimage' \
+               -o -name '*.sig' \) | sort)
+          echo "publishing ${#files[@]} file(s) for $TAG:"
+          printf '  %s\n' "${files[@]}"
+          test "${#files[@]}" -ge 1
+
+          # 重跑同一个 tag 时 Release 已存在：gh release create 会 404/422，
+          # 这里改成复用并覆盖同名资产。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" --draft=false --generate-notes "${files[@]}"
+          fi
+          gh release view "$TAG"
