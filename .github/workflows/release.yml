@@ -142,9 +142,14 @@ jobs:
       # 不用 tauri-action：它唯一的价值是把「打包 + 传 Release」包在一起，而 Release
       # 那半正是它吞报错的地方；打包本身只是一条 `tauri build`。本地 frontend/package.json
       # 已有 @tauri-apps/cli，`pnpm tauri` 就是同一个 CLI，且日志全在 run 输出里。
-      # --no-build：前端在上面一步已经建过（还留了日志），别再让 beforeBuildCommand 跑第二遍。
+      # 别加 --no-build：v2 CLI 没这个选项（只有 --no-bundle），未知 flag 会让五条 job
+      # 在 CLI 启动阶段立刻退 1。代价是 beforeBuildCommand 把前端再建一遍，多几秒而已。
       - name: Build release artifacts
-        run: pnpm tauri build --target "${{ matrix.target }}" --no-build --verbose
+        env:
+          BUILD_LOG_DIR: ${{ runner.temp }}/build-logs
+        run: |
+          mkdir -p "$BUILD_LOG_DIR"
+          pnpm tauri build --target "${{ matrix.target }}" --verbose 2>&1 | tee "$BUILD_LOG_DIR/tauri.log"
 
       # glob 一条都不匹配时 upload-artifact 直接判红，所以先自己确认一遍，
       # 让失败信息是「没打出包」而不是「artifact 上传失败」。
