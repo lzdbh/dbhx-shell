@@ -11,6 +11,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 只为下面那个临时探针 job 开的：平时不占 runner，手动触发才跑。
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -132,6 +134,86 @@ jobs:
       # bindings.ts 是提交进仓库的生成物：Rust 契约改了但忘了重生成，这里就红。
       - name: Fail on generated-binding drift
         run: git diff --exit-code -- frontend/src/lib/ipc/bindings.ts
+
+  # 临时探针（答案拿到就整个删掉）：macOS 上「开本地会话」会永久卡住，而
+  # `LocalSession::spawn` 里的 openpty + fork/exec 是**阻塞调用跑在 async 线程上**，
+  # 所以测试里的 `tokio::time::timeout` 根本等不到定时器——运行时自己的线程被占死了。
+  # 只能从进程外面掐，并且趁它还卡着的时候把现场抓下来：谁还在、停在哪一帧。
+  #
+  # 两组对照：dbhx-pty 的用例都显式给了程序（/bin/echo、/bin/sh），dbhx-ipc 的那三个用
+  # 的是「让 portable-pty 挑默认 shell」。前者挂 = spawn 这条路本身有问题（产品的 bug，
+  # macOS 用户点开本机终端就是卡死）；前者过、后者挂 = 默认 shell 的取值在 macOS 上不对。
+  pty-probe:
+    name: macOS 本地 pty 探针（临时）
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+
+      - name: Build the test binaries
+        shell: bash -uo pipefail {0}
+        run: |
+          mkdir -p .ci-logs
+          cargo build --tests -p dbhx-pty -p dbhx-ipc 2>&1 | tee .ci-logs/probe-build.log
+
+      - name: Run and watch
+        shell: bash -uo pipefail {0}
+        run: |
+          mkdir -p .ci-logs
+          LOG=.ci-logs/probe.log
+          {
+            echo "== sw_vers"; sw_vers
+            echo "== SHELL=$SHELL HOME=$HOME USER=$USER"
+            echo "== passwd 里的 shell（portable-pty 在 \$SHELL 为空时读这个）"
+            dscl . -read "/Users/$USER" UserShell || echo "dscl 读不到"
+            echo "== portable-pty 版本"; grep -A2 'name = "portable-pty"' Cargo.lock
+          } >> "$LOG" 2>&1
+
+          BIN_PTY=$(ls -t target/debug/deps/dbhx_pty-* 2>/dev/null | grep -v '\.d$' | head -1)
+          BIN_IPC=$(ls -t target/debug/deps/dbhx_ipc-* 2>/dev/null | grep -v '\.d$' | head -1)
+          echo "BIN_PTY=$BIN_PTY" "BIN_IPC=$BIN_IPC" >> "$LOG"
+
+          # 起一个测试二进制，最多看 75 秒。退出就报退出码；还活着就抓现场再掐掉。
+          watch() {
+            local name=$1; shift
+            echo "==== $name: $*" | tee -a "$LOG"
+            "$@" > "/tmp/$name.out" 2>&1 &
+            local pid=$! waited=0
+            while [ "$waited" -lt 75 ]; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid"; local rc=$?
+                echo "$name 在 ${waited}s 内退出，rc=$rc" | tee -a "$LOG"
+                tail -20 "/tmp/$name.out" | tee -a "$LOG"
+                return "$rc"
+              fi
+              sleep 5; waited=$((waited + 5))
+            done
+            echo "$name 卡住：抓现场" | tee -a "$LOG"
+            ps -axww -o pid,ppid,state,wchan,command \
+              | grep -iE "dbhx_|/bin/(ba)?sh|zsh|login|echo" | grep -v grep >> "$LOG" || true
+            sample "$pid" 2 -mayDie >> "$LOG" 2>&1 || echo "sample 失败" >> "$LOG"
+            tail -20 "/tmp/$name.out" | tee -a "$LOG"
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+          }
+
+          rc=0
+          watch pty-explicit "$BIN_PTY" --nocapture || rc=1
+          watch ipc-default "$BIN_IPC" --exact \
+            commands::log::tests::stopping_a_session_that_was_never_logged_reports_not_found \
+            --nocapture || rc=1
+          echo "rc=$rc" | tee -a "$LOG"
+          exit "$rc"
+
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-pty-probe
+          path: .ci-logs/probe*.log
 
   frontend:
     name: frontend build
