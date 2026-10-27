@@ -24,3 +24,6 @@ Thumbs.db
 
 # 云同步接口探测脚本：一次性脚手架，令牌从仓库外的文件读，不入库
 tools/sync-probe.mjs
+
+# CI 失败时导出的 cargo check 日志（.github/workflows/ci.yml）
+.ci-logs/

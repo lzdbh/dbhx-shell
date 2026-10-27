@@ -70,15 +70,21 @@ jobs:
           EOF
 
       - name: cargo check
-        run: cargo check --workspace --all-targets --target ${{ matrix.target }} 2>&1 | tee "$RUNNER_TEMP/cargo-check.log"
+        shell: bash -eo pipefail {0}
+        run: |
+          mkdir -p .ci-logs
+          cargo check --workspace --all-targets --target ${{ matrix.target }} 2>&1 | tee .ci-logs/cargo-check.log
 
       # annotation 只留 `Process completed with exit code 101` 这一句，交叉 target 的
       # 真实报错（缺 aarch64 的 C 工具链、pkg-config 找不到目标平台的库等）全在中段，
-      # 而 run log 的下载端点在本机取不到 —— 失败时把日志回打一遍。
-      - name: Dump cargo check log on failure
+      # 而 run log 的下载端点在这台机器上取不到 —— 日志落进 artifact 才看得回来。
+      # glob 不匹配时 upload-artifact 只报 warning，native target 少传一份空包无妨。
+      - name: Upload cargo check log on failure
         if: failure()
-        shell: bash
-        run: tail -n 300 "$RUNNER_TEMP/cargo-check.log"
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-check-${{ matrix.target }}
+          path: .ci-logs/cargo-check.log
 
   test:
     name: cargo test + contract drift (${{ matrix.os }})
