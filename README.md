@@ -162,13 +162,19 @@ CSP 里 `style-src` 只有 `'unsafe-inline'` 不能上 nonce——AntDV 的 cssi
 
 ## CI
 
-`.github/workflows/ci.yml` 描述的是：6 个 target 的 `cargo check`（windows x64/arm64、
-macOS x64/arm64、linux x64/arm64）+ 3 个 runner 的 `cargo test` + 契约漂移检查 + 前端构建。
+远端有两个：`origin` 是 `https://codeup.aliyun.com/dbh/dbhx-shell.git`（内网主仓），
+`github` 是 `https://github.com/lzdbh/dbhx-shell.git`。`.github/workflows/` 只有 GitHub
+执行，Codeup 推上去不会有任何流水线 —— 流水线一律推 `github` 远端。
 
-**这套矩阵到目前为止一次都没真跑过。** 它是 GitHub Actions 的格式，而当前仓库的远端是
-`https://codeup.aliyun.com/dbh/dbhx-shell.git` —— Codeup 不执行 `.github/workflows/`，
-推上去不会有任何流水线。要么在 GitHub 上建镜像仓库，要么把它翻成 Codeup 流水线的写法；
-在那之前，6 target 的交叉编译只能靠本地 `cargo check --target` 抽查，属于**未验证**。
+- `.github/workflows/ci.yml`：6 个 target 的 `cargo check`（windows x64/arm64、
+  macOS x64/arm64、linux x64/arm64）+ 3 个 runner 的 `cargo test` + 契约漂移检查 + 前端构建。
+  推 main 或开 PR 自动跑。
+- `.github/workflows/release.yml`：打 `v*` tag（或手动 workflow 填 tag）即触发 5 条产物构建
+  —— windows x64（msi+nsis）、windows arm64、macOS universal（一个 dmg 含 x86_64 + arm64
+  两个切片）、linux x86_64 与 aarch64（deb+rpm+AppImage），全部挂到同一个 GitHub Release。
+  aarch64 Linux 用 `ubuntu-24.04-arm` 原生 runner：Debian 没有 `libwebkit2gtk-4.1-dev` 的
+  arm64 交叉包，x64 runner 上装不出依赖。**当前无签名证书、无公证**，产物是可安装的裸包，
+  SmartScreen / Gatekeeper 会拦。
 
 工作区躲过两次的坑都写在根 `Cargo.toml` 的注释里：russh 换 `ring` 后端（`aws-lc-rs` 要在
 build.rs 里编 C，交叉 arm64 直接崩），存储层不引 `rusqlite/bundled`（同理），
@@ -180,7 +186,8 @@ build.rs 里编 C，交叉 arm64 直接崩），存储层不引 `rusqlite/bundle
 `0.1.0`，M0–M6 的里程碑（连接、终端、文件、外观与恢复、安全、telnet）都已落地，
 云同步做到「手动按钮可用、两家配置互不干扰」。已知限制与未验证项：
 
-- 没有安装包，没有自动更新；主密钥是明文文件，未接系统密钥库，也没有口令派生
+- 安装包由 `release.yml` 在 CI 里产出，但**未签名、未公证**；没有自动更新；主密钥是明文文件，
+  未接系统密钥库，也没有口令派生
 - 加密文件的离线导出/导入（同步的兜底路径）未做
 - 开机拉取 / 变更防抖推送未做（当前刻意只有手动按钮）
 - 未验证：文件面板的拖拽上传、Gitee 已删片段的历史版本、真实的「云端片段不见了 → 重建」往返、

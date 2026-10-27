@@ -1,0 +1,112 @@
+name: release
+
+# 打 tag（或手动指定 tag）即触发多端产物构建，并汇总到一个 GitHub Release。
+# 平台矩阵与 ci.yml 的 cargo check 矩阵对齐：Windows x64/arm64、macOS universal、
+# Linux x86_64/aarch64。aarch64-pc-windows-msvc 是在 x64 runner 上交叉链接的
+# （Tauri 会取 VS 的 arm64 工具链 + arm64 版 WiX/NSIS 模板），产物能不能真装到
+# arm64 机器上只能等装机验证，本地没有 arm 设备可跑。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并发布的 tag（必须已推到本仓库），如 v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "22"
+  PNPM_VERSION: "11.18.0"
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - label: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+          # universal-apple-darwin 一次产出含 x86_64 + aarch64 两个切片的 .dmg/.app，
+          # 比拆成两个 job 再合并 dmg 省事，且 mac 用户不需要知道自己该下哪个。
+          - label: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+          - label: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          # aarch64 用原生 arm64 runner：Debian/Ubuntu 没有 libwebkit2gtk-4.1-dev 的
+          # arm64 交叉包，交叉打包在 x64 runner 上装不出依赖。
+          - label: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            rpm patchelf
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Install Linux system deps (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          # ubuntu-24.04-arm 的原生架构就是 arm64，直接装本包，不需要 dpkg --add-architecture
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            rpm patchelf
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      # 先跑一遍前端 typecheck + build：tauri-action 的 beforeBuildCommand 也会跑，
+      # 但失败时报错埋在 tauri 日志里，单独一步能直接定位是 TS 还是 Rust 挂了。
+      - name: Frontend build
+        run: pnpm --filter frontend build
+
+      - name: Build release artifacts
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseTag: ${{ github.event.inputs.tag || github.ref_name }}
+          projectPath: src-tauri
+          args: --target ${{ matrix.target }}
