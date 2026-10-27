@@ -2,7 +2,10 @@ name: ci
 
 # M0 的硬要求是跨平台 x64 + arm64，所以矩阵必须在 CI 里就把 6 个 target 都过一遍
 # cargo check，而不是等 M1 引入 russh/portable-pty 后才发现某个平台编不过。
-# `cargo check` 不做链接，跨 target 不需要模拟器；`test` 只在原生 runner 上跑。
+# `cargo check` 不做链接，但**不等于跨 target 不需要工具链**：tree 里只要有
+# build script 会去 pkg-config 找目标平台的 C 库（glib-sys / gtk-sys 就是），
+# 交叉就得有 sysroot，否则 check 直接红。aarch64-linux 因此跑在原生 arm64
+# runner 上，和 release.yml 的打包矩阵同一个理由、同一块机器。
 
 on:
   push:
@@ -31,11 +34,13 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04
+          # 原生 arm64 runner：见文件头那段 —— 交叉 check 会卡在 glib-sys 的
+          # pkg-config 上，装 sysroot 远比换块机器贵。
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Tauri 在 Linux 上的 build script 会 pkg-config 找 webkit2gtk / gtk，
       # 缺任何一个都会让 cargo check 在任何 crate 编译之前就失败。
@@ -58,16 +63,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # 交叉 arm64 时，rusqlite bundled 之类的 C 依赖需要目标三元组的编译器；
-      # D1 还没有 C 依赖，先把 cc 配置好，避免 M1 时踩同一个坑。
-      - name: Configure cross linker (aarch64-linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
+      # 原来这里有一段「交叉 arm64 就写 aarch64-linux-gnu-gcc 当 linker」的配置：
+      # aarch64-linux 改到原生 runner 之后它就是反作用（arm64 机器上没有这个前缀的 ld），
+      # 删掉。真要交叉编译再按 sysroot + PKG_CONFIG_SYSROOT_DIR 那套补，别用 check 冒充。
 
       - name: cargo check
         shell: bash -eo pipefail {0}
@@ -96,7 +94,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-24.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux system deps
         if: startsWith(matrix.os, 'ubuntu')
@@ -123,7 +121,7 @@ jobs:
     name: frontend build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
           # 与本地一致（`pnpm --version` = 11.18.0）。pnpm 11 删掉了

@@ -167,8 +167,11 @@ CSP 里 `style-src` 只有 `'unsafe-inline'` 不能上 nonce——AntDV 的 cssi
 执行，Codeup 推上去不会有任何流水线 —— 流水线一律推 `github` 远端。
 
 - `.github/workflows/ci.yml`：6 个 target 的 `cargo check`（windows x64/arm64、
-  macOS x64/arm64、linux x64/arm64）+ 3 个 runner 的 `cargo test` + 契约漂移检查 + 前端构建。
-  推 main 或开 PR 自动跑。
+  macOS x64/arm64、linux x64 走 x64 runner、linux arm64 走 `ubuntu-24.04-arm`）
+  + 3 个 runner 的 `cargo test` + 契约漂移检查 + 前端构建。推 main 或开 PR 自动跑。
+  arm64 Linux 不能跟打包一样只在 x64 runner 上交叉：tree 里 `glib-sys`/`gtk-sys` 这类
+  build script 会问 pkg-config 要**目标平台**的 C 库，x64 runner 上没 sysroot 就直接报
+  `pkg-config has not been configured to support cross-compilation`。
 - `.github/workflows/release.yml`：打 `v*` tag（或手动 workflow 填 tag）即触发 5 条产物构建
   —— windows x64/arm64（msi + nsis）、macOS universal（一个 dmg 含 x86_64 + arm64 两个切片）、
   linux x86_64/aarch64（deb + rpm + AppImage），产物先落 workflow artifact，再由收尾的
