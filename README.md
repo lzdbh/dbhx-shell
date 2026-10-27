@@ -170,16 +170,25 @@ CSP 里 `style-src` 只有 `'unsafe-inline'` 不能上 nonce——AntDV 的 cssi
   macOS x64/arm64、linux x64/arm64）+ 3 个 runner 的 `cargo test` + 契约漂移检查 + 前端构建。
   推 main 或开 PR 自动跑。
 - `.github/workflows/release.yml`：打 `v*` tag（或手动 workflow 填 tag）即触发 5 条产物构建
-  —— windows x64（msi+nsis）、windows arm64、macOS universal（一个 dmg 含 x86_64 + arm64
-  两个切片）、linux x86_64 与 aarch64（deb+rpm+AppImage），全部挂到同一个 GitHub Release。
+  —— windows x64/arm64（msi + nsis）、macOS universal（一个 dmg 含 x86_64 + arm64 两个切片）、
+  linux x86_64/aarch64（deb + rpm + AppImage），产物先落 workflow artifact，再由收尾的
+  `release` job 用 `gh` 汇总挂到同一个 GitHub Release。首跑已出 11 个包。
   aarch64 Linux 用 `ubuntu-24.04-arm` 原生 runner：Debian 没有 `libwebkit2gtk-4.1-dev` 的
   arm64 交叉包，x64 runner 上装不出依赖。**当前无签名证书、无公证**，产物是可安装的裸包，
   SmartScreen / Gatekeeper 会拦。
 
-  发布的前提是仓库 Settings → Actions → General → **Workflow permissions** 选
-  **Read and write**：默认的 Read-only 会让 `GITHUB_TOKEN` 拿不到 `contents: write`，
-  tauri-action 打完全部包之后在上传 Release 那一步报 `Release not found or created`，
-  一小时 runner 时间白烧。
+  两个写死在流程里的决定，都是踩过才定下来的：
+  - **不用 `tauri-apps/tauri-action`**：它把底层报错吞成一句
+    `Release not found or created`，失败时还顺手删掉自己上传的 workflow artifact，
+    五连跑什么都拿不到。打包就是一条 `tauri build`，Release 用 `gh` 建，日志才有可读的地方。
+  - **`permissions:` 里显式声明 `contents: write` + `actions: read`**：GitHub 仓库设置里
+    Workflow permissions 就算停在默认的 Read-only，workflow 顶层的 `permissions:` 块也能把
+    `GITHUB_TOKEN` 抬上去（探针验过：声明后同一个 token 能建 draft release，没声明时 403）；
+    而显式声明未列出的作用域会变 `none`，下载别的 job 的 artifact 要 `actions: read`。
+
+  打包命令的调法：`cd src-tauri && node ../node_modules/@tauri-apps/cli/tauri.js build`。
+  仓库根没有 package.json，`pnpm tauri …` 在根上直接 `ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND`；
+  `tauri build` 也没有 `-p/--project-path`（只有 `-c`），`--no-build` 这个 flag 在 v2 里不存在。
 
 工作区躲过两次的坑都写在根 `Cargo.toml` 的注释里：russh 换 `ring` 后端（`aws-lc-rs` 要在
 build.rs 里编 C，交叉 arm64 直接崩），存储层不引 `rusqlite/bundled`（同理），
