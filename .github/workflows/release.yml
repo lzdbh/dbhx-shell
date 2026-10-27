@@ -32,17 +32,12 @@ env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "22"
   PNPM_VERSION: "11.18.0"
-  # 上传 artifact 用的 glob；与下面 Locate 那步的 find 条件是同一份清单，
-  # 免得两处漂移成「传上来的 artifact 里 release job 找不到包」。
+  # artifact 只收 bundle 目录：target 会随 CARGO_TARGET_DIR 落在根或 src-tauri 下，
+  # 所以写成不限前缀的递归模式。哪些文件真进 Release 由 release job 的 find 白名单决定
+  # （.app/.tar.xz 这些中间产物不收），这里不收窄，免得某个平台一条模式都不匹配
+  # 把 upload-artifact 的 if-no-files-found: error 触发成假失败。
   BUNDLE_GLOBS: |
-    src-tauri/target/**/release/bundle/**/*.msi
-    src-tauri/target/**/release/bundle/**/*.exe
-    src-tauri/target/**/release/bundle/**/*.dmg
-    src-tauri/target/**/release/bundle/**/*.deb
-    src-tauri/target/**/release/bundle/**/*.rpm
-    src-tauri/target/**/release/bundle/**/*.AppImage
-    src-tauri/target/**/release/bundle/**/*.appimage
-    src-tauri/target/**/release/bundle/**/updater/*.sig
+    **/release/bundle/**
 
 jobs:
   build:
@@ -140,27 +135,34 @@ jobs:
           pnpm --filter frontend build 2>&1 | tee "$BUILD_LOG_DIR/frontend.log"
 
       # 不用 tauri-action：它唯一的价值是把「打包 + 传 Release」包在一起，而 Release
-      # 那半正是它吞报错的地方；打包本身只是一条 `tauri build`。本地 frontend/package.json
-      # 已有 @tauri-apps/cli，`pnpm tauri` 就是同一个 CLI，且日志全在 run 输出里。
-      # 别加 --no-build：v2 CLI 没这个选项（只有 --no-bundle），未知 flag 会让五条 job
-      # 在 CLI 启动阶段立刻退 1。代价是 beforeBuildCommand 把前端再建一遍，多几秒而已。
+      # 那半正是它吞报错的地方；打包本身只是一条 `tauri build`。
+      # 调法是在 src-tauri 里直接跑根 node_modules 的 CLI，三个坑都踩过一遍才定下来：
+      #   - `pnpm tauri`：仓库根没有 package.json，pnpm 报 ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND；
+      #   - `tauri build -p src-tauri`：build 子命令没有 --project-path，未知参数立刻退 1；
+      #   - `--no-build`：v2 CLI 只有 --no-bundle，同上。
+      # cwd 落在 src-tauri 与本地 `pnpm tauri dev` 完全一致，beforeBuildCommand 的
+      # `pnpm --filter frontend build` 会向上找到仓库根的 pnpm-workspace.yaml。
+      # 代价是前端被 beforeBuildCommand 再建一遍，几秒而已。
       - name: Build release artifacts
         env:
           BUILD_LOG_DIR: ${{ runner.temp }}/build-logs
+        working-directory: src-tauri
         run: |
           mkdir -p "$BUILD_LOG_DIR"
-          pnpm tauri build --target "${{ matrix.target }}" --verbose 2>&1 | tee "$BUILD_LOG_DIR/tauri.log"
+          node ../node_modules/@tauri-apps/cli/tauri.js build \
+            --target "${{ matrix.target }}" --verbose 2>&1 | tee "$BUILD_LOG_DIR/tauri.log"
 
       # glob 一条都不匹配时 upload-artifact 直接判红，所以先自己确认一遍，
       # 让失败信息是「没打出包」而不是「artifact 上传失败」。
+      # target 目录按 CARGO_TARGET_DIR/配置变化可能落在根或 src-tauri 下，两边都找。
       - name: Locate bundles
         run: |
-          echo "bundle files:"
-          find src-tauri/target -type f \
+          find . -type d -name bundle -print
+          find . -path '*/release/bundle/*' -type f \
             \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' \
                -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.appimage' \
                -o -name '*.sig' \) -print
-          count=$(find src-tauri/target -type f \( -name '*.msi' -o -name '*.exe' \
+          count=$(find . -path '*/release/bundle/*' -type f \( -name '*.msi' -o -name '*.exe' \
                  -o -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' \
                  -o -name '*.AppImage' -o -name '*.appimage' \) | wc -l)
           echo "installers: $count"
@@ -174,9 +176,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # GitHub 的 annotation 只留最后一行，真实报错（vue-tsc 诊断、pnpm 的 ERR_*）
-      # 全在中段；而 run log 的下载端点要鉴权，本机没 token 下不动。
-      # cargo 的输出靠上面那步的 --verbose 直接进 run log，这里补前端日志与产物目录现状。
+      # GitHub 的 annotation 只留最后一行，真实报错（vue-tsc 诊断、pnpm 的 ERR_*、
+      # rustc 的 error[E0xxx]）全在中段；run log 的下载端点在这台机器上又拿不到，
+      # 所以 build 步骤的 stdout 一律 tee 进 BUILD_LOG_DIR，失败时回打 + 传 artifact。
       - name: Dump logs on failure
         if: failure()
         env:
@@ -187,8 +189,8 @@ jobs:
             echo "==================== $(basename "$f") ===================="
             tail -n 400 "$f"
           done
-          echo "==================== bundle dir ===================="
-          ls -lR src-tauri/target 2>/dev/null | tail -n 60 || true
+          echo "==================== bundle dirs ===================="
+          find . -path '*/release/bundle/*' -type f -printf '%p\n' 2>/dev/null | tail -n 60 || true
 
       - name: Upload logs on failure
         if: failure()
