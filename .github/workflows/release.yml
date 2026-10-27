@@ -29,6 +29,11 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    # 前端那步用 tee 把日志同时留一份给失败时导出；没有 pipefail 的话
+    # vue-tsc 退出码会被 tee 吃掉，红叉永远打在后面的 tauri 步骤上。
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +59,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux system deps (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -91,16 +96,23 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
       # 先跑一遍前端 typecheck + build：tauri-action 的 beforeBuildCommand 也会跑，
       # 但失败时报错埋在 tauri 日志里，单独一步能直接定位是 TS 还是 Rust 挂了。
       - name: Frontend build
-        run: pnpm --filter frontend build
+        env:
+          BUILD_LOG_DIR: ${{ runner.temp }}/build-logs
+        run: |
+          mkdir -p "$BUILD_LOG_DIR"
+          pnpm --filter frontend build 2>&1 | tee "$BUILD_LOG_DIR/frontend.log"
 
       - name: Build release artifacts
         uses: tauri-apps/tauri-action@v0
@@ -109,4 +121,29 @@ jobs:
         with:
           releaseTag: ${{ github.event.inputs.tag || github.ref_name }}
           projectPath: src-tauri
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} --verbose
+
+      # GitHub 的 annotation 只留最后一行，真实报错（vue-tsc 诊断、pnpm 的 ERR_*）
+      # 全在中段；而 run log 的下载端点要鉴权，本机没 token 下不动。
+      # cargo 的输出靠上面那步的 --verbose 直接进 run log，这里补前端日志与产物目录现状。
+      - name: Dump logs on failure
+        if: failure()
+        env:
+          BUILD_LOG_DIR: ${{ runner.temp }}/build-logs
+        run: |
+          for f in "$BUILD_LOG_DIR"/*; do
+            [ -f "$f" ] || continue
+            echo "==================== $(basename "$f") ===================="
+            tail -n 400 "$f"
+          done
+          echo "==================== bundle dir ===================="
+          ls -lR src-tauri/target 2>/dev/null | tail -n 60 || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.label }}
+          path: ${{ runner.temp }}/build-logs/
+          if-no-files-found: ignore
+          retention-days: 7
