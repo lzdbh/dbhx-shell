@@ -47,6 +47,10 @@ use crate::sudo_sftp::{elevated_open, validate_inputs};
 /// 真正的并发预算在会话层（lease / SFTP 并发数）里管。
 const REQUEST_QUEUE: usize = 8;
 
+/// 「这个端口大概率不是 SSH」这句文案。协议层的 version/kex 失败和操作系统的
+/// 握手期断线走同一句话：用户看不出区别，我们也不该让他需要看出来。
+const HANDSHAKE_INTERRUPTED: &str = "对端在握手时中断，请确认该端口运行的是 SSH 服务";
+
 /// 主机密钥的裁决权在调用方：vault 里的记录、UI 的对话框、测试里的自动放行。
 ///
 /// 显式 boxed future 是为了让 `Box<dyn HostKeyVerifier>` 能进 actor，
@@ -301,13 +305,23 @@ fn classify_connect_error(e: &russh::Error) -> SshError {    use russh::Error::*
     };
     match e {
         // version 交换失败 / 握手期断线，绝大多数是「这个端口不是 SSH」或端口填错
-        Version | KexInit | UnknownAlgo | NoCommonAlgo { .. } | Disconnect => {
-            actionable("对端在握手时中断，请确认该端口运行的是 SSH 服务")
-        }
+        Version | KexInit | UnknownAlgo | NoCommonAlgo { .. } | Disconnect => actionable(HANDSHAKE_INTERRUPTED),
         // 签名校验失败是协议层给出的唯一「密钥可能被人换过」信号，不能含糊
         PacketAuth | WrongServerSig => SshError::HostKeyChanged,
         Elapsed(_) => SshError::Timeout,
-        IO(io) => SshError::Unreachable(io.to_string()),
+        // 操作系统层在握手期间报的「对端撤了」。这和上面那组是同一件事的两种写法：
+        // 对端回完自己那句非 SSH 的话就关连接，而我们那条 banner 还没被它读走，
+        // 内核就会用 RST 而不是 FIN 回答——macOS 上必走这一条，Linux 上走 Version。
+        // 同一个场景在两个系统上必须长成同一句话，否则「端口填成了 HTTP」这种
+        // 最常见的误填，在一边是看不懂也不稳定的英文 OS 报错。
+        IO(io) => match io.kind() {
+            std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof => actionable(HANDSHAKE_INTERRUPTED),
+            // 其余（EACCES/ENETUNREACH/连接被拒绝…）各自说的不是一回事，不硬套文案。
+            _ => SshError::Unreachable(io.to_string()),
+        },
         // 其余（Kex / Inconsistent / 压缩协商失败等）都是纯协议层问题。
         // russh 在这些变体上给的是英文短语，透给用户既看不懂也不稳定，只进日志。
         _ => actionable("SSH 握手失败，请核对地址与端口"),
@@ -548,6 +562,10 @@ mod tests {
         });
 
         match dial_err(port, Duration::from_secs(5)).await {
+            // 两种形状都算过：对端撤得慢是 russh 报 version 失败，撤得快（这句
+            // 非 SSH 的话刚发完就关，我们那条 banner 没人读走 ⇒ 内核发 RST）是
+            // 操作系统报断线。分类器把它们并成同一句话，所以这里断的其实是
+            // 「别把这一类误判成握手超时」，而不是某一处的措辞。
             SshError::Unreachable(m) => {
                 assert!(m.contains("协商") || m.contains("version") || m.contains("SSH"), "{m}")
             }
