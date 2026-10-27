@@ -292,9 +292,28 @@ mod tests {
 
     #[test]
     fn a_custom_directory_must_be_absolute() {
-        assert!(log_path(Path::new("/app/data"), Some("logs"), &name()).is_err());
-        let path = log_path(Path::new("/app/data"), Some("F:/logs"), &name()).unwrap();
-        assert!(path.starts_with("F:/logs"));
+        // 「是不是绝对路径」由平台判定，所以这里只验被拒的那一半：任何相对写法
+        // 都不许悄悄落到 core_dir 旁边去。
+        for bad in ["", "logs", "logs/2026", "../logs"] {
+            assert!(
+                log_path(Path::new("/app/data"), Some(bad), &name()).is_err(),
+                "不该放过相对目录 {bad:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_directory_is_honoured_on_unix() {
+        let path = log_path(Path::new("/app/data"), Some("/var/log/dbhx"), &name()).unwrap();
+        assert_eq!(path, PathBuf::from("/var/log/dbhx/dbhx-本机-20261014.log"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_absolute_directory_is_honoured_on_windows() {
+        let path = log_path(Path::new(r"C:\app\data"), Some(r"F:\logs"), &name()).unwrap();
+        assert_eq!(path, PathBuf::from(r"F:\logs\dbhx-本机-20261014.log"));
     }
 
     /// 开不出来时如实回 `io`，而不是悄悄留一个空文件让用户以为在记。
