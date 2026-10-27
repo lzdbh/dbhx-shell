@@ -176,6 +176,11 @@ CSP 里 `style-src` 只有 `'unsafe-inline'` 不能上 nonce——AntDV 的 cssi
   arm64 交叉包，x64 runner 上装不出依赖。**当前无签名证书、无公证**，产物是可安装的裸包，
   SmartScreen / Gatekeeper 会拦。
 
+  发布的前提是仓库 Settings → Actions → General → **Workflow permissions** 选
+  **Read and write**：默认的 Read-only 会让 `GITHUB_TOKEN` 拿不到 `contents: write`，
+  tauri-action 打完全部包之后在上传 Release 那一步报 `Release not found or created`，
+  一小时 runner 时间白烧。
+
 工作区躲过两次的坑都写在根 `Cargo.toml` 的注释里：russh 换 `ring` 后端（`aws-lc-rs` 要在
 build.rs 里编 C，交叉 arm64 直接崩），存储层不引 `rusqlite/bundled`（同理），
 `reqwest` 用 `rustls-tls-native-roots` 读**系统信任库**（装 Steam++ 或公司 SSL 审查网关的机器上，

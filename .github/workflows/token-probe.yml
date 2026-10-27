@@ -1,0 +1,40 @@
+name: token-probe
+
+# 一次性诊断：确认 runner 里的 GITHUB_TOKEN 到底拿到哪些 scope。
+# release.yml 四条 job 都在打完包之后报 "Release not found or created"，
+# 而本仓库 Settings → Actions → General 的默认令牌权限是 Read-only，
+# 需要知道 workflow 里的 `permissions:` 块有没有把它抬上去。
+# 结论确认后这个文件就该删掉。
+
+on:
+  push:
+    paths:
+      - .github/workflows/token-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report token scopes
+        env:
+          T: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          api() { curl -sS -H "Authorization: Bearer $T" -H "Accept: application/vnd.github+json" "$1"; }
+          echo "GITHUB_TOKEN length: ${#T}"
+          echo "--- /user (who is this token) ---"
+          api https://api.github.com/user | sed -n '1,12p'
+          echo "--- declared scopes ---"
+          curl -sSI -H "Authorization: Bearer $T" https://api.github.com/user \
+            | grep -i "x-oauth-scopes\|x-ratelimit-limit" || echo "(no scope header: fine-grained/GITHUB_TOKEN)"
+          echo "--- can it see the repo's actions permissions setting? ---"
+          api https://api.github.com/repos/lzdbh/dbhx-shell/actions/permissions/workflow
+          echo
+          echo "--- can it create a draft release? (the thing release.yml needs) ---"
+          curl -sS -X POST -H "Authorization: Bearer $T" -H "Accept: application/vnd.github+json" \
+            -d '{"tag_name":"token-probe-discard","name":"token-probe-discard","draft":true}' \
+            https://api.github.com/repos/lzdbh/dbhx-shell/releases \
+            | sed -n '1,30p'
