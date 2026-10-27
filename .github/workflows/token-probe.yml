@@ -12,8 +12,11 @@ on:
       - .github/workflows/token-probe.yml
   workflow_dispatch:
 
+# 这一段就是被验的对象：本仓库默认令牌权限是 read，workflow 级 permissions
+# 到底能不能把 GITHUB_TOKEN 抬到 contents: write。上面那个只声明 read 的探针
+# 已经确定拿不到写权限，这里换成 write 再问一次。
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   probe:
@@ -45,5 +48,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: token-probe
+          name: token-probe-write
           path: probe.txt
