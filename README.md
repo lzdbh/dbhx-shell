@@ -162,9 +162,8 @@ CSP 里 `style-src` 只有 `'unsafe-inline'` 不能上 nonce——AntDV 的 cssi
 
 ## CI
 
-远端有两个：`origin` 是 `https://codeup.aliyun.com/dbh/dbhx-shell.git`（内网主仓），
-`github` 是 `https://github.com/lzdbh/dbhx-shell.git`。`.github/workflows/` 只有 GitHub
-执行，Codeup 推上去不会有任何流水线 —— 流水线一律推 `github` 远端。
+流水线一律推 `github` 远端（`https://github.com/lzdbh/dbhx-shell.git`）：`.github/workflows/`
+只有 GitHub 执行，另一台托管在内部主仓的远端不跑 Actions，推过去不会有任何构建。
 
 - `.github/workflows/ci.yml`：6 个 target 的 `cargo check`（windows x64/arm64、
   macOS x64/arm64、linux x64 走 x64 runner、linux arm64 走 `ubuntu-24.04-arm`）
