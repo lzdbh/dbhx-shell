@@ -3,7 +3,7 @@
 一个 Rust + Tauri v2 写的 SSH / SFTP 客户端：主机树、多标签终端、分屏与宫格、双栏文件面板、
 本机加密的凭据库，以及可选的「主机列表云端同步」（GitHub Gist / Gitee 代码片段，密文上传）。
 
-版本 `0.1.0`，日常在 Windows x64 上使用；**尚未出安装包**（`bundle.active = false`）。
+版本 `0.1.2`，日常在 Windows x64 上使用；安装包由 CI 产出（见下文 `release.yml`），未签名。
 
 ## 能做什么
 
@@ -191,6 +191,15 @@ CSP 里 `style-src` 只有 `'unsafe-inline'` 不能上 nonce——AntDV 的 cssi
   打包命令的调法：`cd src-tauri && node ../node_modules/@tauri-apps/cli/tauri.js build`。
   仓库根没有 package.json，`pnpm tauri …` 在根上直接 `ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND`；
   `tauri build` 也没有 `-p/--project-path`（只有 `-c`），`--no-build` 这个 flag 在 v2 里不存在。
+
+- `src-tauri/wix/main.wxs`：`@tauri-apps/cli` 内置 WiX 模板的**副本**，靠
+  `bundle.windows.wix.template` 指过去，为的是修 MSI 升级后任务栏图标变空白。原模板给开始菜单
+  快捷方式写了 `Icon="ProductIcon"`，MSI 于是把图标缓存在 `C:\WINDOWS\Installer\{ProductCode}\`
+  下；而 `<Product Id="*">` 让 ProductCode 每次构建都换新 GUID（本地装过两次 0.1.0，GUID 就不
+  一样），升级删掉旧目录后，之前钉到任务栏的快捷方式指向的图标文件就没了，只剩一张空白页——
+  桌面快捷方式反而没事，因为它没设 `Icon`。副本只删了那一行，让它跟桌面快捷方式一样回落到 exe
+  自带图标。**这是全量替换模板，不是片段**：升级 Tauri 后要重新取一份内置模板 diff 回来，
+  漂移不会报错，只会静默改变打包行为。
 
 工作区躲过两次的坑都写在根 `Cargo.toml` 的注释里：russh 换 `ring` 后端（`aws-lc-rs` 要在
 build.rs 里编 C，交叉 arm64 直接崩），存储层不引 `rusqlite/bundled`（同理），
