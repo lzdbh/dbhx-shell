@@ -44,8 +44,7 @@ impl DerivedKey {
         let plain = crate::crypto::open(&key, body)?;
         let snap: SyncSnapshot = serde_json::from_slice(&plain)
             .map_err(|e| VaultError::Malformed(format!("sync snapshot: {e}")))?;
-        snap.check_version()
-            .map_err(VaultError::Malformed)?;
+        snap.check_version().map_err(VaultError::Malformed)?;
         Ok((
             Self {
                 key,

@@ -158,7 +158,10 @@ mod tests {
 
     #[test]
     fn custom_term_overrides_the_default() {
-        let spec = LocalSpec { term: "vt100".into(), ..Default::default() };
+        let spec = LocalSpec {
+            term: "vt100".into(),
+            ..Default::default()
+        };
         let (cmd, _) = spec.build().unwrap();
         assert_eq!(env(&cmd, "TERM"), Some(OsStr::new("vt100")));
     }
@@ -171,13 +174,19 @@ mod tests {
 
     #[test]
     fn args_without_a_program_are_rejected() {
-        let spec = LocalSpec { args: vec!["-l".into()], ..Default::default() };
+        let spec = LocalSpec {
+            args: vec!["-l".into()],
+            ..Default::default()
+        };
         assert!(matches!(spec.build(), Err(PtyError::BadSpec(_))));
     }
 
     #[test]
     fn missing_cwd_fails_before_openpty() {
-        let err = LocalSpec::default().cwd("Z:/definitely/not/here").build().unwrap_err();
+        let err = LocalSpec::default()
+            .cwd("Z:/definitely/not/here")
+            .build()
+            .unwrap_err();
         assert!(matches!(err, PtyError::BadCwd(_)));
     }
 
@@ -190,7 +199,10 @@ mod tests {
 
     #[test]
     fn wire_size_leaves_pixels_zero() {
-        let size = to_wire_size(&PtySize { rows: 40, cols: 120 });
+        let size = to_wire_size(&PtySize {
+            rows: 40,
+            cols: 120,
+        });
         assert_eq!((size.rows, size.cols), (40, 120));
         assert_eq!((size.pixel_width, size.pixel_height), (0, 0));
     }
@@ -201,14 +213,23 @@ mod tests {
             protocol: dbhx_model::Protocol::Local,
             endpoint: None,
             auth: None,
-            pty: PtySize { rows: 30, cols: 100 },
+            pty: PtySize {
+                rows: 30,
+                cols: 100,
+            },
             shell: Some("/bin/zsh".into()),
             cwd: None,
             term: "xterm".into(),
         };
         let local = LocalSpec::from_connect(&spec);
         assert_eq!(local.program.as_deref(), Some("/bin/zsh"));
-        assert_eq!(local.pty, PtySize { rows: 30, cols: 100 });
+        assert_eq!(
+            local.pty,
+            PtySize {
+                rows: 30,
+                cols: 100
+            }
+        );
         assert_eq!(local.term, "xterm");
         assert!(local.args.is_empty());
     }

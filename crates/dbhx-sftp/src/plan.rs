@@ -46,7 +46,13 @@ pub struct Plan {
 
 impl Plan {
     fn new(kind: TransferKind) -> Self {
-        Self { kind, tasks: Vec::new(), local_dirs: Vec::new(), remote_dirs: Vec::new(), total_bytes: 0 }
+        Self {
+            kind,
+            tasks: Vec::new(),
+            local_dirs: Vec::new(),
+            remote_dirs: Vec::new(),
+            total_bytes: 0,
+        }
     }
 
     fn push_file(&mut self, task: Task) {
@@ -61,7 +67,8 @@ impl Plan {
     /// 目录任务的顺序决定进度条观感：先短后长会把「还剩 3 个」一直挂在最后。
     /// 这里按体积从大到小排，先吃大文件，剩下的都是快的。
     pub fn sort_by_size_desc(&mut self) {
-        self.tasks.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.remote.cmp(&b.remote)));
+        self.tasks
+            .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.remote.cmp(&b.remote)));
     }
 }
 
@@ -132,7 +139,11 @@ pub async fn expand_remote_paths(
             continue;
         }
         let name = path::basename(&remote).ok_or_else(|| SftpError::BadPath(remote.clone()))?;
-        plan.push_file(Task { remote: remote.clone(), local: local_root.join(name), size: entry.size });
+        plan.push_file(Task {
+            remote: remote.clone(),
+            local: local_root.join(name),
+            size: entry.size,
+        });
     }
     Ok(plan)
 }
@@ -200,7 +211,8 @@ fn walk_remote<'a>(
 pub fn expand_local(local: &[PathBuf], remote_dir: &str) -> Result<Plan, SftpError> {
     let mut plan = Plan::new(TransferKind::Upload);
     for src in local {
-        let meta = std::fs::symlink_metadata(src).map_err(|e| SftpError::local_io(&src.display().to_string(), &e))?;
+        let meta = std::fs::symlink_metadata(src)
+            .map_err(|e| SftpError::local_io(&src.display().to_string(), &e))?;
         if meta.is_symlink() {
             tracing::debug!(path = %src.display(), "符号链接，跳过");
             continue;
@@ -214,18 +226,28 @@ pub fn expand_local(local: &[PathBuf], remote_dir: &str) -> Result<Plan, SftpErr
             plan.remote_dirs.push(remote.clone());
             walk_local(src, &remote, 0, &mut plan)?;
         } else if meta.is_file() {
-            plan.push_file(Task { remote, local: src.clone(), size: meta.len() });
+            plan.push_file(Task {
+                remote,
+                local: src.clone(),
+                size: meta.len(),
+            });
         }
     }
     Ok(plan)
 }
 
-fn walk_local(local_dir: &Path, remote_dir: &str, depth: usize, plan: &mut Plan) -> Result<(), SftpError> {
+fn walk_local(
+    local_dir: &Path,
+    remote_dir: &str,
+    depth: usize,
+    plan: &mut Plan,
+) -> Result<(), SftpError> {
     if depth > MAX_DEPTH {
         tracing::debug!(dir = %local_dir.display(), "目录层级过深，跳过");
         return Ok(());
     }
-    let read = std::fs::read_dir(local_dir).map_err(|e| SftpError::local_io(&local_dir.display().to_string(), &e))?;
+    let read = std::fs::read_dir(local_dir)
+        .map_err(|e| SftpError::local_io(&local_dir.display().to_string(), &e))?;
     for item in read {
         let item = item.map_err(|e| SftpError::local_io(&local_dir.display().to_string(), &e))?;
         let meta = std::fs::symlink_metadata(item.path())
@@ -240,7 +262,11 @@ fn walk_local(local_dir: &Path, remote_dir: &str, depth: usize, plan: &mut Plan)
             plan.remote_dirs.push(remote.clone());
             walk_local(&item.path(), &remote, depth + 1, plan)?;
         } else if meta.is_file() {
-            plan.push_file(Task { remote, local: item.path(), size: meta.len() });
+            plan.push_file(Task {
+                remote,
+                local: item.path(),
+                size: meta.len(),
+            });
         } else {
             // FIFO、设备之类在本地文件系统上读不出内容，搬过去也只会得到半个文件
             tracing::debug!(path = %item.path().display(), "特殊文件，跳过");
@@ -255,7 +281,9 @@ pub fn fake_tree(tree: HashMap<String, Vec<FileEntry>>) -> Lister {
     Box::new(move |dir| {
         let tree = tree.clone();
         Box::pin(async move {
-            tree.get(&dir).cloned().ok_or_else(|| SftpError::NotFound(dir.clone()))
+            tree.get(&dir)
+                .cloned()
+                .ok_or_else(|| SftpError::NotFound(dir.clone()))
         })
     })
 }
@@ -291,7 +319,10 @@ mod tests {
     }
 
     fn symlink(name: &str, parent: &str) -> FileEntry {
-        FileEntry { kind: FileKind::Symlink, ..file(name, parent, 11) }
+        FileEntry {
+            kind: FileKind::Symlink,
+            ..file(name, parent, 11)
+        }
     }
 
     fn tree() -> HashMap<String, Vec<FileEntry>> {
@@ -305,33 +336,56 @@ mod tests {
                 dir("archive", "/logs"),
                 symlink("latest", "/logs"),
                 // 与参考实现里那台机器一样：日志目录下躺着一个 FIFO
-                FileEntry { kind: FileKind::Other, ..file("x", "/logs", 0) },
+                FileEntry {
+                    kind: FileKind::Other,
+                    ..file("x", "/logs", 0)
+                },
             ],
         );
-        t.insert("/logs/archive".to_string(), vec![file("2025.log.gz", "/logs/archive", 50), dir("empty", "/logs/archive")]);
+        t.insert(
+            "/logs/archive".to_string(),
+            vec![
+                file("2025.log.gz", "/logs/archive", 50),
+                dir("empty", "/logs/archive"),
+            ],
+        );
         t.insert("/logs/archive/empty".to_string(), vec![]);
         t
     }
 
     #[tokio::test]
     async fn download_plan_flattens_directories_and_keeps_empties() {
-        let plan = expand_remote(&fake_tree(tree()), "/logs", Path::new("/tmp/dl")).await.unwrap();
+        let plan = expand_remote(&fake_tree(tree()), "/logs", Path::new("/tmp/dl"))
+            .await
+            .unwrap();
         let mut paths: Vec<&str> = plan.tasks.iter().map(|t| t.remote.as_str()).collect();
         paths.sort_unstable();
-        assert_eq!(paths, ["/logs/app.log", "/logs/archive/2025.log.gz"], "符号链接与特殊文件不搬");
         assert_eq!(
-            plan.tasks.iter().find(|t| t.remote == "/logs/app.log").unwrap().local,
+            paths,
+            ["/logs/app.log", "/logs/archive/2025.log.gz"],
+            "符号链接与特殊文件不搬"
+        );
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .find(|t| t.remote == "/logs/app.log")
+                .unwrap()
+                .local,
             PathBuf::from("/tmp/dl/logs/app.log")
         );
         // 空目录必须出现在 local_dirs 里，否则下载一个空目录会静默无操作
-        assert!(plan.local_dirs.contains(&PathBuf::from("/tmp/dl/logs/archive/empty")));
+        assert!(plan
+            .local_dirs
+            .contains(&PathBuf::from("/tmp/dl/logs/archive/empty")));
         assert_eq!(plan.total_bytes, 150);
         assert!(plan.remote_dirs.is_empty());
     }
 
     #[tokio::test]
     async fn missing_root_directory_is_an_error_not_an_empty_plan() {
-        let err = expand_remote(&fake_tree(tree()), "/nope", Path::new("/tmp/dl")).await.unwrap_err();
+        let err = expand_remote(&fake_tree(tree()), "/nope", Path::new("/tmp/dl"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, SftpError::NotFound(p) if p == "/nope"));
     }
 
@@ -339,31 +393,57 @@ mod tests {
     async fn a_mixed_selection_expands_dirs_and_keeps_loose_files() {
         // 面板里勾「一个目录 + 一个文件」是最常见的操作，两种落点规则不一样
         let list = fake_tree(tree());
-        let plan = expand_remote_paths(&list, &["/logs".to_string(), "/logs/app.log".to_string()], Path::new("/tmp/dl"))
-            .await
-            .unwrap();
+        let plan = expand_remote_paths(
+            &list,
+            &["/logs".to_string(), "/logs/app.log".to_string()],
+            Path::new("/tmp/dl"),
+        )
+        .await
+        .unwrap();
         let mut remotes: Vec<&str> = plan.tasks.iter().map(|t| t.remote.as_str()).collect();
         remotes.sort_unstable();
-        assert_eq!(remotes, ["/logs/app.log", "/logs/app.log", "/logs/archive/2025.log.gz"], "混选按勾选逐项展开");
+        assert_eq!(
+            remotes,
+            [
+                "/logs/app.log",
+                "/logs/app.log",
+                "/logs/archive/2025.log.gz"
+            ],
+            "混选按勾选逐项展开"
+        );
 
-        let loose = plan.tasks.iter().find(|t| t.local == PathBuf::from("/tmp/dl/app.log")).unwrap();
+        let loose = plan
+            .tasks
+            .iter()
+            .find(|t| t.local == *"/tmp/dl/app.log")
+            .unwrap();
         assert_eq!(loose.size, 100, "文件大小取自规划时的元数据");
-        assert!(plan.local_dirs.contains(&PathBuf::from("/tmp/dl/logs")), "目录项仍按 logs/ 落");
+        assert!(
+            plan.local_dirs.contains(&PathBuf::from("/tmp/dl/logs")),
+            "目录项仍按 logs/ 落"
+        );
         assert_eq!(plan.total_bytes, 100 + 100 + 50);
     }
 
     #[tokio::test]
     async fn a_selected_symlink_is_skipped_rather_than_read() {
         let list = fake_tree(tree());
-        let plan = expand_remote_paths(&list, &["/logs/latest".to_string()], Path::new("/tmp/dl")).await.unwrap();
-        assert!(plan.is_empty(), "勾选单个符号链接不该搬任何东西，也不该报错");
+        let plan = expand_remote_paths(&list, &["/logs/latest".to_string()], Path::new("/tmp/dl"))
+            .await
+            .unwrap();
+        assert!(
+            plan.is_empty(),
+            "勾选单个符号链接不该搬任何东西，也不该报错"
+        );
     }
 
     #[tokio::test]
     async fn a_vanished_selection_reports_not_found() {
         // 面板停留期间远端把文件删了：要报「不存在」，而不是静默交付一个空计划
         let list = fake_tree(tree());
-        let err = expand_remote_paths(&list, &["/logs/gone.log".to_string()], Path::new("/tmp/dl")).await.unwrap_err();
+        let err = expand_remote_paths(&list, &["/logs/gone.log".to_string()], Path::new("/tmp/dl"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, SftpError::NotFound(p) if p == "/logs/gone.log"));
     }
 
@@ -379,7 +459,9 @@ mod tests {
             prefix = child;
         }
         t.insert(prefix.clone(), vec![file("bottom", &prefix, 1)]);
-        let plan = expand_remote(&fake_tree(t), "/deep", Path::new("/tmp/dl")).await.unwrap();
+        let plan = expand_remote(&fake_tree(t), "/deep", Path::new("/tmp/dl"))
+            .await
+            .unwrap();
         assert!(plan.tasks.is_empty(), "超过 {MAX_DEPTH} 层不再往下走");
         assert!(!plan.local_dirs.is_empty(), "浅层的目录仍然建了");
     }
@@ -397,7 +479,10 @@ mod tests {
         names.sort_unstable();
         assert_eq!(names, ["/srv/up/big.bin", "/srv/up/conf/app.yaml"]);
         assert_eq!(plan.total_bytes, 12 + 4);
-        assert!(plan.remote_dirs.contains(&"/srv/up/conf".to_string()), "空目录也要在远端建出来");
+        assert!(
+            plan.remote_dirs.contains(&"/srv/up/conf".to_string()),
+            "空目录也要在远端建出来"
+        );
         assert!(plan.local_dirs.is_empty());
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -406,7 +491,7 @@ mod tests {
     #[test]
     fn upload_of_a_missing_local_path_reports_the_path() {
         let missing = std::env::temp_dir().join("dbhx-sftp-definitely-absent");
-        let err = expand_local(&[missing.clone()], "/srv").unwrap_err();
+        let err = expand_local(std::slice::from_ref(&missing), "/srv").unwrap_err();
         assert!(matches!(err, SftpError::LocalIo { .. }), "{err:?}");
         assert!(format!("{err}").contains(&missing.display().to_string()));
     }
@@ -416,9 +501,21 @@ mod tests {
         let mut plan = Plan {
             kind: TransferKind::Download,
             tasks: vec![
-                Task { remote: "/a/small".into(), local: "/x/small".into(), size: 1 },
-                Task { remote: "/a/huge".into(), local: "/x/huge".into(), size: 900 },
-                Task { remote: "/a/mid".into(), local: "/x/mid".into(), size: 900 },
+                Task {
+                    remote: "/a/small".into(),
+                    local: "/x/small".into(),
+                    size: 1,
+                },
+                Task {
+                    remote: "/a/huge".into(),
+                    local: "/x/huge".into(),
+                    size: 900,
+                },
+                Task {
+                    remote: "/a/mid".into(),
+                    local: "/x/mid".into(),
+                    size: 900,
+                },
             ],
             local_dirs: Vec::new(),
             remote_dirs: Vec::new(),

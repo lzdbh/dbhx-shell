@@ -12,4 +12,4 @@ pub mod iac;
 pub mod session;
 
 pub use error::TelnetError;
-pub use session::{TelnetEvent, TelnetHandle, connect};
+pub use session::{connect, TelnetEvent, TelnetHandle};

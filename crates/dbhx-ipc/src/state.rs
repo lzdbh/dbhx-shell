@@ -11,19 +11,20 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use dbhx_model::{HostId, IpcError};
+use dbhx_forward::{ChannelOpener, LocalTunnel, TunnelError, TunnelStream, TunnelTarget};
+use dbhx_model::{ConflictPolicy, HostId, IpcError, KeyStoreKind, TunnelKind, TunnelSpec};
 use dbhx_session::{
-    Dialer, Lease, LeaseKind, PlanSource, PoolOptions, SessionManager, TransportKey, TransportPool, ssh_dialer,
+    ssh_dialer, Dialer, Lease, LeaseKind, PlanSource, PoolOptions, SessionManager, TransportKey,
+    TransportPool,
 };
 use dbhx_sftp::{Copier, Decision, Engine, FollowGate, Plan, SftpClient, TransferOptions};
-use dbhx_ssh::HostKeyVerifier;
-use dbhx_vault::{KeySource, KnownHosts, Vault};
+use dbhx_vault::{KnownHosts, Vault};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-use crate::events::{BusEvent, FollowHold, SftpFollowed, hold_of};
+use crate::events::{hold_of, BusEvent, FollowHold, SftpFollowed};
 
 /// 事件总线队列。终端输出是主要流量，队列满了说明 webview 跟不上，
 /// 此时应当背压到 SSH 通道（发送端 await），而不是把内存吃掉。
@@ -58,6 +59,8 @@ pub enum UserAnswer {
     Cancelled,
     /// 私钥口令
     Secret(Zeroizing<String>),
+    /// 一批传输里同名文件的处理方式（对整批生效）
+    Conflict(ConflictPolicy),
 }
 
 impl std::fmt::Debug for UserAnswer {
@@ -66,6 +69,7 @@ impl std::fmt::Debug for UserAnswer {
             Self::Confirmed => f.write_str("Confirmed"),
             Self::Cancelled => f.write_str("Cancelled"),
             Self::Secret(_) => f.write_str("Secret(<redacted>)"),
+            Self::Conflict(policy) => write!(f, "Conflict({policy:?})"),
         }
     }
 }
@@ -113,7 +117,9 @@ impl Awaits {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, oneshot::Sender<UserAnswer>>> {
-        self.senders.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.senders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -170,7 +176,9 @@ impl ConnIds {
     /// 「对着面板点提权」只需要前端交出它正在显示的那个号：普通面板和提权面板都能
     /// 反查到同一条 transport，命令层因此不必要求前端记住两种号的对应关系。
     pub fn transport_of(&self, id: u32) -> Option<&TransportKey> {
-        self.by_id.get(&id).or_else(|| self.elevated_by_id.get(&id).map(|(key, _)| key))
+        self.by_id
+            .get(&id)
+            .or_else(|| self.elevated_by_id.get(&id).map(|(key, _)| key))
     }
 
     /// 这条 transport 上所有已登记的号（普通 + 提权），升序。
@@ -296,6 +304,8 @@ pub struct PanelInfo {
 pub struct Core {
     pub dir: PathBuf,
     pub vault: Arc<Mutex<Vault>>,
+    /// 主密钥实际存在哪（系统钥匙串 / 本地文件）。只供设置页展示。
+    pub key_store: KeyStoreKind,
     pub known: Arc<Mutex<KnownHosts>>,
     pub pool: Arc<TransportPool>,
     pub sessions: SessionManager,
@@ -310,6 +320,10 @@ pub struct Core {
     /// 一律拒绝拨号与凭据读写。初值来自 `vault.has_lock_pin()`——存了 PIN 就开机即锁。
     /// 用 `Arc<AtomicBool>` 而非 `Core` 字段，是因为凭据来源闭包在 `Core` 之前就要建好。
     pub locked: Arc<AtomicBool>,
+    /// 正在运行的端口转发，按主机身份键索引。连接断开时由 watch 任务摘除。
+    tunnels: Mutex<HashMap<TransportKey, TunnelSet>>,
+    /// 转发 watch 任务拿不到 `&Arc<Core>`，装配时把弱引用放这里。
+    weak: OnceLock<Weak<Core>>,
     batches: Mutex<HashMap<BatchId, LiveBatch>>,
     /// 正在记录日志的会话。写只在 hub 那一个读者里顺路发生，命令层负责开与关。
     pub logs: crate::logsink::LogRegistry,
@@ -317,10 +331,67 @@ pub struct Core {
     progress: mpsc::Sender<dbhx_model::TransferProgress>,
 }
 
+/// 主密钥来源。生产走系统钥匙串，测试固定走文件，避免把测试密钥写进开发机的
+/// 真实钥匙串。
+enum KeyPlan {
+    System,
+    /// 文件主密钥。测试固定走它，**绝不碰开发机的真实钥匙串**——
+    /// 生产服务名与真实应用相同，测试一旦写进去就会顶掉用户的主密钥。
+    File,
+}
+
+/// 一条主机的转发集合。drop 即停掉监听并归还 lease。
+struct TunnelSet {
+    _tunnels: Vec<LocalTunnel>,
+    _opener: Arc<LeaseOpener>,
+    _watch: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TunnelSet {
+    fn drop(&mut self) {
+        // 主动停掉时把 watch 任务一起收掉；由 watch 自己摘除时 abort 一个正在结束的任务也无害
+        self._watch.abort();
+    }
+}
+
+/// 用一条 lease 打开 `direct-tcpip` 的 opener。lease 随它活着，连接因此不会被回收。
+struct LeaseOpener {
+    lease: Lease,
+}
+
+impl ChannelOpener for LeaseOpener {
+    fn open(
+        &self,
+        host: String,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TunnelStream, TunnelError>> + Send + 'static>,
+    > {
+        let conn = Arc::clone(self.lease.connection());
+        Box::pin(async move {
+            let stream = conn
+                .open_direct_tcpip(host, port)
+                .await
+                .map_err(|e| TunnelError::Open(e.to_string()))?;
+            Ok(Box::new(stream) as TunnelStream)
+        })
+    }
+}
+
 impl Core {
     /// 生产装配：真实 SSH 拨号器。
     pub fn production(dir: PathBuf, bus: mpsc::Sender<BusEvent>) -> Result<Arc<Self>, IpcError> {
-        Self::assemble(dir, bus, ssh_dialer())
+        Self::assemble(dir, bus, ssh_dialer(), KeyPlan::System)
+    }
+
+    /// 集成测试专用：与生产同构，但主密钥固定走文件，**绝不触碰真实系统钥匙串**。
+    /// 生产服务名和真实应用是同一个，集成测试写进去会顶掉用户的主密钥。
+    #[doc(hidden)]
+    pub fn production_for_test(
+        dir: PathBuf,
+        bus: mpsc::Sender<BusEvent>,
+    ) -> Result<Arc<Self>, IpcError> {
+        Self::assemble(dir, bus, ssh_dialer(), KeyPlan::File)
     }
 
     /// 测试装配：只换拨号器，凭据来源与登记表走同一条代码路径。
@@ -330,13 +401,23 @@ impl Core {
         bus: mpsc::Sender<BusEvent>,
         dialer: Dialer,
     ) -> Result<Arc<Self>, IpcError> {
-        Self::assemble(dir, bus, dialer)
+        Self::assemble(dir, bus, dialer, KeyPlan::File)
     }
 
-    fn assemble(dir: PathBuf, bus: mpsc::Sender<BusEvent>, dialer: Dialer) -> Result<Arc<Self>, IpcError> {
-        std::fs::create_dir_all(&dir).map_err(|e| IpcError::new(dbhx_model::ErrorCode::Io, e.to_string(), false))?;
-        let vault = Vault::open(&dir, KeySource::File(dir.join("master.key")))
+    fn assemble(
+        dir: PathBuf,
+        bus: mpsc::Sender<BusEvent>,
+        dialer: Dialer,
+        key_plan: KeyPlan,
+    ) -> Result<Arc<Self>, IpcError> {
+        std::fs::create_dir_all(&dir)
             .map_err(|e| IpcError::new(dbhx_model::ErrorCode::Io, e.to_string(), false))?;
+        let (vault, key_store) = match key_plan {
+            KeyPlan::System => Vault::open_default(&dir),
+            KeyPlan::File => Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key")))
+                .map(|vault| (vault, KeyStoreKind::File)),
+        }
+        .map_err(|e| IpcError::new(dbhx_model::ErrorCode::Io, e.to_string(), false))?;
         let known = KnownHosts::load(&dir)?;
         let awaits = Arc::new(Awaits::default());
         let (progress_tx, progress_rx) = mpsc::channel::<dbhx_model::TransferProgress>(256);
@@ -360,6 +441,7 @@ impl Core {
         let core = Arc::new(Self {
             dir,
             vault: Arc::clone(&vault),
+            key_store,
             known,
             pool,
             sessions,
@@ -370,10 +452,13 @@ impl Core {
             engine: Engine::new(TransferOptions::default()),
             bus,
             locked,
+            tunnels: Mutex::new(HashMap::new()),
+            weak: OnceLock::new(),
             batches: Mutex::new(HashMap::new()),
             logs: crate::logsink::LogRegistry::default(),
             progress: progress_tx,
         });
+        let _ = core.weak.set(Arc::downgrade(&core));
         spawn_progress_forward(Arc::downgrade(&core), progress_rx);
         Ok(core)
     }
@@ -407,13 +492,19 @@ impl Core {
     }
 
     pub async fn emit_async(&self, event: BusEvent) -> Result<(), IpcError> {
-        self.bus.send(event).await.map_err(|_| IpcError::internal("事件总线已关闭"))
+        self.bus
+            .send(event)
+            .await
+            .map_err(|_| IpcError::internal("事件总线已关闭"))
     }
 
     /// 摘下面板。返回的 `Panel` 被丢弃即归还 lease——断开与否由池的 TTL 决定，
     /// 这里不该有任何「顺手把连接也关掉」的动作。
     pub fn remove_panel(&self, connection: u32) -> Option<Panel> {
-        self.panels.lock().unwrap_or_else(|p| p.into_inner()).remove(connection)
+        self.panels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(connection)
     }
 
     /// 连接是否已被某个面板持有。传输中的面板不允许被关掉。
@@ -423,6 +514,189 @@ impl Core {
             .get(connection)
             .map(|p| p.client.clone())
             .ok_or_else(|| not_found_panel(connection))
+    }
+
+    /// 面板所在主机的作用域串。续传日志用它隔离不同主机：
+    /// 两台机器上同名的 `/srv/a` 与同一个本地落点不能互相续写。
+    pub fn panel_scope(&self, connection: u32) -> Option<String> {
+        let panels = self.panels.lock().unwrap_or_else(|p| p.into_inner());
+        let endpoint = panels.get(connection)?.lease.endpoint();
+        Some(format!(
+            "{}@{}:{}",
+            endpoint.username, endpoint.host, endpoint.port
+        ))
+    }
+
+    /// 为一条已建立的连接启动该主机的端口转发。失败逐条发 `TunnelFailed`。
+    ///
+    /// 转发持有一条 `LeaseKind::Tunnel` 的 lease：只要隧道还在，连接就不会被 idle park 回收。
+    /// 同一个身份键只启动一次；重复调用（会话和面板先后打开）直接返回。
+    pub async fn ensure_tunnels(&self, key: &TransportKey, specs: &[TunnelSpec]) {
+        if specs.is_empty() {
+            return;
+        }
+        if self
+            .tunnels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(key)
+        {
+            return;
+        }
+
+        let lease = match self.pool.acquire(key.clone(), LeaseKind::Tunnel).await {
+            Ok(lease) => lease,
+            Err(e) => {
+                self.warn_tunnel(key, format!("连接已不可用：{e}")).await;
+                return;
+            }
+        };
+        if lease.connection().is_closed() {
+            self.warn_tunnel(key, "连接已关闭，转发未启动".into()).await;
+            return;
+        }
+        let opener = Arc::new(LeaseOpener { lease });
+        let mut started = Vec::new();
+        let mut any = false;
+        let mut failures = Vec::new();
+        for spec in specs {
+            match spec.kind {
+                TunnelKind::Local => {
+                    let target = TunnelTarget::Fixed {
+                        host: spec.target_host.clone(),
+                        port: spec.target_port,
+                    };
+                    match dbhx_forward::spawn_local(
+                        opener.clone(),
+                        &spec.bind_host,
+                        spec.bind_port,
+                        target,
+                    )
+                    .await
+                    {
+                        Ok(tunnel) => {
+                            started.push(tunnel);
+                            any = true;
+                        }
+                        Err(e) => failures.push(format!(
+                            "{}:{} 启动失败：{e}",
+                            spec.bind_host, spec.bind_port
+                        )),
+                    }
+                }
+                TunnelKind::Dynamic => {
+                    match dbhx_forward::spawn_local(
+                        opener.clone(),
+                        &spec.bind_host,
+                        spec.bind_port,
+                        TunnelTarget::Socks5,
+                    )
+                    .await
+                    {
+                        Ok(tunnel) => {
+                            started.push(tunnel);
+                            any = true;
+                        }
+                        Err(e) => failures.push(format!(
+                            "{}:{} 启动失败：{e}",
+                            spec.bind_host, spec.bind_port
+                        )),
+                    }
+                }
+                TunnelKind::Remote => {
+                    match opener
+                        .lease
+                        .remote_forward(
+                            spec.bind_host.clone(),
+                            spec.bind_port,
+                            spec.target_host.clone(),
+                            spec.target_port,
+                        )
+                        .await
+                    {
+                        Ok(port) => {
+                            tracing::info!(host = %key.describe(), port, "远端转发已启动");
+                            any = true;
+                        }
+                        Err(e) => failures.push(format!(
+                            "远端转发 {}:{} 启动失败：{e}",
+                            spec.bind_host, spec.bind_port
+                        )),
+                    }
+                }
+            }
+        }
+        if !any {
+            drop(opener);
+            for message in failures {
+                self.warn_tunnel(key, message).await;
+            }
+            return;
+        }
+        if opener.lease.connection().is_closed() {
+            drop(started);
+            drop(opener);
+            self.warn_tunnel(key, "连接已关闭，转发未启动".into()).await;
+            return;
+        }
+
+        let conn = Arc::clone(opener.lease.connection());
+        let key_for_watch = key.clone();
+        let weak = self.weak.get().cloned().unwrap_or_else(Weak::new);
+        let watch = tokio::spawn(async move {
+            let _ = conn.wait_closed().await;
+            if let Some(core) = weak.upgrade() {
+                let removed = {
+                    core.tunnels
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&key_for_watch)
+                };
+                drop(removed);
+            }
+        });
+
+        self.tunnels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                key.clone(),
+                TunnelSet {
+                    _tunnels: started,
+                    _opener: opener,
+                    _watch: watch,
+                },
+            );
+        for message in failures {
+            self.warn_tunnel(key, message).await;
+        }
+    }
+
+    /// 主机配置改了或删了：停掉它的转发，下次连接按新配置重启。
+    pub fn stop_tunnels_for_host(&self, host_id: &HostId) {
+        let removed: Vec<TunnelSet> = {
+            let mut map = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
+            let keys: Vec<TransportKey> = map
+                .keys()
+                .filter(|key| &key.host_id == host_id)
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| map.remove(&key))
+                .collect()
+        };
+        drop(removed);
+    }
+
+    async fn warn_tunnel(&self, key: &TransportKey, message: String) {
+        tracing::warn!(host = %key.describe(), %message, "端口转发启动失败");
+        let _ = self
+            .bus
+            .send(BusEvent::TunnelFailed(crate::events::TunnelFailed {
+                host_id: key.host_id.0.clone(),
+                message,
+            }))
+            .await;
     }
 
     /// 面板的客户端 **加上它此刻显示给用户的那个目录**。
@@ -440,7 +714,11 @@ impl Core {
     }
 
     /// 让面板重开一条 transport 上的第二个 lease（用于「终端还在、面板先关又开」）。
-    pub async fn acquire(&self, key: TransportKey, kind: LeaseKind) -> Result<Lease, dbhx_session::SessionError> {
+    pub async fn acquire(
+        &self,
+        key: TransportKey,
+        kind: LeaseKind,
+    ) -> Result<Lease, dbhx_session::SessionError> {
         self.pool.acquire(key, kind).await
     }
 
@@ -456,26 +734,42 @@ impl Core {
     ///
     /// 号先于面板存在：拨号失败也保留号，同一台主机重试时前端的黑名单/门控记账才不跳号。
     pub fn conn_id_of(&self, key: &TransportKey) -> u32 {
-        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).of(key)
+        self.conn_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .of(key)
     }
 
     /// 提权面板的连接号（同一个 `(transport, 提权用户)` 复用同一个号）。
     pub fn elevated_conn_id_of(&self, key: &TransportKey, sudo_user: &str) -> u32 {
-        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).of_elevated(key, sudo_user)
+        self.conn_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .of_elevated(key, sudo_user)
     }
 
     /// 面板号反查 transport：普通面板和提权面板都算。
     pub fn conn_key(&self, connection: u32) -> Option<TransportKey> {
-        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).transport_of(connection).cloned()
+        self.conn_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .transport_of(connection)
+            .cloned()
     }
 
     /// 这条 transport 上已登记的全部面板号。终端报目录时按它扇出。
     pub fn conn_ids_for_key(&self, key: &TransportKey) -> Vec<u32> {
-        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).ids_of(key)
+        self.conn_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ids_of(key)
     }
 
     pub fn conn_id_count(&self) -> usize {
-        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.conn_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// 起跑一批传输，返回批次 id。
@@ -486,13 +780,24 @@ impl Core {
     ///
     /// `connection` 是发起传输的面板：传输期间终端的 `cd` 不该把面板拽走
     /// （参考实现里被投诉过的行为），收尾时才补上期间被压住的那次跳转。
-    pub fn start_batch(self: &Arc<Self>, connection: u32, copier: Arc<dyn Copier>, plan: Plan) -> BatchId {
+    pub fn start_batch(
+        self: &Arc<Self>,
+        connection: u32,
+        copier: Arc<dyn Copier>,
+        plan: Plan,
+    ) -> BatchId {
         let batch = self.engine.start(copier, plan, self.progress.clone());
         let id = batch.id();
-        self.batches.lock().unwrap_or_else(|p| p.into_inner()).insert(
-            id,
-            LiveBatch { cancel: batch.cancel_handle(), connection },
-        );
+        self.batches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                id,
+                LiveBatch {
+                    cancel: batch.cancel_handle(),
+                    connection,
+                },
+            );
         let _ = self.set_busy(connection, true);
         let core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
@@ -515,17 +820,17 @@ impl Core {
                     error: Some(e.to_string()),
                 },
             };
-            core.batches.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+            core.batches
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
             core.emit(BusEvent::TransferBatchEnded(ended));
             // 闸门放开后门控可能立刻给出「期间终端 cd 去了别处」的导航
-            match core.set_busy(connection, false) {
-                Ok(decision) => {
-                    let followed = core.apply_decision(connection, decision).await;
-                    if followed.listing.is_some() {
-                        core.emit(BusEvent::SftpFollowed(followed));
-                    }
+            if let Ok(decision) = core.set_busy(connection, false) {
+                let followed = core.apply_decision(connection, decision).await;
+                if followed.listing.is_some() {
+                    core.emit(BusEvent::SftpFollowed(followed));
                 }
-                Err(_) => {}
             }
         });
         id
@@ -555,7 +860,10 @@ impl Core {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .map(|(id, live)| BatchInfo { batch: *id, connection: live.connection })
+            .map(|(id, live)| BatchInfo {
+                batch: *id,
+                connection: live.connection,
+            })
             .collect();
         infos.sort_unstable_by_key(|b| b.batch);
         infos
@@ -579,12 +887,18 @@ impl Core {
     ///
     /// 连接号会被复用（见 `ConnIds`），不清的话新机器的某个目录会莫名「跳不动」。
     pub fn clear_blacklist(&self, connection: u32) {
-        self.blacklist.lock().unwrap_or_else(|p| p.into_inner()).clear_connection(connection);
+        self.blacklist
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear_connection(connection);
     }
 
     /// 销号。面板关掉且没有传输在跑时调用。
     pub fn forget_conn(&self, connection: u32) {
-        self.conn_ids.lock().unwrap_or_else(|p| p.into_inner()).forget(connection);
+        self.conn_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .forget(connection);
     }
 
     /// 面板的 `Lister`：目录列举走这条通道的同一个 client 克隆。
@@ -612,7 +926,9 @@ impl Core {
         f: impl FnOnce(&mut FollowGate, &dbhx_sftp::Blacklist) -> Decision,
     ) -> Result<Decision, IpcError> {
         let mut panels = self.panels.lock().unwrap_or_else(|p| p.into_inner());
-        let panel = panels.get_mut(connection).ok_or_else(|| not_found_panel(connection))?;
+        let panel = panels
+            .get_mut(connection)
+            .ok_or_else(|| not_found_panel(connection))?;
         let blacklist = self.blacklist.lock().unwrap_or_else(|p| p.into_inner());
         Ok(f(&mut panel.gate, &blacklist))
     }
@@ -629,7 +945,11 @@ impl Core {
     /// 不可能被两条路径改成不一样的值。
     /// 返回值 `listing` 有值表示已经换了目录，`hold` 有值表示停在原处并说明原因。
     pub async fn apply_decision(&self, connection: u32, decision: Decision) -> SftpFollowed {
-        let stopped = |hold: Option<FollowHold>| SftpFollowed { connection, listing: None, hold };
+        let stopped = |hold: Option<FollowHold>| SftpFollowed {
+            connection,
+            listing: None,
+            hold,
+        };
         let target = match decision {
             Decision::Navigate(target) => target,
             Decision::Hold(hold) => return stopped(hold_of(hold)),
@@ -645,7 +965,11 @@ impl Core {
                     panel.gate.confirm_navigated(&listing.path);
                     panel.shown = listing.path.clone();
                 }
-                SftpFollowed { connection, listing: Some(listing), hold: None }
+                SftpFollowed {
+                    connection,
+                    listing: Some(listing),
+                    hold: None,
+                }
             }
             Err(e) => {
                 tracing::debug!(%target, ?e, "目录导航失败，已拉黑");
@@ -687,8 +1011,13 @@ fn vault_plan_source(
     bus: mpsc::Sender<BusEvent>,
 ) -> PlanSource {
     Box::new(move |key: TransportKey| {
-        let (vault, known, awaits, locked, bus) =
-            (Arc::clone(&vault), Arc::clone(&known), Arc::clone(&awaits), Arc::clone(&locked), bus.clone());
+        let (vault, known, awaits, locked, bus) = (
+            Arc::clone(&vault),
+            Arc::clone(&known),
+            Arc::clone(&awaits),
+            Arc::clone(&locked),
+            bus.clone(),
+        );
         Box::pin(async move { build_plan(&vault, &known, &awaits, &locked, &bus, key).await })
     })
 }
@@ -713,11 +1042,59 @@ async fn build_plan(
         return Err(SessionError::Locked);
     }
 
+    let credential = resolve_credential(vault, awaits, bus, &key).await?;
+
+    // 跳板链的每一跳都要自己的凭据。键里的 `jumps` 已经按离本机由近到远排好。
+    let mut hops = Vec::with_capacity(key.jumps.len());
+    for jump in &key.jumps {
+        let hop_record = {
+            let guard = vault.lock().unwrap_or_else(|p| p.into_inner());
+            guard.host(&jump.host_id).cloned()
+        }
+        .ok_or_else(|| SessionError::UnknownHost(jump.host_id.0.clone()))?;
+        let auth = dbhx_model::HostInfo::from_record(&hop_record).auth;
+        let hop_key = TransportKey::new(
+            jump.host_id.clone(),
+            jump.endpoint.clone(),
+            auth,
+            hop_record.keepalive_secs,
+            Vec::new(),
+        );
+        let hop_credential = resolve_credential(vault, awaits, bus, &hop_key).await?;
+        hops.push(dbhx_session::HopPlan {
+            endpoint: jump.endpoint.clone(),
+            credential: hop_credential,
+            keepalive: hop_key.keepalive,
+        });
+    }
+
+    let verifier = dbhx_ssh::SharedHostKeyVerifier::new(Box::new(
+        crate::plansrc::VaultVerifier::new(Arc::clone(known), Arc::clone(awaits), bus.clone()),
+    ));
+    Ok(dbhx_session::DialPlan {
+        credential,
+        verifier,
+        keepalive: key.keepalive,
+        hops,
+    })
+}
+
+/// 从 vault 解一条凭据。锁内只取值，等用户输口令之前必须放锁。
+async fn resolve_credential(
+    vault: &Arc<Mutex<Vault>>,
+    awaits: &Arc<Awaits>,
+    bus: &mpsc::Sender<BusEvent>,
+    key: &TransportKey,
+) -> Result<dbhx_ssh::Credential, dbhx_session::SessionError> {
+    use dbhx_session::SessionError;
+
     let label = key.describe();
     // 锁内只取值
     let borrowed = {
         let guard = vault.lock().unwrap_or_else(|p| p.into_inner());
-        let host = guard.host(&HostId(key.host_id.0.clone())).ok_or_else(|| SessionError::UnknownHost(label.clone()))?;
+        let host = guard
+            .host(&HostId(key.host_id.0.clone()))
+            .ok_or_else(|| SessionError::UnknownHost(label.clone()))?;
         let host_label = host.label.clone();
         match &key.auth {
             dbhx_model::AuthRef::Agent => Some(Prepared::Agent),
@@ -743,15 +1120,25 @@ async fn build_plan(
     let credential = match prepared {
         Prepared::Agent => dbhx_ssh::Credential::Agent,
         Prepared::Password(password) => dbhx_ssh::Credential::Password(password),
-        Prepared::Key { pem, passphrase, label: identity_label } => {
+        Prepared::Key {
+            pem,
+            passphrase,
+            label: identity_label,
+        } => {
             let passphrase = match passphrase {
                 Some(p) => Some(p),
                 // 加密私钥又没存口令：这时才问人，问不到就当用户取消
                 None if dbhx_ssh::key_is_encrypted(&pem) => {
-                    let answer = ask(bus, awaits, crate::events::BusEvent::PassphraseRequest(crate::events::PassphraseRequest {
-                        request: 0, // 号由 ask 填，这里占位
-                        identity_label: identity_label.clone(),
-                    }))
+                    let answer = ask(
+                        bus,
+                        awaits,
+                        crate::events::BusEvent::PassphraseRequest(
+                            crate::events::PassphraseRequest {
+                                request: 0, // 号由 ask 填，这里占位
+                                identity_label: identity_label.clone(),
+                            },
+                        ),
+                    )
                     .await;
                     match answer {
                         UserAnswer::Secret(text) => Some(text),
@@ -762,48 +1149,67 @@ async fn build_plan(
             };
             // 先判定格式再交出 pem：`Zeroizing` 不 `Copy`，字段简写会把所有权移走
             let is_ppk = looks_like_ppk(&pem);
-            dbhx_ssh::Credential::PrivateKey { pem, passphrase, is_ppk }
+            dbhx_ssh::Credential::PrivateKey {
+                pem,
+                passphrase,
+                is_ppk,
+            }
         }
     };
-
-    let verifier: Box<dyn HostKeyVerifier> = Box::new(crate::plansrc::VaultVerifier::new(
-        Arc::clone(known),
-        Arc::clone(awaits),
-        bus.clone(),
-    ));
-    Ok(dbhx_session::DialPlan { credential, verifier, keepalive: key.keepalive })
+    Ok(credential)
 }
 
 enum Prepared {
     Agent,
     Password(Zeroizing<String>),
-    Key { pem: Zeroizing<String>, passphrase: Option<Zeroizing<String>>, label: String },
+    Key {
+        pem: Zeroizing<String>,
+        passphrase: Option<Zeroizing<String>>,
+        label: String,
+    },
 }
 
-fn prepare_password(vault: &Vault, secret: &dbhx_model::SecretId) -> Result<Prepared, dbhx_session::SessionError> {
+fn prepare_password(
+    vault: &Vault,
+    secret: &dbhx_model::SecretId,
+) -> Result<Prepared, dbhx_session::SessionError> {
     let text = vault
         .with_secret(secret, |bytes| {
-            String::from_utf8(bytes.to_vec()).map_err(|_| dbhx_vault::VaultError::Malformed("stored password is not utf-8".into()))
+            String::from_utf8(bytes.to_vec()).map_err(|_| {
+                dbhx_vault::VaultError::Malformed("stored password is not utf-8".into())
+            })
         })
         .map_err(|_| dbhx_session::SessionError::Internal("password decode failed".into()))?;
     Ok(Prepared::Password(Zeroizing::new(text)))
 }
 
-fn prepare_key(vault: &Vault, identity: &dbhx_model::IdentityRecord) -> Result<Prepared, dbhx_session::SessionError> {
+fn prepare_key(
+    vault: &Vault,
+    identity: &dbhx_model::IdentityRecord,
+) -> Result<Prepared, dbhx_session::SessionError> {
     let pem = vault
         .with_secret(&identity.private_key_secret_id, |bytes| {
-            String::from_utf8(bytes.to_vec()).map_err(|_| dbhx_vault::VaultError::Malformed("stored key is not utf-8".into()))
+            String::from_utf8(bytes.to_vec())
+                .map_err(|_| dbhx_vault::VaultError::Malformed("stored key is not utf-8".into()))
         })
         .map_err(|_| dbhx_session::SessionError::Internal("private key decode failed".into()))?;
     let passphrase = match &identity.passphrase_secret_id {
         Some(id) => Some(
             vault
-                .with_secret(id, |bytes| Ok(Zeroizing::new(String::from_utf8_lossy(bytes).into_owned())))
-                .map_err(|_| dbhx_session::SessionError::Internal("passphrase decode failed".into()))?,
+                .with_secret(id, |bytes| {
+                    Ok(Zeroizing::new(String::from_utf8_lossy(bytes).into_owned()))
+                })
+                .map_err(|_| {
+                    dbhx_session::SessionError::Internal("passphrase decode failed".into())
+                })?,
         ),
         None => None,
     };
-    Ok(Prepared::Key { pem: Zeroizing::new(pem), passphrase, label: identity.label.clone() })
+    Ok(Prepared::Key {
+        pem: Zeroizing::new(pem),
+        passphrase,
+        label: identity.label.clone(),
+    })
 }
 
 /// PuTTY 的 `.ppk` 没有统一扩展名可依赖，靠首行标记认。
@@ -814,7 +1220,11 @@ fn looks_like_ppk(pem: &str) -> bool {
 /// 发一个带请求号的事件，然后等前端回答。
 ///
 /// 请求号必须在发送前生成，否则可能出现「回答比请求先到」——前端是异步的，这个竞态真实存在。
-async fn ask(bus: &mpsc::Sender<BusEvent>, awaits: &Awaits, event: BusEvent) -> UserAnswer {
+pub(crate) async fn ask(
+    bus: &mpsc::Sender<BusEvent>,
+    awaits: &Awaits,
+    event: BusEvent,
+) -> UserAnswer {
     let (id, rx) = awaits.register();
     let event = with_request_id(event, id);
     if bus.send(event).await.is_err() {
@@ -838,6 +1248,10 @@ fn with_request_id(event: BusEvent, id: u32) -> BusEvent {
             e.request = id;
             BusEvent::HostKeyPending(e)
         }
+        BusEvent::TransferConflict(mut e) => {
+            e.request = id;
+            BusEvent::TransferConflict(e)
+        }
         other => other,
     }
 }
@@ -847,11 +1261,21 @@ fn with_request_id(event: BusEvent, id: u32) -> BusEvent {
 ///
 /// 抓的是 `Weak<Core>`：任务握着强引用的话，`Core` 就永远等不到释放，
 /// 而发送端正是 `Core` 的字段，两端互相钉住，退出时谁都不走。
-fn spawn_progress_forward(core: std::sync::Weak<Core>, mut rx: mpsc::Receiver<dbhx_model::TransferProgress>) {
+fn spawn_progress_forward(
+    core: std::sync::Weak<Core>,
+    mut rx: mpsc::Receiver<dbhx_model::TransferProgress>,
+) {
     tauri::async_runtime::spawn(async move {
         while let Some(progress) = rx.recv().await {
             let Some(core) = core.upgrade() else { return };
-            if core.bus.send(BusEvent::TransferProgress(crate::events::TransferProgressEvent(progress))).await.is_err() {
+            if core
+                .bus
+                .send(BusEvent::TransferProgress(
+                    crate::events::TransferProgressEvent(progress),
+                ))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -868,9 +1292,11 @@ fn spawn_progress_forward(core: std::sync::Weak<Core>, mut rx: mpsc::Receiver<db
 pub fn fake_dialer() -> Dialer {
     use dbhx_session::{BoxFuture, DialPlan, SessionError, SharedConnection};
     // 返回值必须显式标注成 BoxFuture，否则推导不出 `dyn Future` 那层间接
-    Box::new(|_key, _plan: DialPlan| -> BoxFuture<'static, Result<SharedConnection, SessionError>> {
-        Box::pin(async { Err(SessionError::Closed) })
-    })
+    Box::new(
+        |_key, _plan: DialPlan| -> BoxFuture<'static, Result<SharedConnection, SessionError>> {
+            Box::pin(async { Err(SessionError::Closed) })
+        },
+    )
 }
 
 /// 起一套与生产同构的 `Core`，并握着事件队列的接收端。
@@ -900,7 +1326,11 @@ mod tests {
         let key = sample_key("db1");
         let mut ids = ConnIds::default();
         let first = ids.of(&key);
-        assert_eq!(ids.of(&key), first, "同一个键必须是同一个号，否则黑名单会指向别处");
+        assert_eq!(
+            ids.of(&key),
+            first,
+            "同一个键必须是同一个号，否则黑名单会指向别处"
+        );
         assert_eq!(ids.key_of(first), Some(&key));
 
         let other = sample_key("db2");
@@ -920,9 +1350,17 @@ mod tests {
         let root = ids.of_elevated(&key, "root");
 
         assert_ne!(plain, root, "两个面板共用一个号的话后开的会把先开的顶掉");
-        assert_eq!(ids.of_elevated(&key, "root"), root, "同一台机器重复提权要复用同一个面板");
+        assert_eq!(
+            ids.of_elevated(&key, "root"),
+            root,
+            "同一台机器重复提权要复用同一个面板"
+        );
         assert_eq!(ids.key_of(plain), Some(&key), "普通面板仍按原来的表记账");
-        assert_eq!(ids.transport_of(root), Some(&key), "提权号也要能反查到 transport");
+        assert_eq!(
+            ids.transport_of(root),
+            Some(&key),
+            "提权号也要能反查到 transport"
+        );
 
         // 另一台机器同名的提权用户是另一个面板：号不能串
         assert_ne!(ids.of_elevated(&sample_key("db8"), "root"), root);
@@ -936,7 +1374,11 @@ mod tests {
         let mut ids = ConnIds::default();
         let root = ids.of_elevated(&key, "root");
         let plain = ids.of(&key);
-        assert_eq!(ids.ids_of(&key), vec![plain.min(root), plain.max(root)], "扇出要覆盖两个面板，且顺序稳定");
+        assert_eq!(
+            ids.ids_of(&key),
+            vec![plain.min(root), plain.max(root)],
+            "扇出要覆盖两个面板，且顺序稳定"
+        );
 
         // 别的 transport 的面板不能被牵进来
         assert_eq!(ids.ids_of(&sample_key("db10")), Vec::<u32>::new());
@@ -950,8 +1392,15 @@ mod tests {
         let root = ids.of_elevated(&key, "root");
 
         ids.forget(root);
-        assert_eq!(ids.transport_of(plain), Some(&key), "关掉提权面板不能把普通面板的号也销掉");
-        assert!(ids.transport_of(root).is_none(), "销掉的号不该再反查到任何 transport");
+        assert_eq!(
+            ids.transport_of(plain),
+            Some(&key),
+            "关掉提权面板不能把普通面板的号也销掉"
+        );
+        assert!(
+            ids.transport_of(root).is_none(),
+            "销掉的号不该再反查到任何 transport"
+        );
 
         ids.forget(plain);
         assert!(ids.is_empty(), "两个号都销完登记表就该空");
@@ -978,7 +1427,11 @@ mod tests {
         let (id, rx) = awaits.register();
         drop(rx);
         awaits.drop_request(id);
-        assert_eq!(awaits.pending(), 0, "失败路径也要清表，否则表随失败次数增长");
+        assert_eq!(
+            awaits.pending(),
+            0,
+            "失败路径也要清表，否则表随失败次数增长"
+        );
     }
 
     #[test]
@@ -998,7 +1451,10 @@ mod tests {
 
     #[test]
     fn request_id_is_filled_before_the_event_leaves() {
-        let event = BusEvent::PassphraseRequest(crate::events::PassphraseRequest { request: 0, identity_label: "k".into() });
+        let event = BusEvent::PassphraseRequest(crate::events::PassphraseRequest {
+            request: 0,
+            identity_label: "k".into(),
+        });
         match with_request_id(event, 41) {
             BusEvent::PassphraseRequest(e) => assert_eq!(e.request, 41),
             _ => panic!("请求号填错对象"),
@@ -1008,9 +1464,14 @@ mod tests {
     fn sample_key(host: &str) -> TransportKey {
         TransportKey::new(
             HostId("h1".into()),
-            dbhx_model::LiveEndpoint { host: host.into(), port: 22, username: "app".into() },
+            dbhx_model::LiveEndpoint {
+                host: host.into(),
+                port: 22,
+                username: "app".into(),
+            },
             dbhx_model::AuthRef::Agent,
             0,
+            Vec::new(),
         )
     }
 

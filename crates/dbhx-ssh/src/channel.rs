@@ -12,8 +12,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use dbhx_model::PtySize;
-use russh::{Channel, ChannelReadHalf, ChannelWriteHalf};
 use russh::client::Msg;
+use russh::{Channel, ChannelReadHalf, ChannelWriteHalf};
 use russh::{ChannelId, ChannelMsg};
 use tokio::time::{timeout, Duration};
 
@@ -41,7 +41,12 @@ impl SplitChannel {
     pub(crate) fn with_early(channel: WireChannel, early: Vec<Chunk>) -> Self {
         let id = channel.id();
         let (read, write) = channel.split();
-        Self { id, read, write, early: VecDeque::from(early) }
+        Self {
+            id,
+            read,
+            write,
+            early: VecDeque::from(early),
+        }
     }
 
     pub async fn write(&self, bytes: &[u8]) -> Result<(), SshError> {
@@ -86,7 +91,10 @@ fn chunk_of(id: ChannelId, msg: ChannelMsg) -> Option<Chunk> {
         ChannelMsg::ExtendedData { ext, data } => Some(if ext == 1 {
             Chunk::Stderr(data.to_vec())
         } else {
-            Chunk::Other { ext, data: data.to_vec() }
+            Chunk::Other {
+                ext,
+                data: data.to_vec(),
+            }
         }),
         ChannelMsg::Eof | ChannelMsg::Close => None,
         ChannelMsg::WindowAdjusted { new_size } => Some(Chunk::WindowAdjusted { bytes: new_size }),
@@ -107,8 +115,13 @@ pub enum Chunk {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     /// sshd 极少用非 1 的 extended code；留着，但不当错误丢数据
-    Other { ext: u32, data: Vec<u8> },
-    WindowAdjusted { bytes: u32 },
+    Other {
+        ext: u32,
+        data: Vec<u8>,
+    },
+    WindowAdjusted {
+        bytes: u32,
+    },
     ExitStatus(u32),
     ExitSignal(String),
     /// 未预期但无害的消息，交给调用方决定；不静默丢弃
@@ -128,8 +141,22 @@ impl Shell {
     /// `ChannelWriteHalf` 不是 `Clone`（`ChannelReadHalf` 也不是），所以写端套一层 `Arc`；
     /// 读端保持独占——它的 `wait` 要 `&mut self`，而且一个字节流不该有两个读者。
     pub fn into_split(self) -> (ShellWriter, ShellReader) {
-        let Shell(SplitChannel { id, read, write, early }) = self;
-        (ShellWriter { inner: Arc::new(write) }, ShellReader { id, inner: read, early })
+        let Shell(SplitChannel {
+            id,
+            read,
+            write,
+            early,
+        }) = self;
+        (
+            ShellWriter {
+                inner: Arc::new(write),
+            },
+            ShellReader {
+                id,
+                inner: read,
+                early,
+            },
+        )
     }
 }
 
@@ -216,9 +243,7 @@ impl Exec {
         while let Some(msg) = self.0.read.wait().await {
             match msg {
                 ChannelMsg::Data { data } => out.stdout.extend_from_slice(&data),
-                ChannelMsg::ExtendedData { ext, data } if ext == 1 => {
-                    out.stderr.extend_from_slice(&data)
-                }
+                ChannelMsg::ExtendedData { ext: 1, data } => out.stderr.extend_from_slice(&data),
                 ChannelMsg::ExtendedData { data, .. } => out.stdout.extend_from_slice(&data),
                 ChannelMsg::ExitStatus { exit_status } => out.exit_status = Some(exit_status),
                 ChannelMsg::ExitSignal { signal_name, .. } => {
@@ -305,7 +330,11 @@ pub(crate) async fn confirm(
             // 其余消息（Data / ExtendedData 为主）：先按数据收下，再回去等 Success。
             // `None` 只代表 EOF/Close，这两种上面已经判过，这里不会丢字节。
             Ok(Some(other)) => {
-                tracing::debug!(?other, request, "等待通道确认时收到消息，暂存后继续等待 Success");
+                tracing::debug!(
+                    ?other,
+                    request,
+                    "等待通道确认时收到消息，暂存后继续等待 Success"
+                );
                 early.extend(chunk_of(channel.id(), other));
             }
         }

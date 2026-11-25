@@ -27,12 +27,19 @@ struct MinimalClient;
 impl Handler for MinimalClient {
     type Error = Error;
 
-    async fn check_server_key(&mut self, _key: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        _key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
         println!("  -> check_server_key 被调用");
         Ok(true)
     }
 
-    async fn auth_banner(&mut self, banner: &str, _session: &mut russh::client::Session) -> Result<(), Self::Error> {
+    async fn auth_banner(
+        &mut self,
+        banner: &str,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
         println!("  -> auth_banner: {banner}");
         Ok(())
     }
@@ -43,20 +50,36 @@ async fn handshakes_with_a_minimal_russh_client() {
     let server = TestServer::start(TestSpec::new()).await.unwrap();
     let addr = server.addr;
     let outcome = tokio::time::timeout(Duration::from_secs(15), async move {
-        let mut handle = russh::client::connect(Arc::new(russh::client::Config::default()), addr, MinimalClient)
-            .await
-            .map_err(|e| format!("connect 失败: {e:?}"))?;
+        let mut handle = russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            MinimalClient,
+        )
+        .await
+        .map_err(|e| format!("connect 失败: {e:?}"))?;
         println!("  -> connect 返回，开始认证");
-        let auth = handle.authenticate_password("app", "dbhx-test").await.map_err(|e| format!("认证请求失败: {e:?}"))?;
+        let auth = handle
+            .authenticate_password("app", "dbhx-test")
+            .await
+            .map_err(|e| format!("认证请求失败: {e:?}"))?;
         println!("  -> 认证结果 success={}", auth.success());
         if !auth.success() {
             return Err("服务器拒绝了密码".to_string());
         }
-        let channel = handle.channel_open_session().await.map_err(|e| format!("打不开会话通道: {e}"))?;
-        channel.request_subsystem(true, "sftp").await.map_err(|e| format!("subsystem 请求失败: {e}"))?;
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("打不开会话通道: {e}"))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| format!("subsystem 请求失败: {e}"))?;
         println!("  -> subsystem 已确认");
         drop(channel);
-        handle.disconnect(russh::Disconnect::ByApplication, "", "en").await.map_err(|e| format!("断开失败: {e}"))?;
+        handle
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .map_err(|e| format!("断开失败: {e}"))?;
         Ok(())
     })
     .await;

@@ -7,7 +7,7 @@ import { useHostkeysStore } from './hostkeys'
 
 vi.mock('../lib/ipc/client', () => ({
   hostkeyApi: { list: vi.fn(async () => []), forget: vi.fn(async () => 1), importSystem: vi.fn(async () => 0) },
-  requestApi: { replyConfirmed: vi.fn(async () => undefined), replyCancelled: vi.fn(async () => undefined), replySecret: vi.fn(async () => undefined) },
+  requestApi: { replyConfirmed: vi.fn(async () => undefined), replyCancelled: vi.fn(async () => undefined), replySecret: vi.fn(async () => undefined), replyConflict: vi.fn(async () => undefined) },
 }))
 
 const reply = vi.mocked(requestApi)
@@ -67,7 +67,7 @@ describe('hostkeys store', () => {
     expect(store.current?.kind).toBe('conflict')
     store.dismissConflict()
     expect(store.current).toBeNull()
-    expect(Object.keys(reply)).toEqual(['replyConfirmed', 'replyCancelled', 'replySecret'])
+    expect(Object.keys(reply)).toEqual(['replyConfirmed', 'replyCancelled', 'replySecret', 'replyConflict'])
     expect(reply.replyConfirmed).not.toHaveBeenCalled()
     expect(reply.replyCancelled).not.toHaveBeenCalled()
   })
@@ -89,5 +89,23 @@ describe('hostkeys store', () => {
     expect(store.asks.length).toBe(1)
     await store.answerPassphrase('x')
     expect(reply.replySecret).toHaveBeenCalledWith(11, 'x')
+  })
+
+  it('answers a transfer conflict with the batch-wide policy', async () => {
+    const store = useHostkeysStore()
+    store.onTransferConflict({ request: 21, transfer_kind: 'upload', count: 3, samples: ['/srv/a'] })
+    expect(store.current?.kind).toBe('transfer')
+    await store.answerTransferConflict('rename')
+    expect(reply.replyConflict).toHaveBeenCalledWith(21, 'rename')
+    expect(store.current).toBeNull()
+  })
+
+  it('cancelling a transfer conflict replies cancelled instead of a policy', async () => {
+    const store = useHostkeysStore()
+    store.onTransferConflict({ request: 22, transfer_kind: 'download', count: 1, samples: ['C:/tmp/a'] })
+    await store.cancelTransferConflict()
+    expect(reply.replyCancelled).toHaveBeenCalledWith(22)
+    expect(reply.replyConflict).not.toHaveBeenCalled()
+    expect(store.current).toBeNull()
   })
 })

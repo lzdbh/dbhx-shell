@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 
+import { notification } from 'ant-design-vue'
 import { defineStore } from 'pinia'
 
 import type { LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo, SessionStatus } from '../lib/ipc/bindings'
@@ -90,9 +91,12 @@ export const useSessionsStore = defineStore('sessions', () => {
   /** 打开远端 shell。失败时把错误留在返回值里给调用方显示，不在这里静默建 tab。 */
   async function openRemote(hostId: string, pty: PtySize = DEFAULT_PTY): Promise<OpenResult> {
     try {
-      const info = await sessionApi.openRemote(hostId, pty)
+      const info = await sessionApi.openRemote(hostId, pty, useSettingsStore().term || null)
       upsert(info)
       activeId.value = info.id
+      if (info.banner) {
+        notification.info({ message: '登录横幅', description: info.banner, duration: 8 })
+      }
       return { ok: true, error: null, id: info.id }
     } catch (err) {
       return { ok: false, error: describeIpcError(normalizeIpcError(err)), id: null }
@@ -111,6 +115,14 @@ export const useSessionsStore = defineStore('sessions', () => {
     } catch (err) {
       return { ok: false, error: describeIpcError(normalizeIpcError(err)), id: null }
     }
+  }
+
+  /** 拖动标签重排。越界/原地不动都直接忽略。 */
+  function moveTab(from: number, to: number): void {
+    const last = tabs.value.length - 1
+    if (from === to || from < 0 || to < 0 || from > last || to > last) return
+    const [moved] = tabs.value.splice(from, 1)
+    tabs.value.splice(to, 0, moved)
   }
 
   async function close(id: SessionId): Promise<void> {
@@ -274,6 +286,7 @@ export const useSessionsStore = defineStore('sessions', () => {
     toggleLog,
     refresh,
     activate,
+    moveTab,
   }
 })
 

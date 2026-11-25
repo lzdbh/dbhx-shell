@@ -7,14 +7,19 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dbhx_model::{HostId, HostRecord, IdentityId, IdentityRecord, ProviderKind, SecretId, SyncTarget};
+use dbhx_model::{
+    HostId, HostRecord, IdentityId, IdentityRecord, KeyStoreKind, ProviderKind, SecretId,
+    SyncTarget,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::crypto::{open, seal, KeySource, MasterKey};
+use crate::crypto::{open, seal, KeySource, KeyringSpec, MasterKey};
 use crate::error::VaultError;
-use crate::snapshot::{MergePlan, SnapshotSecret, SyncSnapshot};
+use crate::snapshot::{
+    plan_merge, MergeInput, MergePlan, MergePolicy, SnapshotSecret, SyncSnapshot,
+};
 use crate::sync::DerivedKey;
 
 /// 当前文档结构版本。加字段时递增并写迁移，读到老版本要能升上来。
@@ -220,6 +225,26 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// 生产打开方式：优先系统钥匙串，不可用时回退应用目录下的明文文件。
+    /// 返回实际使用的来源，供设置页展示。
+    pub fn open_default(dir: &Path) -> Result<(Self, KeyStoreKind), VaultError> {
+        let legacy = dir.join("master.key");
+        match Self::open(
+            dir,
+            KeySource::Keyring(KeyringSpec::for_app(legacy.clone())),
+        ) {
+            Ok(vault) => Ok((vault, KeyStoreKind::SystemKeyring)),
+            Err(VaultError::KeyringUnavailable) => {
+                tracing::warn!(
+                    path = %legacy.display(),
+                    "系统钥匙串不可用，主密钥回退到本地文件"
+                );
+                Self::open(dir, KeySource::File(legacy)).map(|vault| (vault, KeyStoreKind::File))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 打开（不存在则新建空库）。文件损坏时**不覆盖**：
     /// 一次误覆盖就是整库凭据丢失，宁可让人来处理。
     pub fn open(dir: &Path, key_source: KeySource) -> Result<Self, VaultError> {
@@ -349,7 +374,9 @@ impl Vault {
     fn prune_tombstones(&mut self, now_ms: u64) {
         let keep_before = now_ms.saturating_sub(TOMBSTONE_RETENTION_MS);
         let before = self.doc.tombstones.len();
-        self.doc.tombstones.retain(|t| t.deleted_at_ms > keep_before);
+        self.doc
+            .tombstones
+            .retain(|t| t.deleted_at_ms > keep_before);
         if self.doc.tombstones.len() != before {
             self.dirty = true;
         }
@@ -363,7 +390,9 @@ impl Vault {
             .iter_mut()
             .find(|t| t.id == mark.id && t.kind == mark.kind)
         {
-            Some(existing) if existing.deleted_at_ms > mark.deleted_at_ms => *existing = mark.clone(),
+            Some(existing) if existing.deleted_at_ms > mark.deleted_at_ms => {
+                *existing = mark.clone()
+            }
             Some(_) => {}
             None => self.doc.tombstones.push(mark.clone()),
         }
@@ -456,7 +485,11 @@ impl Vault {
     }
 
     /// 主机改口令：写入新密文并挂到主机上，旧的若无人引用即回收。
-    pub fn set_host_password(&mut self, host_id: &HostId, password: &[u8]) -> Result<(), VaultError> {
+    pub fn set_host_password(
+        &mut self,
+        host_id: &HostId,
+        password: &[u8],
+    ) -> Result<(), VaultError> {
         let new_secret = self.put_secret(SecretKind::Password, password)?;
         let old = {
             let host = self
@@ -465,7 +498,7 @@ impl Vault {
                 .iter_mut()
                 .find(|h| h.id == *host_id)
                 .ok_or_else(|| VaultError::NotFound(format!("host {}", host_id.0)))?;
-            std::mem::replace(&mut host.password_secret_id, Some(new_secret))
+            host.password_secret_id.replace(new_secret)
         };
         if let Some(old) = old {
             self.drop_secret_if_unreferenced(&old);
@@ -475,7 +508,9 @@ impl Vault {
     }
 
     pub fn password_of(&self, host_id: &HostId) -> Result<Option<SecretId>, VaultError> {
-        Ok(self.host(host_id).and_then(|h| h.password_secret_id.clone()))
+        Ok(self
+            .host(host_id)
+            .and_then(|h| h.password_secret_id.clone()))
     }
 
     /// 解出秘密交给回调；回调返回后明文立即清零。
@@ -633,7 +668,10 @@ impl Vault {
     }
 
     /// 这台设备存过的同步串（归一化后的那一版）。明文只在回调里存在。
-    pub fn with_sync_str<T>(&self, f: impl FnOnce(&[u8]) -> Result<T, VaultError>) -> Result<T, VaultError> {
+    pub fn with_sync_str<T>(
+        &self,
+        f: impl FnOnce(&[u8]) -> Result<T, VaultError>,
+    ) -> Result<T, VaultError> {
         let id = self
             .profile()
             .and_then(|p| p.sync_str.clone())
@@ -790,9 +828,7 @@ impl Vault {
         let plain = open(&self.key, &sealed)?;
         let snap: SyncSnapshot = serde_json::from_slice(&plain)
             .map_err(|e| VaultError::Malformed(format!("sync baseline: {e}")))?;
-        snap
-            .check_version()
-            .map_err(VaultError::Malformed)?;
+        snap.check_version().map_err(VaultError::Malformed)?;
         Ok(Some(snap))
     }
 
@@ -880,7 +916,8 @@ impl Vault {
                 .kind;
             // 本机主密钥解开 → 换那把锁重封，明文只活在这一对括号里
             let cipher = self.with_secret(&id, |plain| reseal(plain))?;
-            snap.secrets.push((id.0.clone(), SnapshotSecret { kind, cipher }));
+            snap.secrets
+                .push((id.0.clone(), SnapshotSecret { kind, cipher }));
         }
         snap.tombstones = self.doc.tombstones.clone();
         Ok(snap)
@@ -919,6 +956,46 @@ impl Vault {
         Ok(())
     }
 
+    /// 离线备份：整库（含私钥）用口令派生的密钥封成一份 blob。
+    ///
+    /// 与云端那份的区别只有「密钥从哪来」：这里是从用户口令派生，云端是从同步串派生。
+    /// 所以备份文件**可以带到另一台机器**上恢复——解出来的明文快照会在导入时按
+    /// 目标机器的本地主密钥重新封存。
+    pub fn export_offline(&self, passphrase: &str) -> Result<Vec<u8>, VaultError> {
+        let key = DerivedKey::for_push(passphrase)?;
+        let snap = self.export_snapshot(&key, true)?;
+        key.seal_snapshot(&snap)
+    }
+
+    /// 离线备份导入。
+    ///
+    /// `RemoteWins`：同 id 的导入版本覆盖本地，被覆盖的本地内容转存为冲突副本（不丢数据）；
+    /// 本地独有的记录保留。没有共同基线（`base = None`），所以每条导入记录都按新内容处理。
+    pub fn import_offline(
+        &mut self,
+        passphrase: &str,
+        blob: &[u8],
+    ) -> Result<MergePlan, VaultError> {
+        let (key, remote) = DerivedKey::from_blob(passphrase, blob)?;
+        let secret_ids = self.secret_ids();
+        let plan = {
+            let input = MergeInput {
+                local_hosts: &self.doc.hosts,
+                local_identities: &self.doc.identities,
+                local_tombstones: &self.doc.tombstones,
+                local_device_id: &self.doc.device_id,
+                local_secret_ids: &secret_ids,
+                remote: &remote,
+                base: None,
+                policy: MergePolicy::RemoteWins,
+            };
+            plan_merge(&input, new_id)
+        };
+        self.apply_plan(&key, &plan)?;
+        self.flush()?;
+        Ok(plan)
+    }
+
     /// 合并用：按 id 覆盖一条主机，**不改它的时间戳**。
     ///
     /// 不能走 `upsert_host`：它把 `updated_at_ms` 刷成现在，合并进来的记录一旦被刷，
@@ -948,14 +1025,23 @@ impl Vault {
     ///
     /// 同 id 已存在就一个字节都不动。整条链路的正确性建立在「同 id 即同内容」这条
     /// 不变量上，而覆盖一条本机正在引用的密文，恰恰是它会崩的样子。
-    fn insert_secret_at(&mut self, id: &str, kind: SecretKind, plain: &[u8]) -> Result<(), VaultError> {
+    fn insert_secret_at(
+        &mut self,
+        id: &str,
+        kind: SecretKind,
+        plain: &[u8],
+    ) -> Result<(), VaultError> {
         if self.doc.secrets.contains_key(id) {
             return Ok(());
         }
         let sealed = seal(&self.key, plain)?;
-        self.doc
-            .secrets
-            .insert(id.to_string(), SecretEntry { kind, cipher: base64_encode(&sealed) });
+        self.doc.secrets.insert(
+            id.to_string(),
+            SecretEntry {
+                kind,
+                cipher: base64_encode(&sealed),
+            },
+        );
         Ok(())
     }
 
@@ -1008,7 +1094,7 @@ pub(crate) use dbhx_model::now_ms;
 /// `pub(crate)` 是给 `envelope` 生成同步串用的（24 字节 → base64url 正好 32 字符）。
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [
             chunk[0],
@@ -1044,7 +1130,7 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if cleaned.len() % 4 != 0 {
+    if !cleaned.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
@@ -1114,6 +1200,8 @@ mod tests {
             encoding: TerminalEncoding::Utf8,
             created_at_ms: 0,
             updated_at_ms: 0,
+            jump: vec![],
+            tunnels: vec![],
         }
     }
 
@@ -1132,7 +1220,10 @@ mod tests {
         drop(v);
 
         let on_disk = std::fs::read(dir.join("vault.json")).unwrap();
-        assert!(!on_disk.windows(6).any(|w| w == b"s3cr3t"), "明文进了落盘文件");
+        assert!(
+            !on_disk.windows(6).any(|w| w == b"s3cr3t"),
+            "明文进了落盘文件"
+        );
 
         let reopened = Vault::open(&dir, KeySource::File(key_path)).unwrap();
         let secret_id = reopened
@@ -1141,7 +1232,9 @@ mod tests {
             .password_secret_id
             .clone()
             .unwrap();
-        let got = reopened.with_secret(&secret_id, |p| Ok(p.to_vec())).unwrap();
+        let got = reopened
+            .with_secret(&secret_id, |p| Ok(p.to_vec()))
+            .unwrap();
         assert_eq!(got, "s3cr3t-口令".as_bytes());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1178,9 +1271,17 @@ mod tests {
         v.set_host_password(&a, b"pw").unwrap();
         let secret = v.host(&a).unwrap().password_secret_id.clone().unwrap();
         // 手工让第二台主机共用同一条密文（模拟导入场景）
-        v.doc.hosts.iter_mut().find(|h| h.id == b).unwrap().password_secret_id = Some(secret.clone());
+        v.doc
+            .hosts
+            .iter_mut()
+            .find(|h| h.id == b)
+            .unwrap()
+            .password_secret_id = Some(secret.clone());
         assert_eq!(v.secret_references(&secret), 2);
-        assert!(matches!(v.remove_secret(&secret), Err(VaultError::InUse { count: 2, .. })));
+        assert!(matches!(
+            v.remove_secret(&secret),
+            Err(VaultError::InUse { count: 2, .. })
+        ));
         v.remove_host(&a).unwrap();
         v.remove_secret(&secret).unwrap_err(); // 还剩 b 引用
         v.remove_host(&b).unwrap();
@@ -1191,7 +1292,11 @@ mod tests {
     fn identity_stores_key_and_passphrase_as_two_secrets() {
         let mut v = memory_vault(&temp_dir("identity"));
         let id = v
-            .add_identity("work", b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n", Some(b"pp"))
+            .add_identity(
+                "work",
+                b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n",
+                Some(b"pp"),
+            )
             .unwrap();
         assert_eq!(v.secret_count(), 2);
         let rec = v.identities().iter().find(|i| i.id == id).unwrap();
@@ -1208,7 +1313,9 @@ mod tests {
             .unwrap();
         assert!(key.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----"));
         let pp = v
-            .with_secret(rec.passphrase_secret_id.as_ref().unwrap(), |p| Ok(p.to_vec()))
+            .with_secret(rec.passphrase_secret_id.as_ref().unwrap(), |p| {
+                Ok(p.to_vec())
+            })
             .unwrap();
         assert_eq!(pp, b"pp");
         v.remove_identity(&id).unwrap();
@@ -1243,7 +1350,7 @@ mod tests {
         for len in 0..17usize {
             let bytes: Vec<u8> = (0..len as u8).collect();
             let enc = base64_encode(&bytes);
-            assert_eq!(enc.len(), (len + 2) / 3 * 4);
+            assert_eq!(enc.len(), len.div_ceil(3) * 4);
             assert_eq!(base64_decode(&enc).unwrap(), bytes, "len={len} enc={enc}");
         }
         assert!(base64_decode("QQ=").is_none(), "padding 位置非法必须拒绝");
@@ -1320,8 +1427,16 @@ mod tests {
         let off = v.export_snapshot(&derived(sync.clone()), false).unwrap();
         assert!(off.identities.is_empty(), "开关没勾时身份不能出库");
         assert_eq!(off.secrets.len(), 0, "没勾时连钥匙和口令密文都不该带上");
-        assert_eq!(off.hosts.len(), 1, "主机记录一律要带，否则两台设备的字节不一致");
-        assert_eq!(off.hosts[0].identity_id, Some(id.clone()), "引用照旧留着，由导入侧报缺身份");
+        assert_eq!(
+            off.hosts.len(),
+            1,
+            "主机记录一律要带，否则两台设备的字节不一致"
+        );
+        assert_eq!(
+            off.hosts[0].identity_id,
+            Some(id.clone()),
+            "引用照旧留着，由导入侧报缺身份"
+        );
 
         let on = v.export_snapshot(&derived(sync.clone()), true).unwrap();
         assert_eq!(on.identities.len(), 1);
@@ -1357,11 +1472,14 @@ mod tests {
         v.set_host_password(&hid, b"pw").unwrap();
         v.set_lock_pin(b"1234").unwrap();
         v.set_sync_str(b"0123456789abcdefghijKLMNOPqrst").unwrap();
-        v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap();
         // 四条密文都在库里，导出只能带走口令那一条。
         // 云端令牌要是跟着快照上了云，就等于把「谁能改这个片段」交给了「谁能读这个片段」。
         assert_eq!(v.secret_count(), 4);
-        let snap = v.export_snapshot(&derived(MasterKey::generate()), true).unwrap();
+        let snap = v
+            .export_snapshot(&derived(MasterKey::generate()), true)
+            .unwrap();
         assert_eq!(snap.secrets.len(), 1, "只有被记录引用到的密文才参与导出");
         assert_eq!(
             snap.secrets[0].0,
@@ -1383,8 +1501,14 @@ mod tests {
             .find(|h| h.id == b)
             .unwrap()
             .password_secret_id = Some(shared.clone());
-        let snap = v.export_snapshot(&derived(MasterKey::generate()), false).unwrap();
-        assert_eq!(snap.secrets.len(), 1, "两台主机共用一条密文，导出不能变成两条");
+        let snap = v
+            .export_snapshot(&derived(MasterKey::generate()), false)
+            .unwrap();
+        assert_eq!(
+            snap.secrets.len(),
+            1,
+            "两台主机共用一条密文，导出不能变成两条"
+        );
         assert_eq!(snap.secrets[0].0, shared.0);
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1396,7 +1520,8 @@ mod tests {
         let sync_str = "0123456789abcdefghijKLMNOPqrst";
         let (mut v, _local, dir_a) = sync_vault("loop-a");
         let hid = v.upsert_host(host("生产库"));
-        v.set_host_password(&hid, "云端那条口令".as_bytes()).unwrap();
+        v.set_host_password(&hid, "云端那条口令".as_bytes())
+            .unwrap();
 
         let push = DerivedKey::for_push(sync_str).unwrap();
         let blob = push
@@ -1454,7 +1579,8 @@ mod tests {
         // 所以导入侧遇到同 id 一律不动，哪怕云端那份更新。
         let (mut v, _local, dir) = sync_vault("no-clobber");
         let hid = v.upsert_host(host("db1"));
-        v.set_host_password(&hid, "本地这份是对的".as_bytes()).unwrap();
+        v.set_host_password(&hid, "本地这份是对的".as_bytes())
+            .unwrap();
         let sid = v.host(&hid).unwrap().password_secret_id.clone().unwrap();
         let sync = MasterKey::generate();
         let plan = MergePlan {
@@ -1491,9 +1617,18 @@ mod tests {
         // 基线里就是本地这一条 ⇒ 本机压根没动过它，删除胜出时不必留副本
         let mut base = SyncSnapshot::new("AAA".into(), 900);
         base.hosts.push(v.host(&hid).unwrap().clone());
-        merge_from(&mut v, &remote, Some(&base), &derived(MasterKey::generate()));
+        merge_from(
+            &mut v,
+            &remote,
+            Some(&base),
+            &derived(MasterKey::generate()),
+        );
         assert!(v.host(&hid).is_none());
-        assert_eq!(v.secret_count(), 0, "删掉的记录必须连带回收只被它引用的密文");
+        assert_eq!(
+            v.secret_count(),
+            0,
+            "删掉的记录必须连带回收只被它引用的密文"
+        );
         assert_eq!(v.tombstones().len(), 1, "删除标记要留在本地，防它下次复活");
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1516,7 +1651,11 @@ mod tests {
         assert_eq!(plan.conflicts.len(), 1, "没基线就留一份副本");
         assert!(v.host(&hid).is_none(), "原条目仍然按删除胜出");
         assert_eq!(v.hosts().len(), 1);
-        assert_eq!(v.secret_count(), 1, "副本还引用着那条口令，回收不能把它带走");
+        assert_eq!(
+            v.secret_count(),
+            1,
+            "副本还引用着那条口令，回收不能把它带走"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1556,8 +1695,12 @@ mod tests {
         let key_path = dir.join("master.key");
         let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
         v.set_sync_str(b"0123456789abcdefghijKLMNOPqrst").unwrap();
-        v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-        v.set_sync_target(Some(SyncTarget { provider: dbhx_model::ProviderKind::GitHub, id: "deadbeef".into() }));
+        v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap();
+        v.set_sync_target(Some(SyncTarget {
+            provider: dbhx_model::ProviderKind::GitHub,
+            id: "deadbeef".into(),
+        }));
         let hid = v.upsert_host(host("临时的一台"));
         v.set_host_password(&hid, b"pw").unwrap();
         // 基线要能用本机密钥原样读回来，否则每次同步都等于没有基线
@@ -1582,7 +1725,11 @@ mod tests {
             2,
             "口令条目该被回收，同步串和令牌这两条「没人引用」的得留着"
         );
-        assert_eq!(v.sync_base().unwrap().unwrap().hosts.len(), 1, "基线里的这台主机不能跟着消失");
+        assert_eq!(
+            v.sync_base().unwrap().unwrap().hosts.len(),
+            1,
+            "基线里的这台主机不能跟着消失"
+        );
         v.flush().unwrap();
         drop(v);
 
@@ -1591,7 +1738,10 @@ mod tests {
         assert!(reopened.has_provider_token());
         assert_eq!(reopened.sync_target().unwrap().id, "deadbeef");
         let reopened_base = reopened.sync_base().unwrap().expect("重开之后基线还在");
-        assert!(reopened_base.same_content(&base), "基线读回来变了，说明它没被原样存下");
+        assert!(
+            reopened_base.same_content(&base),
+            "基线读回来变了，说明它没被原样存下"
+        );
         let revealed = reopened
             .with_sync_str(|p| Ok(String::from_utf8(p.to_vec())))
             .unwrap()
@@ -1621,18 +1771,38 @@ mod tests {
         v.set_sync_base(Some(&base)).unwrap();
         // 重复选同一家不该把已经建好的坐标抹掉：那只是用户把下拉框点回原处
         v.set_sync_provider(dbhx_model::ProviderKind::Gitee);
-        assert_eq!(v.sync_target().map(|t| t.id).as_deref(), Some("3d0rmjto24pfie6bawxsu73"));
+        assert_eq!(
+            v.sync_target().map(|t| t.id).as_deref(),
+            Some("3d0rmjto24pfie6bawxsu73")
+        );
         v.flush().unwrap();
         drop(v);
 
         let mut reopened = Vault::open(&dir, KeySource::File(key_path)).unwrap();
-        assert_eq!(reopened.sync_provider(), dbhx_model::ProviderKind::Gitee, "选的一家没存住");
+        assert_eq!(
+            reopened.sync_provider(),
+            dbhx_model::ProviderKind::Gitee,
+            "选的一家没存住"
+        );
         reopened.set_sync_provider(dbhx_model::ProviderKind::GitHub);
-        assert!(reopened.sync_target().is_none(), "github 那一格本来就是空的，gitee 的 id 不该跟着过来");
-        assert!(reopened.sync_base().unwrap().is_none(), "基线也是按家存的，切到没同步过的那家等于没有基线");
+        assert!(
+            reopened.sync_target().is_none(),
+            "github 那一格本来就是空的，gitee 的 id 不该跟着过来"
+        );
+        assert!(
+            reopened.sync_base().unwrap().is_none(),
+            "基线也是按家存的，切到没同步过的那家等于没有基线"
+        );
         reopened.set_sync_provider(dbhx_model::ProviderKind::Gitee);
-        assert_eq!(reopened.sync_target().map(|t| t.id).as_deref(), Some("3d0rmjto24pfie6bawxsu73"), "切回去坐标却没了");
-        assert!(reopened.sync_base().unwrap().is_some(), "切回去基线也没了，下一次同步会白推一次");
+        assert_eq!(
+            reopened.sync_target().map(|t| t.id).as_deref(),
+            Some("3d0rmjto24pfie6bawxsu73"),
+            "切回去坐标却没了"
+        );
+        assert!(
+            reopened.sync_base().unwrap().is_some(),
+            "切回去基线也没了，下一次同步会白推一次"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1651,7 +1821,8 @@ mod tests {
                     v.set_sync_provider(c);
                 }
                 v.set_sync_str(b"0123456789abcdefghijKLMNOPqrst").unwrap();
-                v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+                v.set_provider_token(b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                    .unwrap();
                 // v2 里换家会清坐标，所以「选了 gitee + 坐标写着 gitee」才是真实的老状态
                 v.set_sync_target(Some(SyncTarget {
                     provider: chosen.unwrap_or(dbhx_model::ProviderKind::GitHub),
@@ -1663,8 +1834,12 @@ mod tests {
             }
             // 把手上的文档倒回 v2 形状：版本号改回 2，四样重新摊平回单槽字段，槽位清空。
             // 从**真写出来过的** v3 文档反推，比手写一份 v2 JSON 更接近真实老库。
-            let raw = base64_decode(&String::from_utf8(std::fs::read(dir.join("vault.json")).unwrap()).unwrap()).unwrap();
-            let mut doc: serde_json::Value = serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
+            let raw = base64_decode(
+                &String::from_utf8(std::fs::read(dir.join("vault.json")).unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut doc: serde_json::Value =
+                serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
             doc["version"] = serde_json::json!(2u32);
             let obj = doc.as_object_mut().unwrap();
             let profiles = obj.remove("sync_profiles").unwrap_or(serde_json::json!({}));
@@ -1673,7 +1848,10 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or("github")
                 .to_string();
-            let profile = profiles.get(&key_name).cloned().unwrap_or(serde_json::json!({}));
+            let profile = profiles
+                .get(&key_name)
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
             obj.insert("sync_str".into(), profile["sync_str"].clone());
             obj.insert("provider_token".into(), profile["provider_token"].clone());
             obj.insert("sync_base".into(), profile["base"].clone());
@@ -1693,15 +1871,28 @@ mod tests {
             assert!(v.has_sync_str(), "{want:?} 那一格里应当躺着老那把串");
             assert!(v.has_provider_token());
             assert_eq!(v.sync_target().map(|t| t.id).as_deref(), Some("deadbeef"));
-            assert!(v.sync_base().unwrap().is_some(), "基线也得跟着搬过来，否则升完版第一次同步会白推");
+            assert!(
+                v.sync_base().unwrap().is_some(),
+                "基线也得跟着搬过来，否则升完版第一次同步会白推"
+            );
             v.flush().unwrap();
-            let raw = base64_decode(&String::from_utf8(std::fs::read(dir.join("vault.json")).unwrap()).unwrap()).unwrap();
-            let doc: serde_json::Value = serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
+            let raw = base64_decode(
+                &String::from_utf8(std::fs::read(dir.join("vault.json")).unwrap()).unwrap(),
+            )
+            .unwrap();
+            let doc: serde_json::Value =
+                serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
             assert_eq!(doc["version"], serde_json::json!(DOC_VERSION));
             for gone in ["sync_str", "provider_token", "sync_target", "sync_base"] {
-                assert!(doc.get(gone).is_none(), "{gone} 是 v2 的单槽字段，升上来后不该再写回盘上");
+                assert!(
+                    doc.get(gone).is_none(),
+                    "{gone} 是 v2 的单槽字段，升上来后不该再写回盘上"
+                );
             }
-            assert!(doc["sync_profiles"].is_object(), "四样配置现在住在按家分的槽位里");
+            assert!(
+                doc["sync_profiles"].is_object(),
+                "四样配置现在住在按家分的槽位里"
+            );
             std::fs::remove_dir_all(dir).ok();
         }
     }
@@ -1713,18 +1904,26 @@ mod tests {
         let dir = temp_dir("sync-keys-switch");
         let key_path = dir.join("master.key");
         let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
-        assert!(!v.sync_private_keys(), "默认必须是关：没勾过就不该让私钥离开本机");
+        assert!(
+            !v.sync_private_keys(),
+            "默认必须是关：没勾过就不该让私钥离开本机"
+        );
         v.set_sync_private_keys(true);
         v.flush().unwrap();
         drop(v);
 
         let mut reopened = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
-        assert!(reopened.sync_private_keys(), "勾过的开关重启后必须还是勾着的");
+        assert!(
+            reopened.sync_private_keys(),
+            "勾过的开关重启后必须还是勾着的"
+        );
         reopened.set_sync_private_keys(false);
         reopened.flush().unwrap();
         drop(reopened);
 
-        assert!(!Vault::open(&dir, KeySource::File(key_path)).unwrap().sync_private_keys());
+        assert!(!Vault::open(&dir, KeySource::File(key_path))
+            .unwrap()
+            .sync_private_keys());
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1746,7 +1945,10 @@ mod tests {
             provider: dbhx_model::ProviderKind::GitHub,
             id: "bbbb".into(),
         }));
-        assert!(v.sync_base().unwrap().is_none(), "换了片段还留着老片段的基线");
+        assert!(
+            v.sync_base().unwrap().is_none(),
+            "换了片段还留着老片段的基线"
+        );
 
         // 同一个 id 重复设置不能把基线弄丢：sync_once 每次推完都重设坐标，
         // 若这里也清一次，紧接着写入的新基线就成了唯一依据，等于每次同步都失忆一半。
@@ -1755,7 +1957,10 @@ mod tests {
             provider: dbhx_model::ProviderKind::GitHub,
             id: "bbbb".into(),
         }));
-        assert!(v.sync_base().unwrap().is_some(), "重复设置同一个坐标不该把基线抹掉");
+        assert!(
+            v.sync_base().unwrap().is_some(),
+            "重复设置同一个坐标不该把基线抹掉"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1788,13 +1993,22 @@ mod tests {
         let key_path = dir.join("master.key");
         let mut v = Vault::open(&dir, KeySource::File(key_path.clone())).unwrap();
         let first = v.device_id().to_string();
-        assert!(!first.is_empty(), "新库没设备号，之后推上去的墓碑就没人认领");
+        assert!(
+            !first.is_empty(),
+            "新库没设备号，之后推上去的墓碑就没人认领"
+        );
         let hid = v.upsert_host(host("一台"));
         v.set_host_password(&hid, b"pw").unwrap();
         v.flush().unwrap();
         drop(v);
 
-        assert_eq!(Vault::open(&dir, KeySource::File(key_path)).unwrap().device_id(), first, "设备号换进程就变了");
+        assert_eq!(
+            Vault::open(&dir, KeySource::File(key_path))
+                .unwrap()
+                .device_id(),
+            first,
+            "设备号换进程就变了"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1817,7 +2031,8 @@ mod tests {
             &String::from_utf8(std::fs::read(dir.join("vault.json")).unwrap()).unwrap(),
         )
         .unwrap();
-        let mut doc: serde_json::Value = serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
         doc["version"] = serde_json::json!(1u32);
         for gone in [
             "device_id",
@@ -1851,11 +2066,55 @@ mod tests {
         )
         .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&open(&key, &raw).unwrap()).unwrap();
-        assert_eq!(doc["version"], serde_json::json!(DOC_VERSION), "升完版必须落盘");
+        assert_eq!(
+            doc["version"],
+            serde_json::json!(DOC_VERSION),
+            "升完版必须落盘"
+        );
         assert_eq!(doc["device_id"], serde_json::json!(&first_device));
 
         let again = Vault::open(&dir, KeySource::File(key_path)).unwrap();
-        assert_eq!(again.device_id(), first_device, "device_id 换进程就变了，定序会失效");
+        assert_eq!(
+            again.device_id(),
+            first_device,
+            "device_id 换进程就变了，定序会失效"
+        );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn offline_backup_round_trips_and_keeps_local_only_records() {
+        let pass = "correct horse battery staple";
+        let dir_a = temp_dir("offline-a");
+        let mut a = Vault::open(&dir_a, KeySource::Memory(MasterKey::generate())).unwrap();
+        let id = a.upsert_host(host("备份机"));
+        a.set_host_password(&id, b"hunter2").unwrap();
+        a.flush().unwrap();
+        let blob = a.export_offline(pass).unwrap();
+
+        let dir_b = temp_dir("offline-b");
+        let mut b = Vault::open(&dir_b, KeySource::Memory(MasterKey::generate())).unwrap();
+        let _ = b.upsert_host(host("仅本机"));
+        b.flush().unwrap();
+
+        let plan = b.import_offline(pass, &blob).unwrap();
+        assert!(plan.conflicts.is_empty(), "没有同 id 记录时不该有冲突副本");
+        assert_eq!(b.hosts().len(), 2, "导入不能冲掉本地独有的记录");
+        let restored = b
+            .hosts()
+            .iter()
+            .find(|h| h.label == "备份机")
+            .expect("备份机应当被导入");
+        let sid = restored
+            .password_secret_id
+            .clone()
+            .expect("口令引用应当随记录导入");
+        let password = b.with_secret(&sid, |bytes| Ok(bytes.to_vec())).unwrap();
+        assert_eq!(password, b"hunter2", "口令应当能用本地主密钥重新解出");
+
+        assert!(matches!(
+            b.import_offline("wrong horse battery staple", &blob),
+            Err(VaultError::Crypto)
+        ));
     }
 }

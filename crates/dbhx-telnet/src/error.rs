@@ -41,11 +41,18 @@ mod tests {
 
     #[test]
     fn io_failure_is_unreachable_and_never_carries_the_os_text() {
-        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Connection refused (os error 111)");
+        let io = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 111)",
+        );
         let e: IpcError = TelnetError::Io(io).into();
         assert_eq!(e.code, ErrorCode::Unreachable);
         assert!(e.retryable, "端口不通，服务器起来后重试就有救");
-        assert!(!e.message.contains("os error"), "{} —— 原始英文 OS 文本不得跨 IPC", e.message);
+        assert!(
+            !e.message.contains("os error"),
+            "{} —— 原始英文 OS 文本不得跨 IPC",
+            e.message
+        );
     }
 
     #[test]

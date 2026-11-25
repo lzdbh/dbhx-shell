@@ -44,11 +44,15 @@ pub struct TelnetHandle {
 impl TelnetHandle {
     /// 写用户输入。裸 `0xFF` 会在这里被转义成 `IAC IAC`，绝不让它逃出去变成命令。
     pub fn write(&self, bytes: &[u8]) -> Result<(), TelnetError> {
-        self.tx.try_send(Frame::Data(iac::escape(bytes))).map_err(|_| TelnetError::Closed)
+        self.tx
+            .try_send(Frame::Data(iac::escape(bytes)))
+            .map_err(|_| TelnetError::Closed)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), TelnetError> {
-        self.tx.try_send(Frame::Naws { cols, rows }).map_err(|_| TelnetError::Closed)
+        self.tx
+            .try_send(Frame::Naws { cols, rows })
+            .map_err(|_| TelnetError::Closed)
     }
 
     /// 关掉会话：让任务退出并 drop socket。
@@ -62,7 +66,11 @@ impl TelnetHandle {
 ///
 /// 返回 `(句柄, 事件接收端)`。连接失败以 [`TelnetError::Io`] 回，交上层翻成
 /// `unreachable`/`timeout`——telnet 没有认证失败之外的分类可言。
-pub async fn connect(host: &str, port: u16, pty: &PtySize) -> Result<(TelnetHandle, tokio::sync::mpsc::Receiver<TelnetEvent>), TelnetError> {
+pub async fn connect(
+    host: &str,
+    port: u16,
+    pty: &PtySize,
+) -> Result<(TelnetHandle, tokio::sync::mpsc::Receiver<TelnetEvent>), TelnetError> {
     let stream = TcpStream::connect((host, port)).await?;
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(512);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Frame>(64);

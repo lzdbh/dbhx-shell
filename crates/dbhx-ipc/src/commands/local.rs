@@ -81,7 +81,10 @@ fn list_dir(path: &Path) -> Result<DirListing, IpcError> {
             .cmp(&dir_rank(b.kind))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(DirListing { path: path.display().to_string(), entries })
+    Ok(DirListing {
+        path: path.display().to_string(),
+        entries,
+    })
 }
 
 /// 把本机路径拼成条目。`meta` 缺省时大小/时间留空而不是填 0——
@@ -93,7 +96,10 @@ fn entry_of(target: &Path, kind: FileKind, meta: Option<&std::fs::Metadata>) -> 
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64);
     FileEntry {
-        name: target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| target.display().to_string()),
+        name: target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.display().to_string()),
         path: target.display().to_string(),
         kind,
         size,
@@ -133,14 +139,19 @@ pub async fn pick_dir_impl(default_path: Option<String>) -> Option<String> {
     if let Some(dir) = start {
         dialog = dialog.set_directory(dir);
     }
-    dialog.pick_folder().await.map(|picked| picked.path().display().to_string())
+    dialog
+        .pick_folder()
+        .await
+        .map(|picked| picked.path().display().to_string())
 }
 
 /// 列本机目录。`path` 为空时回到家目录。
 pub fn list_impl(path: Option<String>) -> Result<DirListing, IpcError> {
     let target = match path.filter(|p| !p.trim().is_empty()) {
         Some(p) => PathBuf::from(p),
-        None => home_dir().ok_or_else(|| IpcError::new(ErrorCode::NotFound, "找不到主目录", false))?,
+        None => {
+            home_dir().ok_or_else(|| IpcError::new(ErrorCode::NotFound, "找不到主目录", false))?
+        }
     };
     list_dir(&target)
 }
@@ -152,7 +163,11 @@ pub fn mkdir_impl(path: String) -> Result<(), IpcError> {
 
 /// 本机删除。目录递归删，文件直接删。
 pub fn remove_impl(path: String, is_dir: bool) -> Result<(), IpcError> {
-    let result = if is_dir { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+    let result = if is_dir {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    };
     result.map_err(|e| io_err("remove", e))
 }
 
@@ -168,7 +183,13 @@ pub fn rename_impl(from: String, to: String) -> Result<(), IpcError> {
 pub fn stat_impl(path: String) -> Result<FileEntry, IpcError> {
     let target = Path::new(&path);
     let meta = std::fs::metadata(target).map_err(|e| io_err("stat", e))?;
-    let kind = if meta.is_dir() { FileKind::Dir } else if meta.is_file() { FileKind::File } else { FileKind::Other };
+    let kind = if meta.is_dir() {
+        FileKind::Dir
+    } else if meta.is_file() {
+        FileKind::File
+    } else {
+        FileKind::Other
+    };
     Ok(entry_of(target, kind, Some(&meta)))
 }
 
@@ -179,9 +200,15 @@ pub fn stat_impl(path: String) -> Result<FileEntry, IpcError> {
 /// 的通用后果，不是这里能兜住的，兜它要付出的是每次建文件都多一次打开。
 pub fn create_file_impl(path: String) -> Result<(), IpcError> {
     if Path::new(&path).exists() {
-        return Err(IpcError::new(ErrorCode::InvalidInput, "该名称已存在", false));
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            "该名称已存在",
+            false,
+        ));
     }
-    std::fs::File::create(&path).map(|_| ()).map_err(|e| io_err("create_file", e))
+    std::fs::File::create(&path)
+        .map(|_| ())
+        .map_err(|e| io_err("create_file", e))
 }
 
 /// 编辑副本的「还算在用」期限。前端一次编辑最多监听三十分钟，留一倍余量：
@@ -209,7 +236,9 @@ pub fn edit_dir_impl() -> Result<String, IpcError> {
 /// 全程尽力而为：读目录失败、某个文件删不掉，一律忽略——清理是附带好处，
 /// 不该让它挡住「拿到编辑目录」这件正事。
 fn prune_stale_edits(dir: &Path, max_age: std::time::Duration) {
-    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
     let now = std::time::SystemTime::now();
     for entry in read.flatten() {
         let age = entry
@@ -233,7 +262,9 @@ fn prune_stale_edits(dir: &Path, max_age: std::time::Duration) {
 pub fn open_with_impl(path: String) -> Result<(), IpcError> {
     let spawned = {
         #[cfg(windows)]
-        let it = std::process::Command::new("explorer.exe").arg(&path).spawn();
+        let it = std::process::Command::new("explorer.exe")
+            .arg(&path)
+            .spawn();
         #[cfg(target_os = "macos")]
         let it = std::process::Command::new("open").arg(&path).spawn();
         #[cfg(not(any(windows, target_os = "macos")))]
@@ -244,7 +275,11 @@ pub fn open_with_impl(path: String) -> Result<(), IpcError> {
         Ok(_) => Ok(()),
         Err(e) => {
             tracing::debug!(%e, "调用系统关联程序失败");
-            Err(IpcError::new(ErrorCode::Internal, "无法启动打开该文件的程序", false))
+            Err(IpcError::new(
+                ErrorCode::Internal,
+                "无法启动打开该文件的程序",
+                false,
+            ))
         }
     }
 }
@@ -274,12 +309,10 @@ pub fn open_file_window_impl(app: &AppHandle, host_id: HostId) -> Result<(), Ipc
         .min_inner_size(760.0, 460.0)
         .resizable(true)
         .shadow(true);
-    with_platform_chrome(builder)
-        .build()
-        .map_err(|e| {
-            tracing::debug!(%e, "创建文件管理窗口失败");
-            IpcError::new(ErrorCode::Internal, "无法打开文件管理窗口", false)
-        })?;
+    with_platform_chrome(builder).build().map_err(|e| {
+        tracing::debug!(%e, "创建文件管理窗口失败");
+        IpcError::new(ErrorCode::Internal, "无法打开文件管理窗口", false)
+    })?;
     Ok(())
 }
 
@@ -411,7 +444,11 @@ mod tests {
 
         let listing = list_impl(Some(dir.display().to_string())).unwrap();
         let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["alpha", "Zeta", "a.txt", "b.txt"], "目录在前、各自忽略大小写排序");
+        assert_eq!(
+            names,
+            ["alpha", "Zeta", "a.txt", "b.txt"],
+            "目录在前、各自忽略大小写排序"
+        );
         assert_eq!(listing.entries[0].kind, FileKind::Dir);
         assert_eq!(listing.entries[2].size, 2, "文件应带真实字节数");
         let _ = std::fs::remove_dir_all(&dir);
@@ -456,7 +493,11 @@ mod tests {
         let err = create_file_impl(file.display().to_string()).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert_eq!(err.message, "该名称已存在");
-        assert_eq!(std::fs::read(&file).unwrap(), b"keep me", "已存在的文件一个字节都不能少");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"keep me",
+            "已存在的文件一个字节都不能少"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -467,8 +508,14 @@ mod tests {
         std::fs::write(&file, b"12345").unwrap();
 
         let entry = stat_impl(file.display().to_string()).unwrap();
-        assert_eq!((entry.name.as_str(), entry.kind, entry.size), ("a.txt", FileKind::File, 5));
-        assert!(entry.mtime_ms.is_some(), "本机文件该带修改时间，编辑流程就靠它比对");
+        assert_eq!(
+            (entry.name.as_str(), entry.kind, entry.size),
+            ("a.txt", FileKind::File, 5)
+        );
+        assert!(
+            entry.mtime_ms.is_some(),
+            "本机文件该带修改时间，编辑流程就靠它比对"
+        );
 
         let err = stat_impl(dir.join("gone.txt").display().to_string()).unwrap_err();
         assert_eq!(err.message, "路径不存在", "OS 的英文说明不外泄");
@@ -478,8 +525,14 @@ mod tests {
     #[test]
     fn edit_dir_lives_under_the_system_temp() {
         let dir = edit_dir_impl().unwrap();
-        assert!(std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()), "外部编辑的临时目录要真的存在：{dir}");
-        assert!(dir.replace('\\', "/").ends_with("dbhx-edit"), "临时副本集中放一处，好认也好清：{dir}");
+        assert!(
+            std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()),
+            "外部编辑的临时目录要真的存在：{dir}"
+        );
+        assert!(
+            dir.replace('\\', "/").ends_with("dbhx-edit"),
+            "临时副本集中放一处，好认也好清：{dir}"
+        );
     }
 
     /// 关窗会把前端 `finally` 的清理一起带走，所以过期副本要由后端扫掉——
@@ -494,7 +547,10 @@ mod tests {
 
         // 期限设成 0：两个都算「过期」，全清
         prune_stale_edits(&dir, std::time::Duration::ZERO);
-        assert!(!fresh.exists() && !stale.exists(), "过期的编辑副本一个都不该留");
+        assert!(
+            !fresh.exists() && !stale.exists(),
+            "过期的编辑副本一个都不该留"
+        );
 
         // 期限放开一小时：刚写出来的还年轻，动它就会毁掉用户正在编辑的文件
         std::fs::write(&fresh, b"new").unwrap();

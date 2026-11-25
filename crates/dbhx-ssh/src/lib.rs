@@ -21,14 +21,14 @@ pub mod hostkey;
 pub mod sudo_sftp;
 pub mod transport;
 
-pub use auth::{Credential, key_is_encrypted};
+pub use auth::{key_is_encrypted, Credential};
 pub use channel::{Chunk, Exec, ExecOutput, Shell, ShellReader, ShellWriter, SplitChannel};
 pub use config::DialOptions;
 pub use error::SshError;
 pub use handler::{CloseReason, SessionState, SshEvent};
 pub use hostkey::{pattern_of, ServerKey};
 pub use transport::{
-    wait_until_closed, HostKeyVerifier, RejectAll, SshTransport, TrustAll,
+    wait_until_closed, HostKeyVerifier, RejectAll, SharedHostKeyVerifier, SshTransport, TrustAll,
 };
 
 /// 给会话层与 dbhx-sftp 用的裸流类型别名，避免它们到处写 russh 的路径。

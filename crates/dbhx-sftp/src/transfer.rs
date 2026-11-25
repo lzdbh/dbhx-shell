@@ -9,22 +9,25 @@
 //! （队列长度 = `Config::max_concurrent_writes`，见 `client::SftpOptions`），
 //! 自己再开一层只会在通道里塞更多未完成请求。
 //!
-//! 本期**不做断点续传**：一律覆盖写。续传要先解决「远端在这期间被改过怎么办」，
-//! 那需要一个指纹侧车文件，属于 M3 的事。
+//! 本期不再「一律覆盖写」：续传进度记在本机日志（[`crate::resume`]），
+//! 源指纹与目标大小都对得上才续写，远端不会多出任何侧车文件。
 
-use std::sync::Arc;
+use std::io::SeekFrom;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dbhx_model::{TransferKind, TransferProgress, TransferState};
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, mpsc};
+use russh_sftp::protocol::OpenFlags;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::error::SftpError;
 use crate::path;
 use crate::plan::{BoxFuture, Plan, Task};
+use crate::resume::{ResumeJournal, ResumeTarget};
 
 /// 分块大小。参考实现取 32 KiB：小于它是白白多打报文，大于它会让单个 WRITE
 /// 在低带宽线路上占住通道太久，交互终端会跟着卡。
@@ -94,7 +97,10 @@ pub struct ProgressMeter {
 
 impl ProgressMeter {
     pub fn new(interval: Duration) -> Self {
-        Self { interval, last: None }
+        Self {
+            interval,
+            last: None,
+        }
     }
 
     /// 该发就返回 `true` 并重置计时。
@@ -137,12 +143,62 @@ pub struct SftpCopier {
     session: Arc<SftpSession>,
     kind: TransferKind,
     chunk_size: usize,
+    journal: Option<Arc<ResumeJournal>>,
+    /// 主机作用域：同路径但不同主机不能互相续传。
+    scope: String,
 }
 
 impl SftpCopier {
     pub fn new(session: Arc<SftpSession>, kind: TransferKind, chunk_size: usize) -> Self {
-        Self { session, kind, chunk_size }
+        Self {
+            session,
+            kind,
+            chunk_size,
+            journal: None,
+            scope: String::new(),
+        }
     }
+
+    /// 打开本机续传日志。
+    pub fn with_resume(mut self, journal: Arc<ResumeJournal>, scope: String) -> Self {
+        self.journal = Some(journal);
+        self.scope = scope;
+        self
+    }
+}
+
+/// 每搬这么多字节写一次续传日志。太小会把磁盘写爆，太大则崩溃后要多搬一段。
+const RESUME_RECORD_EVERY: u64 = 4 * 1024 * 1024;
+
+fn record_progress(
+    copier: &SftpCopier,
+    task: &Task,
+    kind: TransferKind,
+    source_size: u64,
+    source_mtime: i64,
+    written: u64,
+) {
+    if let Some(journal) = &copier.journal {
+        journal.record(
+            ResumeTarget {
+                scope: &copier.scope,
+                kind,
+                remote: &task.remote,
+                local: &task.local.display().to_string(),
+                source_size,
+                source_mtime,
+            },
+            written,
+        );
+    }
+}
+
+fn local_mtime_ms(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(-1)
 }
 
 impl Copier for SftpCopier {
@@ -198,6 +254,48 @@ async fn download(
     cancel: &Cancel,
     progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<(), SftpError> {
+    let local_path = task.local.display().to_string();
+    let meta = copier
+        .session
+        .metadata(task.remote.clone())
+        .await
+        .map_err(|e| SftpError::classify(e, task.remote.clone()))?;
+    let source_size = meta.size.unwrap_or(task.size);
+    let source_mtime = meta.mtime.map(i64::from).unwrap_or(-1);
+
+    let local_size = tokio::fs::metadata(&task.local)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let offset = match &copier.journal {
+        Some(journal) => journal.offset_for(
+            ResumeTarget {
+                scope: &copier.scope,
+                kind: TransferKind::Download,
+                remote: &task.remote,
+                local: &local_path,
+                source_size,
+                source_mtime,
+            },
+            local_size,
+        ),
+        None => 0,
+    };
+
+    // 上次已经搬完，只差日志收尾
+    if offset > 0 && offset >= source_size {
+        if let Some(journal) = &copier.journal {
+            journal.forget(
+                &copier.scope,
+                TransferKind::Download,
+                &task.remote,
+                &local_path,
+            );
+        }
+        progress(offset);
+        return Ok(());
+    }
+
     if let Some(parent) = task.local.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -208,26 +306,89 @@ async fn download(
         .open(task.remote.clone())
         .await
         .map_err(|e| SftpError::classify(e, task.remote.clone()))?;
-    let mut local = tokio::fs::File::create(&task.local)
-        .await
-        .map_err(|e| SftpError::local_io(&task.local.display().to_string(), &e))?;
+    let mut local = if offset > 0 {
+        // 续写：不 truncate，先 seek 到上次的末尾
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&task.local)
+            .await
+            .map_err(|e| SftpError::local_io(&local_path, &e))?;
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| SftpError::local_io(&local_path, &e))?;
+        file
+    } else {
+        tokio::fs::File::create(&task.local)
+            .await
+            .map_err(|e| SftpError::local_io(&local_path, &e))?
+    };
+    if offset > 0 {
+        remote
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| remote_io(e, &task.remote))?;
+        progress(offset);
+    }
 
+    let mut written = offset;
+    let mut since_record = 0u64;
     let mut buf = vec![0u8; copier.chunk_size];
     loop {
         if cancel.is_cancelled() {
+            record_progress(
+                copier,
+                task,
+                TransferKind::Download,
+                source_size,
+                source_mtime,
+                written,
+            );
             finish_remote(remote).await;
             return Err(SftpError::Cancelled);
         }
-        let n = remote.read(&mut buf).await.map_err(|e| remote_io(e, &task.remote))?;
+        let n = remote
+            .read(&mut buf)
+            .await
+            .map_err(|e| remote_io(e, &task.remote))?;
         if n == 0 {
             break;
         }
-        local.write_all(&buf[..n]).await.map_err(|e| SftpError::local_io(&task.local.display().to_string(), &e))?;
+        local
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| SftpError::local_io(&local_path, &e))?;
+        written += n as u64;
+        since_record += n as u64;
+        if since_record >= RESUME_RECORD_EVERY {
+            record_progress(
+                copier,
+                task,
+                TransferKind::Download,
+                source_size,
+                source_mtime,
+                written,
+            );
+            since_record = 0;
+        }
         progress(n as u64);
     }
     // 落盘完再收尾：中途 flush 失败时还能把远端句柄关掉
-    local.flush().await.map_err(|e| SftpError::local_io(&task.local.display().to_string(), &e))?;
-    remote.close().await.map_err(|e| remote_io(e, &task.remote))?;
+    local
+        .flush()
+        .await
+        .map_err(|e| SftpError::local_io(&local_path, &e))?;
+    remote
+        .close()
+        .await
+        .map_err(|e| remote_io(e, &task.remote))?;
+    if let Some(journal) = &copier.journal {
+        journal.forget(
+            &copier.scope,
+            TransferKind::Download,
+            &task.remote,
+            &local_path,
+        );
+    }
     Ok(())
 }
 
@@ -238,32 +399,133 @@ async fn upload(
     progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<(), SftpError> {
     let local_path = task.local.display().to_string();
-    let mut local = tokio::fs::File::open(&task.local).await.map_err(|e| SftpError::local_io(&local_path, &e))?;
-    // `create` = WRITE|CREATE|TRUNCATE：与「不做续传、一律覆盖」的口径一致
+    let local_meta = tokio::fs::metadata(&task.local)
+        .await
+        .map_err(|e| SftpError::local_io(&local_path, &e))?;
+    let source_size = local_meta.len();
+    let source_mtime = local_mtime_ms(&local_meta);
+
+    let remote_size = copier
+        .session
+        .metadata(task.remote.clone())
+        .await
+        .ok()
+        .and_then(|m| m.size)
+        .unwrap_or(0);
+    let offset = match &copier.journal {
+        Some(journal) => journal.offset_for(
+            ResumeTarget {
+                scope: &copier.scope,
+                kind: TransferKind::Upload,
+                remote: &task.remote,
+                local: &local_path,
+                source_size,
+                source_mtime,
+            },
+            remote_size,
+        ),
+        None => 0,
+    };
+    if offset > 0 && offset >= source_size {
+        if let Some(journal) = &copier.journal {
+            journal.forget(
+                &copier.scope,
+                TransferKind::Upload,
+                &task.remote,
+                &local_path,
+            );
+        }
+        progress(offset);
+        return Ok(());
+    }
+
+    let mut local = tokio::fs::File::open(&task.local)
+        .await
+        .map_err(|e| SftpError::local_io(&local_path, &e))?;
+    // 续写时不能 TRUNCATE，也不能用 `create()`（它固定带 TRUNCATE）
+    let flags = if offset > 0 {
+        OpenFlags::WRITE | OpenFlags::CREATE
+    } else {
+        OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
+    };
     let mut remote = copier
         .session
-        .create(task.remote.clone())
+        .open_with_flags(task.remote.clone(), flags)
         .await
         .map_err(|e| SftpError::classify(e, task.remote.clone()))?;
+    if offset > 0 {
+        local
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| SftpError::local_io(&local_path, &e))?;
+        remote
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| remote_io(e, &task.remote))?;
+        progress(offset);
+    }
 
+    let mut written = offset;
+    let mut since_record = 0u64;
     let mut buf = vec![0u8; copier.chunk_size];
     loop {
         if cancel.is_cancelled() {
+            record_progress(
+                copier,
+                task,
+                TransferKind::Upload,
+                source_size,
+                source_mtime,
+                written,
+            );
             finish_remote(remote).await;
             return Err(SftpError::Cancelled);
         }
-        let n = local.read(&mut buf).await.map_err(|e| SftpError::local_io(&local_path, &e))?;
+        let n = local
+            .read(&mut buf)
+            .await
+            .map_err(|e| SftpError::local_io(&local_path, &e))?;
         if n == 0 {
             break;
         }
         // 这里刻意不 flush：russh-sftp 的写队列会自动攒够并发度再等应答，
         // 每块都 flush 就等于把流水线拆成串行
-        remote.write_all(&buf[..n]).await.map_err(|e| remote_io(e, &task.remote))?;
+        remote
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| remote_io(e, &task.remote))?;
+        written += n as u64;
+        since_record += n as u64;
+        if since_record >= RESUME_RECORD_EVERY {
+            record_progress(
+                copier,
+                task,
+                TransferKind::Upload,
+                source_size,
+                source_mtime,
+                written,
+            );
+            since_record = 0;
+        }
         progress(n as u64);
     }
     // flush 把在途的 WRITE 应答收干净，close 才真的发 SSH_FXP_CLOSE
-    remote.flush().await.map_err(|e| remote_io(e, &task.remote))?;
-    remote.close().await.map_err(|e| remote_io(e, &task.remote))?;
+    remote
+        .flush()
+        .await
+        .map_err(|e| remote_io(e, &task.remote))?;
+    remote
+        .close()
+        .await
+        .map_err(|e| remote_io(e, &task.remote))?;
+    if let Some(journal) = &copier.journal {
+        journal.forget(
+            &copier.scope,
+            TransferKind::Upload,
+            &task.remote,
+            &local_path,
+        );
+    }
     Ok(())
 }
 
@@ -329,7 +591,9 @@ impl Batch {
     /// 等这批跑完。丢弃返回值也安全：任务自己会结束。
     pub async fn joined(mut self) -> Result<BatchReport, SftpError> {
         match self.join.take() {
-            Some(join) => join.await.map_err(|_| SftpError::Internal("传输任务被运行时中止".into())),
+            Some(join) => join
+                .await
+                .map_err(|_| SftpError::Internal("传输任务被运行时中止".into())),
             None => Err(SftpError::Internal("这批已经等过了".into())),
         }
     }
@@ -357,7 +621,11 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(options: TransferOptions) -> Self {
-        Self { options, next_batch: AtomicU32::new(1), next_item: AtomicU32::new(1) }
+        Self {
+            options,
+            next_batch: AtomicU32::new(1),
+            next_item: AtomicU32::new(1),
+        }
     }
 
     pub fn options(&self) -> &TransferOptions {
@@ -366,13 +634,32 @@ impl Engine {
 
     /// 起跑一批。`sink` 是进度事件出口，建议给一个有界通道：
     /// 满了说明 webview 抽不干了，此时**停下整批**比把内存吃掉更划算。
-    pub fn start(&self, copier: Arc<dyn Copier>, plan: Plan, sink: mpsc::Sender<TransferProgress>) -> Batch {
+    pub fn start(
+        &self,
+        copier: Arc<dyn Copier>,
+        plan: Plan,
+        sink: mpsc::Sender<TransferProgress>,
+    ) -> Batch {
         let id = self.next_batch.fetch_add(1, Ordering::Relaxed);
         let cancel = Cancel::new();
         let options = self.options;
-        let base_item = self.next_item.fetch_add(plan.tasks.len() as u32, Ordering::Relaxed);
-        let join = tokio::spawn(run_batch(id, base_item, copier, plan, options, cancel.clone(), sink));
-        Batch { id, cancel, join: Some(join) }
+        let base_item = self
+            .next_item
+            .fetch_add(plan.tasks.len() as u32, Ordering::Relaxed);
+        let join = tokio::spawn(run_batch(
+            id,
+            base_item,
+            copier,
+            plan,
+            options,
+            cancel.clone(),
+            sink,
+        ));
+        Batch {
+            id,
+            cancel,
+            join: Some(join),
+        }
     }
 }
 
@@ -385,7 +672,13 @@ async fn run_batch(
     cancel: Cancel,
     sink: mpsc::Sender<TransferProgress>,
 ) -> BatchReport {
-    let mut report = BatchReport { id, completed: 0, failed: 0, cancelled: 0, bytes: 0 };
+    let mut report = BatchReport {
+        id,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        bytes: 0,
+    };
     // 目录先建出来：勾选一个空目录时，如果只等文件任务去建父目录，这批会静默地什么也不做
     let _ = copier.prepare(&plan).await;
     let kind = plan.kind;
@@ -417,7 +710,9 @@ async fn run_batch(
             break;
         }
         // 许可拿不到就在这里等：这是并发上限的唯一实现点
-        let Ok(permit) = Arc::clone(&slots).acquire_owned().await else { break };
+        let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
+            break;
+        };
         // 拿到许可后再看一次取消：等许可的那段时间里用户可能已经按了停止。
         // 不补这一眼，队列里的任务会在取消之后逐个醒来空跑一趟。
         if cancel.is_cancelled() {
@@ -428,7 +723,17 @@ async fn run_batch(
         let sink = sink.clone();
         running.push(tokio::spawn(async move {
             let _permit = permit;
-            run_task(id, base_item + offset as u32, copier, task, kind, options, cancel, sink).await
+            run_task(
+                id,
+                base_item + offset as u32,
+                copier,
+                task,
+                kind,
+                options,
+                cancel,
+                sink,
+            )
+            .await
         }));
     }
 
@@ -480,41 +785,53 @@ async fn run_task(
         total: Some(total),
         error,
     };
-    if sink.send(emit(TransferState::Running, 0, None)).await.is_err() {
+    if sink
+        .send(emit(TransferState::Running, 0, None))
+        .await
+        .is_err()
+    {
         cancel.cancel();
         return Outcome::Cancelled(transferred);
     }
 
     let result = copier
-        .copy(
-            &task,
-            &cancel,
-            &mut |delta| {
-                transferred += delta;
-                if meter.tick(tokio::time::Instant::now()) {
-                    // 节流窗口外直接丢：进度事件是「示意」，丢一条不影响正确性，
-                    // 而 try_send 满时阻塞在这个回调里会把整条流水线钉住
-                    let _ = sink.try_send(emit(TransferState::Running, transferred, None));
-                }
-            },
-        )
+        .copy(&task, &cancel, &mut |delta| {
+            transferred += delta;
+            if meter.tick(tokio::time::Instant::now()) {
+                // 节流窗口外直接丢：进度事件是「示意」，丢一条不影响正确性，
+                // 而 try_send 满时阻塞在这个回调里会把整条流水线钉住
+                let _ = sink.try_send(emit(TransferState::Running, transferred, None));
+            }
+        })
         .await;
 
     match result {
         Ok(()) => {
             // 终态事件一定发出去，哪怕还在节流窗口里：前端靠它把条目从「传输中」摘掉
-            if sink.send(emit(TransferState::Completed, transferred, None)).await.is_err() {
+            if sink
+                .send(emit(TransferState::Completed, transferred, None))
+                .await
+                .is_err()
+            {
                 tracing::debug!(batch_id, item_id, "进度接收端已关闭");
             }
             Outcome::Done(transferred)
         }
         Err(SftpError::Cancelled) => {
-            let _ = sink.send(emit(TransferState::Cancelled, transferred, None)).await;
+            let _ = sink
+                .send(emit(TransferState::Cancelled, transferred, None))
+                .await;
             Outcome::Cancelled(transferred)
         }
         Err(e) => {
             let message: dbhx_model::IpcError = e.into();
-            let _ = sink.send(emit(TransferState::Failed, transferred, Some(message.message))).await;
+            let _ = sink
+                .send(emit(
+                    TransferState::Failed,
+                    transferred,
+                    Some(message.message),
+                ))
+                .await;
             Outcome::Failed
         }
     }
@@ -540,7 +857,11 @@ mod tests {
     use tokio::time::{Duration, Instant};
 
     fn task(remote: &str, size: u64) -> Task {
-        Task { remote: remote.into(), local: PathBuf::from("/tmp/out"), size }
+        Task {
+            remote: remote.into(),
+            local: PathBuf::from("/tmp/out"),
+            size,
+        }
     }
 
     fn plan(tasks: Vec<Task>) -> Plan {
@@ -612,7 +933,11 @@ mod tests {
     }
 
     /// 起一批并把事件全收下来。
-    async fn drive(options: TransferOptions, copier: Arc<FakeCopier>, plan: Plan) -> (BatchReport, Vec<TransferProgress>) {
+    async fn drive(
+        options: TransferOptions,
+        copier: Arc<FakeCopier>,
+        plan: Plan,
+    ) -> (BatchReport, Vec<TransferProgress>) {
         let (tx, mut rx) = mpsc::channel::<TransferProgress>(256);
         let engine = Engine::new(options);
         let batch = engine.start(copier, plan, tx);
@@ -625,7 +950,11 @@ mod tests {
     }
 
     fn options(max_files: usize) -> TransferOptions {
-        TransferOptions { chunk_size: 10, max_files, progress_interval: PROGRESS_INTERVAL }
+        TransferOptions {
+            chunk_size: 10,
+            max_files,
+            progress_interval: PROGRESS_INTERVAL,
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -639,7 +968,11 @@ mod tests {
         let states: Vec<TransferState> = events.iter().map(|e| e.state).collect();
         assert_eq!(states[0], TransferState::Queued, "先排队，前端才知道总量");
         assert!(states.contains(&TransferState::Running));
-        assert_eq!(*states.last().unwrap(), TransferState::Completed, "终态必须收尾");
+        assert_eq!(
+            *states.last().unwrap(),
+            TransferState::Completed,
+            "终态必须收尾"
+        );
         assert_eq!(events.last().unwrap().transferred, 20);
         assert_eq!(events.last().unwrap().total, Some(20));
     }
@@ -651,11 +984,18 @@ mod tests {
         let tasks: Vec<Task> = (0..8).map(|i| task(&format!("/{i}.log"), 20)).collect();
         let peak = Arc::clone(&copier.peak);
         let (report, events) = drive(options(3), copier, plan(tasks)).await;
-        assert_eq!(peak.load(Ordering::Acquire), 3, "并发上限是唯一实现点，不能被绕过");
+        assert_eq!(
+            peak.load(Ordering::Acquire),
+            3,
+            "并发上限是唯一实现点，不能被绕过"
+        );
         assert_eq!(report.completed, 8);
         assert_eq!(report.bytes, 160);
         // 每个条目一条终态事件
-        let done = events.iter().filter(|e| e.state == TransferState::Completed).count();
+        let done = events
+            .iter()
+            .filter(|e| e.state == TransferState::Completed)
+            .count();
         assert_eq!(done, 8);
     }
 
@@ -673,11 +1013,24 @@ mod tests {
         .await;
         assert_eq!((report.completed, report.failed), (1, 1));
         let names: Vec<String> = seen.lock().unwrap().clone();
-        assert!(names.contains(&"/good.log".to_string()), "坏文件不该拦住后面的");
-        let failed = events.iter().find(|e| e.state == TransferState::Failed).unwrap();
+        assert!(
+            names.contains(&"/good.log".to_string()),
+            "坏文件不该拦住后面的"
+        );
+        let failed = events
+            .iter()
+            .find(|e| e.state == TransferState::Failed)
+            .unwrap();
         assert_eq!(failed.path, "/bad.log");
-        assert!(failed.error.as_deref().unwrap().contains("/bad.log"), "要看得出是哪个文件");
-        assert!(!failed.error.as_deref().unwrap().contains("Permission"), "{}", failed.error.as_deref().unwrap());
+        assert!(
+            failed.error.as_deref().unwrap().contains("/bad.log"),
+            "要看得出是哪个文件"
+        );
+        assert!(
+            !failed.error.as_deref().unwrap().contains("Permission"),
+            "{}",
+            failed.error.as_deref().unwrap()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -699,7 +1052,11 @@ mod tests {
         assert!(report.cancelled >= 1, "{report:?}");
         assert_eq!(report.completed, 0);
         let started = seen.lock().unwrap().clone();
-        assert_eq!(started, vec!["/first.log".to_string()], "并发 1 时第二个不该被起跑");
+        assert_eq!(
+            started,
+            vec!["/first.log".to_string()],
+            "并发 1 时第二个不该被起跑"
+        );
         assert!(events.iter().any(|e| e.state == TransferState::Cancelled));
         assert!(events.iter().all(|e| e.kind == TransferKind::Download));
     }
@@ -710,12 +1067,30 @@ mod tests {
         // 只该有约两三条中间进度，最后一定有一条 Completed
         let mut copier = FakeCopier::new();
         copier.gap = Duration::from_millis(50);
-        let (_, events) = drive(options(1), Arc::new(copier), plan(vec![task("/a.log", 100)])).await;
-        let running = events.iter().filter(|e| e.state == TransferState::Running).count();
-        assert!((2..=4).contains(&running), "200 ms 节流下 500 ms 的传输不该有 {running} 条进度");
+        let (_, events) = drive(
+            options(1),
+            Arc::new(copier),
+            plan(vec![task("/a.log", 100)]),
+        )
+        .await;
+        let running = events
+            .iter()
+            .filter(|e| e.state == TransferState::Running)
+            .count();
+        assert!(
+            (2..=4).contains(&running),
+            "200 ms 节流下 500 ms 的传输不该有 {running} 条进度"
+        );
         assert_eq!(*events.last().unwrap(), last_completed(100));
-        let counts: Vec<u64> = events.iter().filter(|e| e.state == TransferState::Running).map(|e| e.transferred).collect();
-        assert!(counts.windows(2).all(|w| w[1] > w[0]), "进度必须单调递增：{counts:?}");
+        let counts: Vec<u64> = events
+            .iter()
+            .filter(|e| e.state == TransferState::Running)
+            .map(|e| e.transferred)
+            .collect();
+        assert!(
+            counts.windows(2).all(|w| w[1] > w[0]),
+            "进度必须单调递增：{counts:?}"
+        );
     }
 
     fn last_completed(bytes: u64) -> TransferProgress {
@@ -741,7 +1116,10 @@ mod tests {
         drop(rx);
         let report = batch.joined().await.unwrap();
         assert_eq!(report.completed, 0);
-        assert!(seen.lock().unwrap().is_empty() || report.cancelled > 0, "{report:?}");
+        assert!(
+            seen.lock().unwrap().is_empty() || report.cancelled > 0,
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -779,8 +1157,15 @@ mod tests {
     fn upload_shows_the_local_path_download_the_remote_one() {
         // 用 join 构造，分隔符按当前平台走，Linux CI 上才不会比出反斜杠
         let local = PathBuf::from("tmp").join("out").join("app.log");
-        let t = Task { remote: "/srv/app.log".into(), local: local.clone(), size: 1 };
-        assert_eq!(display_path(TransferKind::Upload, &t), local.display().to_string());
+        let t = Task {
+            remote: "/srv/app.log".into(),
+            local: local.clone(),
+            size: 1,
+        };
+        assert_eq!(
+            display_path(TransferKind::Upload, &t),
+            local.display().to_string()
+        );
         assert_eq!(display_path(TransferKind::Download, &t), "/srv/app.log");
     }
 }

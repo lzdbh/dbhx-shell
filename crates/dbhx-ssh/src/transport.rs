@@ -24,14 +24,16 @@
 //! 所有 `SshTransport` 句柄 drop ⇒ 请求通道关闭 ⇒ actor 退出 ⇒ `Handle` drop ⇒ 连接断开。
 //! 会话层的池只要还留着一条 lease，就会留着句柄，所以 idle park 不会误杀连接。
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dbhx_model::{LiveEndpoint, PtySize};
-use russh::ChannelStream;
 use russh::client::{Handle, Msg};
+use russh::ChannelStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 use zeroize::Zeroizing;
 
@@ -89,20 +91,82 @@ impl HostKeyVerifier for RejectAll {
     }
 }
 
+/// 可克隆的主机密钥裁决者。跳板链的每一跳都要各起一次握手，但它们的裁决应当
+/// 走同一个来源（同一份 known_hosts、同一个 UI）。`verify` 需要 `&mut`，所以内部
+/// 用异步互斥串行化；裁决是低频操作，串行没有代价。
+#[derive(Clone)]
+pub struct SharedHostKeyVerifier(Arc<tokio::sync::Mutex<Box<dyn HostKeyVerifier>>>);
+
+impl SharedHostKeyVerifier {
+    pub fn new(inner: Box<dyn HostKeyVerifier>) -> Self {
+        Self(Arc::new(tokio::sync::Mutex::new(inner)))
+    }
+
+    /// 每一跳各要一个 `Box<dyn HostKeyVerifier>`；它们共享同一把锁。
+    pub fn boxed(&self) -> Box<dyn HostKeyVerifier> {
+        Box::new(self.clone())
+    }
+}
+
+impl HostKeyVerifier for SharedHostKeyVerifier {
+    fn verify(
+        &mut self,
+        endpoint: LiveEndpoint,
+        key: ServerKey,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let shared = Arc::clone(&self.0);
+        Box::pin(async move {
+            let mut guard = shared.lock().await;
+            guard.verify(endpoint, key).await
+        })
+    }
+}
+
 type Reply<T> = oneshot::Sender<Result<T, SshError>>;
 
 enum Request {
-    Authenticate { credential: Credential, reply: Reply<()> },
-    OpenShell { term: String, pty: PtySize, reply: Reply<Shell> },
-    OpenExec { command: String, reply: Reply<Exec> },
+    Authenticate {
+        credential: Credential,
+        reply: Reply<()>,
+    },
+    OpenShell {
+        term: String,
+        pty: PtySize,
+        reply: Reply<Shell>,
+    },
+    OpenExec {
+        command: String,
+        reply: Reply<Exec>,
+    },
     /// 给 dbhx-sftp 用：subsystem 建好后把裸流交出去，之后 SFTP 报文不再过 actor
-    OpenSubsystem { name: String, reply: Reply<ChannelStream<Msg>> },
+    OpenSubsystem {
+        name: String,
+        reply: Reply<ChannelStream<Msg>>,
+    },
     /// 提权版的裸流：与 `OpenSubsystem` 同为「交出一条 SFTP 线」，但通道里跑的是
     /// 被 sudo 拉起来的 sftp-server，而不是 sshd 自己的 subsystem。
     ///
     /// 口令单独一条字段并包在 `Zeroizing` 里：actor 队列可能积压，
     /// 明文在队列里多躺一秒就多一份可被读出来的副本。
-    OpenSftpElevated { sudo_user: String, password: Zeroizing<String>, reply: Reply<ChannelStream<Msg>> },
+    OpenSftpElevated {
+        sudo_user: String,
+        password: Zeroizing<String>,
+        reply: Reply<ChannelStream<Msg>>,
+    },
+    /// 本地/动态转发的底层：向服务器要一条通往 `target` 的直连通道。
+    OpenDirectTcpip {
+        target_host: String,
+        target_port: u32,
+        reply: Reply<ChannelStream<Msg>>,
+    },
+    /// 远端转发：让服务器在 `bind_host:bind_port` 上监听，把连接转回本机目标。
+    AddRemoteForward {
+        bind_host: String,
+        bind_port: u32,
+        target_host: String,
+        target_port: u16,
+        reply: Reply<u32>,
+    },
     Shutdown,
 }
 
@@ -111,6 +175,8 @@ pub struct SshTransport {
     endpoint: LiveEndpoint,
     tx: mpsc::Sender<Request>,
     state: watch::Receiver<SessionState>,
+    /// 登录横幅：服务器在认证前推的说明文字，最多留第一条。
+    banner: Arc<Mutex<Option<String>>>,
     /// 取走一次就没了（见 `take_events`），所以是 Option。
     events: Option<mpsc::UnboundedReceiver<SshEvent>>,
 }
@@ -121,36 +187,78 @@ impl SshTransport {
         options: DialOptions,
         verifier: Box<dyn HostKeyVerifier>,
     ) -> Result<Self, SshError> {
+        let config = options.config();
+        let target = (options.endpoint.host.clone(), options.endpoint.port);
+        Self::run_handshake(options, verifier, move |handler| {
+            russh::client::connect(config, target, handler)
+        })
+        .await
+    }
+
+    /// 与 [`dial`] 相同，但握手跑在一条已有的字节流上（跳板机的 `direct-tcpip` 通道）。
+    /// `options.endpoint` 仍必须是**最终目标**：主机密钥裁决与用户名都按它来，
+    /// 只是 TCP 这一段换成了给定的流。
+    pub async fn dial_stream<S>(
+        options: DialOptions,
+        verifier: Box<dyn HostKeyVerifier>,
+        stream: S,
+    ) -> Result<Self, SshError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let config = options.config();
+        Self::run_handshake(options, verifier, move |handler| {
+            russh::client::connect_stream(config, stream, handler)
+        })
+        .await
+    }
+
+    /// 两条拨号路径共用的状态机：建通道、等主机密钥裁决、起 actor。
+    async fn run_handshake<F, Fut>(
+        options: DialOptions,
+        verifier: Box<dyn HostKeyVerifier>,
+        connect: F,
+    ) -> Result<Self, SshError>
+    where
+        F: FnOnce(ClientHandler) -> Fut,
+        Fut: std::future::Future<Output = Result<Handle<ClientHandler>, russh::Error>>,
+    {
         let endpoint = options.endpoint.clone();
+        let handshake_timeout = options.handshake_timeout;
         let (state_tx, mut state_rx) = watch::channel(SessionState::Handshaking);
         let state_tx = Arc::new(state_tx);
         let (event_tx, events) = mpsc::unbounded_channel();
         let (check_tx, check_rx) = mpsc::unbounded_channel();
         let (req_tx, req_rx) = mpsc::channel(REQUEST_QUEUE);
+        let forwards = Arc::new(Mutex::new(HashMap::new()));
+        let banner = Arc::new(Mutex::new(None));
 
-        let handler = ClientHandler::new(endpoint.clone(), Arc::clone(&state_tx), event_tx, check_tx);
+        let handler = ClientHandler::new(
+            endpoint.clone(),
+            Arc::clone(&state_tx),
+            event_tx,
+            check_tx,
+            Arc::clone(&forwards),
+            Arc::clone(&banner),
+        );
         // 应答任务必须在 connect 之前就位：russh 的 `connect()` 要等密钥交换走完才返回，
         // 而密钥交换又卡在等 `check_server_key` 的回话——先 connect 再 spawn 就是死锁。
         tokio::spawn(verify_loop(check_rx, endpoint.clone(), verifier));
-        let handle = tokio::time::timeout(
-            options.handshake_timeout,
-            russh::client::connect(
-                options.config(),
-                (endpoint.host.as_str(), endpoint.port),
-                handler,
-            ),
-        )
-        .await
-        .map_err(|_| SshError::Timeout)?
-        .map_err(|e| {
-            // 主机密钥被裁决为「拒绝」时 russh 只能给出一个笼统的握手错误，
-            // 那个错误解释不了「为什么连不上」。以本地裁决结论为准：中间人阻断
-            // 若被翻译成「请核对地址与端口」，用户会去改端口而不是去查密钥。
-            if matches!(&*state_rx.borrow_and_update(), SessionState::Closed(CloseReason::HostKeyRejected)) {
-                return SshError::HostKeyUnknown;
-            }
-            classify_connect_error(&e)
-        })?;
+        let handle = tokio::time::timeout(handshake_timeout, connect(handler))
+            .await
+            .map_err(|_| SshError::Timeout)?
+            .map_err(|e| {
+                // 主机密钥被裁决为「拒绝」时 russh 只能给出一个笼统的握手错误，
+                // 那个错误解释不了「为什么连不上」。以本地裁决结论为准：中间人阻断
+                // 若被翻译成「请核对地址与端口」，用户会去改端口而不是去查密钥。
+                if matches!(
+                    &*state_rx.borrow_and_update(),
+                    SessionState::Closed(CloseReason::HostKeyRejected)
+                ) {
+                    return SshError::HostKeyUnknown;
+                }
+                classify_connect_error(&e)
+            })?;
 
         tokio::spawn(actor_loop(
             handle,
@@ -158,27 +266,48 @@ impl SshTransport {
             state_rx.clone(),
             req_rx,
             endpoint.clone(),
+            forwards,
         ));
 
         // 主机密钥必须已经裁完才能继续：等到不再是 Handshaking 为止。
         let mut waiter = state_rx.clone();
-        wait_for_state(&mut waiter, |s| !matches!(s, SessionState::Handshaking), options.handshake_timeout)
-            .await?;
+        wait_for_state(
+            &mut waiter,
+            |s| !matches!(s, SessionState::Handshaking),
+            handshake_timeout,
+        )
+        .await?;
         match &*state_rx.borrow_and_update() {
             SessionState::KeyExchanged | SessionState::Authenticated => {}
             // 裁决为拒绝 ⇒ 要么是没记录（可确认后重试），要么是不一致（硬阻断）。
             // actor 无法区分这两者，交给调用方：它手上的 verifier 才知道自己为什么说不。
             // 这里统一报 Changed 会让「首次连接」变成不可跳过的错误，所以报 Unknown；
             // Strict 策略（后台复用、无人可问）本来就只会因 Unknown 而失败。
-            SessionState::Closed(CloseReason::HostKeyRejected) => return Err(SshError::HostKeyUnknown),
+            SessionState::Closed(CloseReason::HostKeyRejected) => {
+                return Err(SshError::HostKeyUnknown)
+            }
             SessionState::Closed(other) => return Err(SshError::Unreachable(format!("{other:?}"))),
             SessionState::Handshaking => return Err(SshError::Timeout),
         }
-        Ok(Self { endpoint, tx: req_tx, state: state_rx, events: Some(events) })
+        Ok(Self {
+            endpoint,
+            tx: req_tx,
+            state: state_rx,
+            banner,
+            events: Some(events),
+        })
     }
 
     pub fn endpoint(&self) -> &LiveEndpoint {
         &self.endpoint
+    }
+
+    /// 服务器在认证阶段推的登录横幅（第一条）。可能在认证完成后才到，所以是「当前值」。
+    pub fn auth_banner(&self) -> Option<String> {
+        self.banner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn state(&self) -> SessionState {
@@ -220,23 +349,36 @@ impl SshTransport {
     }
 
     pub async fn authenticate(&self, credential: Credential) -> Result<(), SshError> {
-        self.call(|reply| Request::Authenticate { credential, reply }).await
+        self.call(|reply| Request::Authenticate { credential, reply })
+            .await
     }
 
     pub async fn open_shell(&self, term: &str, pty: &PtySize) -> Result<Shell, SshError> {
         self.require_authenticated()?;
-        self.call(|reply| Request::OpenShell { term: term.to_string(), pty: pty.clone(), reply })
-            .await
+        self.call(|reply| Request::OpenShell {
+            term: term.to_string(),
+            pty: pty.clone(),
+            reply,
+        })
+        .await
     }
 
     pub async fn open_exec(&self, command: &str) -> Result<Exec, SshError> {
         self.require_authenticated()?;
-        self.call(|reply| Request::OpenExec { command: command.to_string(), reply }).await
+        self.call(|reply| Request::OpenExec {
+            command: command.to_string(),
+            reply,
+        })
+        .await
     }
 
     pub async fn open_subsystem(&self, name: &str) -> Result<ChannelStream<Msg>, SshError> {
         self.require_authenticated()?;
-        self.call(|reply| Request::OpenSubsystem { name: name.to_string(), reply }).await
+        self.call(|reply| Request::OpenSubsystem {
+            name: name.to_string(),
+            reply,
+        })
+        .await
     }
 
     /// 用当前登录用户的 sudo 口令起一条提权后的 SFTP 线。
@@ -259,6 +401,43 @@ impl SshTransport {
         self.call(|reply| Request::OpenSftpElevated {
             sudo_user: sudo_user.to_string(),
             password: Zeroizing::new(password.to_string()),
+            reply,
+        })
+        .await
+    }
+
+    /// 打开一条通往 `target_host:target_port` 的 `direct-tcpip` 通道。
+    ///
+    /// 字节原样透传，调用方自己做协议（本地转发、SOCKS5 或跳板）。目标地址由
+    /// **服务器**去连，所以这里不做本地校验：`127.0.0.1` 指的是服务器那一侧。
+    pub async fn open_direct_tcpip(
+        &self,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<ChannelStream<Msg>, SshError> {
+        self.require_authenticated()?;
+        self.call(|reply| Request::OpenDirectTcpip {
+            target_host: target_host.to_string(),
+            target_port: u32::from(target_port),
+            reply,
+        })
+        .await
+    }
+
+    /// 远端转发。返回服务器实际绑定的端口（`bind_port` 传 0 时由服务器分配）。
+    pub async fn remote_forward(
+        &self,
+        bind_host: &str,
+        bind_port: u16,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<u32, SshError> {
+        self.require_authenticated()?;
+        self.call(|reply| Request::AddRemoteForward {
+            bind_host: bind_host.to_string(),
+            bind_port: u32::from(bind_port),
+            target_host: target_host.to_string(),
+            target_port,
             reply,
         })
         .await
@@ -296,7 +475,8 @@ pub async fn wait_until_closed(rx: &mut watch::Receiver<SessionState>) -> CloseR
     }
 }
 
-fn classify_connect_error(e: &russh::Error) -> SshError {    use russh::Error::*;
+fn classify_connect_error(e: &russh::Error) -> SshError {
+    use russh::Error::*;
     // 文案是给运维看的，原文是给日志看的：russh 的 Display 是英文短语，
     // 直接透出既看不懂也不稳定，所以固定成可行动中文 + tracing::debug 留原文。
     let actionable = |hint: &str| {
@@ -305,7 +485,9 @@ fn classify_connect_error(e: &russh::Error) -> SshError {    use russh::Error::*
     };
     match e {
         // version 交换失败 / 握手期断线，绝大多数是「这个端口不是 SSH」或端口填错
-        Version | KexInit | UnknownAlgo | NoCommonAlgo { .. } | Disconnect => actionable(HANDSHAKE_INTERRUPTED),
+        Version | KexInit | UnknownAlgo | NoCommonAlgo { .. } | Disconnect => {
+            actionable(HANDSHAKE_INTERRUPTED)
+        }
         // 签名校验失败是协议层给出的唯一「密钥可能被人换过」信号，不能含糊
         PacketAuth | WrongServerSig => SshError::HostKeyChanged,
         Elapsed(_) => SshError::Timeout,
@@ -338,7 +520,10 @@ async fn wait_for_state(
         if done(&rx.borrow_and_update()) {
             return Ok(());
         }
-        if tokio::time::timeout_at(deadline, rx.changed()).await.is_err() {
+        if tokio::time::timeout_at(deadline, rx.changed())
+            .await
+            .is_err()
+        {
             return Err(SshError::Timeout);
         }
     }
@@ -367,6 +552,7 @@ async fn actor_loop(
     mut state_rx: watch::Receiver<SessionState>,
     mut requests: mpsc::Receiver<Request>,
     endpoint: LiveEndpoint,
+    forwards: Arc<Mutex<HashMap<u32, (String, u16)>>>,
 ) {
     loop {
         tokio::select! {
@@ -377,7 +563,7 @@ async fn actor_loop(
                     // `Error(Disconnected)` 后到，把用户关连接误记成「连接失败」，
                     // UI 会给出不存在的重试建议。
                     Some(req) => {
-                        if handle_request(&endpoint, &mut handle, &state_tx, req).await {
+                        if handle_request(&endpoint, &mut handle, &state_tx, req, &forwards).await {
                             break;
                         }
                     }
@@ -398,7 +584,9 @@ async fn actor_loop(
     // handler 的 `disconnected` 回调随时可能抢到写权。
     stamp_closed(&state_tx, CloseReason::ClientRequested);
     // 尽量发个 disconnect，让对端日志是「客户端正常关闭」而不是 TCP 断裂
-    let _ = handle.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await;
 }
 
 /// 只在「还没有关闭原因」时写入关闭原因。
@@ -419,6 +607,7 @@ async fn handle_request(
     handle: &mut Handle<ClientHandler>,
     state_tx: &Arc<watch::Sender<SessionState>>,
     request: Request,
+    forwards: &Arc<Mutex<HashMap<u32, (String, u16)>>>,
 ) -> bool {
     match request {
         Request::Authenticate { credential, reply } => {
@@ -443,12 +632,58 @@ async fn handle_request(
             let _ = reply.send(open_subsystem(handle, &name).await);
             false
         }
-        Request::OpenSftpElevated { sudo_user, password, reply } => {
+        Request::OpenSftpElevated {
+            sudo_user,
+            password,
+            reply,
+        } => {
             let _ = reply.send(open_sftp_elevated(handle, endpoint, &sudo_user, &password).await);
+            false
+        }
+        Request::OpenDirectTcpip {
+            target_host,
+            target_port,
+            reply,
+        } => {
+            let _ = reply.send(open_direct_tcpip(handle, target_host, target_port).await);
+            false
+        }
+        Request::AddRemoteForward {
+            bind_host,
+            bind_port,
+            target_host,
+            target_port,
+            reply,
+        } => {
+            let outcome = match handle.tcpip_forward(bind_host, bind_port).await {
+                Ok(assigned) => {
+                    // 请求了具体端口时 russh 客户端回 0（服务端没换端口）；0 才表示服务端分配的
+                    let bound = if assigned == 0 { bind_port } else { assigned };
+                    forwards
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(bound, (target_host, target_port));
+                    Ok(bound)
+                }
+                Err(e) => Err(SshError::Russh(e)),
+            };
+            let _ = reply.send(outcome);
             false
         }
         Request::Shutdown => true,
     }
+}
+
+/// `direct-tcpip`：服务器替你连 `target`，字节沿通道原样回来。
+async fn open_direct_tcpip(
+    handle: &mut Handle<ClientHandler>,
+    target_host: String,
+    target_port: u32,
+) -> Result<ChannelStream<Msg>, SshError> {
+    let channel = handle
+        .channel_open_direct_tcpip(target_host, target_port, "127.0.0.1", 0)
+        .await?;
+    Ok(channel.into_stream())
 }
 
 async fn open_shell(
@@ -458,7 +693,15 @@ async fn open_shell(
 ) -> Result<SplitChannel, SshError> {
     let mut channel = handle.channel_open_session().await?;
     channel
-        .request_pty(true, term, u32::from(pty.cols), u32::from(pty.rows), 0, 0, &[])
+        .request_pty(
+            true,
+            term,
+            u32::from(pty.cols),
+            u32::from(pty.rows),
+            0,
+            0,
+            &[],
+        )
         .await?;
     let mut early = confirm(&mut channel, "pty-req").await?;
     channel.request_shell(true).await?;
@@ -489,7 +732,11 @@ async fn open_subsystem(
     // 所以确认阶段不可能有输出要接管。真出现了就是协议异常，留一条日志好查。
     let early = confirm(&mut channel, "subsystem").await?;
     if !early.is_empty() {
-        tracing::warn!(name, count = early.len(), "子系统确认前收到意外数据，已丢弃");
+        tracing::warn!(
+            name,
+            count = early.len(),
+            "子系统确认前收到意外数据，已丢弃"
+        );
     }
     Ok(channel.into_stream())
 }
@@ -545,7 +792,10 @@ mod tests {
     #[tokio::test]
     async fn dial_to_a_dead_port_is_unreachable() {
         let err = dial_err(dead_port().await, Duration::from_secs(5)).await;
-        assert!(matches!(err, SshError::Unreachable(_) | SshError::Timeout), "{err:?}");
+        assert!(
+            matches!(err, SshError::Unreachable(_) | SshError::Timeout),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -567,7 +817,10 @@ mod tests {
             // 操作系统报断线。分类器把它们并成同一句话，所以这里断的其实是
             // 「别把这一类误判成握手超时」，而不是某一处的措辞。
             SshError::Unreachable(m) => {
-                assert!(m.contains("协商") || m.contains("version") || m.contains("SSH"), "{m}")
+                assert!(
+                    m.contains("协商") || m.contains("version") || m.contains("SSH"),
+                    "{m}"
+                )
             }
             other => panic!("期望 Unreachable，实际 {other:?}"),
         }
@@ -589,7 +842,11 @@ mod tests {
         let started = std::time::Instant::now();
         let err = dial_err(port, Duration::from_millis(400)).await;
         assert!(matches!(err, SshError::Timeout), "{err:?}");
-        assert!(started.elapsed() < Duration::from_secs(2), "超时预算没生效：等了 {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "超时预算没生效：等了 {:?}",
+            started.elapsed()
+        );
         server.abort();
     }
 }

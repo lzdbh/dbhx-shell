@@ -10,15 +10,22 @@
 use std::time::Duration;
 
 use dbhx_model::{LiveEndpoint, PtySize};
-use dbhx_ssh::{Credential, DialOptions, ExecOutput, RejectAll, SshError, SshTransport, TrustAll, Chunk};
-use dbhx_testsrv::{TestServer, TestSpec, sample_fs};
+use dbhx_ssh::{
+    Chunk, Credential, DialOptions, ExecOutput, RejectAll, SshError, SshTransport, TrustAll,
+};
+use dbhx_testsrv::{sample_fs, TestServer, TestSpec};
+use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 /// 一次往返的最长等待。本地回环 + 内存 VFS，正常都在几十毫秒内完成。
 const BUDGET: Duration = Duration::from_secs(10);
 
 fn endpoint(server: &TestServer) -> LiveEndpoint {
-    LiveEndpoint { host: server.host(), port: server.port(), username: "app".to_string() }
+    LiveEndpoint {
+        host: server.host(),
+        port: server.port(),
+        username: "app".to_string(),
+    }
 }
 
 fn password() -> Credential {
@@ -30,21 +37,24 @@ async fn login(server: &TestServer) -> SshTransport {
     let transport = SshTransport::dial(DialOptions::new(endpoint(server)), Box::new(TrustAll))
         .await
         .expect("握手与主机密钥裁决应当成功");
-    transport.authenticate(password()).await.expect("正确口令应当认证通过");
+    transport
+        .authenticate(password())
+        .await
+        .expect("正确口令应当认证通过");
     assert!(transport.is_ready(), "认证通过后连接必须处于 ready");
     transport
 }
 
 /// 从 shell 里读到出现 `needle` 为止，返回读到的全部字节。
-async fn read_until(
-    reader: &mut dbhx_ssh::ShellReader,
-    needle: &[u8],
-) -> Vec<u8> {
+async fn read_until(reader: &mut dbhx_ssh::ShellReader, needle: &[u8]) -> Vec<u8> {
     let mut acc = Vec::new();
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Some(chunk) = tokio::time::timeout(remaining, reader.next_chunk()).await.expect("读取超时：通道可能根本没打通") else {
+        let Some(chunk) = tokio::time::timeout(remaining, reader.next_chunk())
+            .await
+            .expect("读取超时：通道可能根本没打通")
+        else {
             panic!("通道提前结束，已读到 {:?}", String::from_utf8_lossy(&acc));
         };
         match chunk {
@@ -66,12 +76,18 @@ async fn a_password_handshake_opens_a_shell_and_carries_keystrokes() {
     let server = TestServer::start(spec()).await.unwrap();
     let transport = login(&server).await;
 
-    let shell = transport.open_shell("xterm-256color", &PtySize::default()).await.unwrap();
+    let shell = transport
+        .open_shell("xterm-256color", &PtySize::default())
+        .await
+        .unwrap();
     let (_writer, mut reader) = shell.into_split();
 
     // 服务器在 shell_request 里就会推一条带 OSC 7 的提示符
     let first = read_until(&mut reader, b"$ ").await;
-    assert!(String::from_utf8_lossy(&first).contains("\x1b]7;file://"), "首条提示符必须带 OSC 7，目录跟随才有原料");
+    assert!(
+        String::from_utf8_lossy(&first).contains("\x1b]7;file://"),
+        "首条提示符必须带 OSC 7，目录跟随才有原料"
+    );
 
     transport.close().await;
     server.shutdown().await;
@@ -81,7 +97,10 @@ async fn a_password_handshake_opens_a_shell_and_carries_keystrokes() {
 async fn typed_input_comes_back_and_cd_moves_the_reported_directory() {
     let server = TestServer::start(spec()).await.unwrap();
     let transport = login(&server).await;
-    let shell = transport.open_shell("xterm-256color", &PtySize::default()).await.unwrap();
+    let shell = transport
+        .open_shell("xterm-256color", &PtySize::default())
+        .await
+        .unwrap();
     let (writer, mut reader) = shell.into_split();
     read_until(&mut reader, b"$ ").await;
 
@@ -92,7 +111,9 @@ async fn typed_input_comes_back_and_cd_moves_the_reported_directory() {
     writer.write(b"cd /home/app/logs\r").await.unwrap();
     let after_cd = read_until(&mut reader, b"file://dbhx-test/home/app/logs").await;
     // 这就是 SFTP 面板跟随所依赖的那个字节序列，必须原样到达客户端
-    assert!(String::from_utf8_lossy(&after_cd).contains("\x1b]7;file://dbhx-test/home/app/logs\x07"));
+    assert!(
+        String::from_utf8_lossy(&after_cd).contains("\x1b]7;file://dbhx-test/home/app/logs\x07")
+    );
 
     writer.close().await.unwrap();
     transport.close().await;
@@ -102,12 +123,26 @@ async fn typed_input_comes_back_and_cd_moves_the_reported_directory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_wrong_password_is_refused_and_the_attempt_is_visible() {
     let server = TestServer::start(spec()).await.unwrap();
-    let transport = SshTransport::dial(DialOptions::new(endpoint(&server)), Box::new(TrustAll)).await.unwrap();
+    let transport = SshTransport::dial(DialOptions::new(endpoint(&server)), Box::new(TrustAll))
+        .await
+        .unwrap();
     let wrong = Credential::Password(Zeroizing::new("not-it".to_string()));
-    let err = transport.authenticate(wrong).await.expect_err("错口令不该通过");
-    assert!(matches!(err, SshError::AuthFailed), "应当是明确的认证失败，收到 {err:?}");
+    let err = transport
+        .authenticate(wrong)
+        .await
+        .expect_err("错口令不该通过");
+    assert!(
+        matches!(err, SshError::AuthFailed),
+        "应当是明确的认证失败，收到 {err:?}"
+    );
     let observed = server.observed();
-    assert!(observed.auth_attempts.iter().any(|(user, ok)| user == "app" && !ok), "服务器侧应当记下这次失败尝试");
+    assert!(
+        observed
+            .auth_attempts
+            .iter()
+            .any(|(user, ok)| user == "app" && !ok),
+        "服务器侧应当记下这次失败尝试"
+    );
     assert!(!transport.is_ready(), "认证失败的连接不能自称 ready");
 
     transport.close().await;
@@ -121,27 +156,54 @@ async fn an_unreachable_port_is_a_network_fault_not_a_panic() {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         probe.local_addr().unwrap().port()
     };
-    let endpoint = LiveEndpoint { host: "127.0.0.1".to_string(), port, username: "app".to_string() };
+    let endpoint = LiveEndpoint {
+        host: "127.0.0.1".to_string(),
+        port,
+        username: "app".to_string(),
+    };
     let err = match SshTransport::dial(DialOptions::new(endpoint), Box::new(TrustAll)).await {
         Ok(_) => panic!("端口上没人听，拨号不该成功"),
         Err(err) => err,
     };
-    assert!(matches!(err, SshError::Timeout | SshError::Unreachable(_)), "连不上应当归成网络类错误，收到 {err:?}");
+    assert!(
+        matches!(err, SshError::Timeout | SshError::Unreachable(_)),
+        "连不上应当归成网络类错误，收到 {err:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resize_requests_reach_the_server_with_the_right_geometry() {
     let server = TestServer::start(spec()).await.unwrap();
     let transport = login(&server).await;
-    let shell = transport.open_shell("xterm-256color", &PtySize { rows: 30, cols: 110 }).await.unwrap();
+    let shell = transport
+        .open_shell(
+            "xterm-256color",
+            &PtySize {
+                rows: 30,
+                cols: 110,
+            },
+        )
+        .await
+        .unwrap();
     let (writer, _reader) = shell.into_split();
 
-    writer.resize(&PtySize { rows: 12, cols: 40 }).await.unwrap();
+    writer
+        .resize(&PtySize { rows: 12, cols: 40 })
+        .await
+        .unwrap();
     // window-change 是单向消息，等它落地再断言
     tokio::time::sleep(Duration::from_millis(200)).await;
     let observed = server.observed();
-    assert!(observed.resizes.contains(&(110, 30)), "开 shell 时的 pty 尺寸应当先到：{:?}", observed.resizes);
-    assert!(observed.resizes.contains(&(40, 12)), "resize 之后服务端看到的必须是新尺寸：{:?}", observed.resizes);
+    assert!(
+        observed.resizes.contains(&(110, 30)),
+        "开 shell 时的 pty 尺寸应当先到：{:?}",
+        observed.resizes
+    );
+    assert!(
+        observed.resizes.contains(&(40, 12)),
+        "resize 之后服务端看到的必须是新尺寸：{:?}",
+        observed.resizes
+    );
 
     transport.close().await;
     server.shutdown().await;
@@ -165,11 +227,22 @@ async fn a_known_subsystem_opens_and_an_unknown_one_is_refused() {
     let server = TestServer::start(spec()).await.unwrap();
     let transport = login(&server).await;
 
-    let stream = transport.open_subsystem("sftp").await.expect("sftp 子系统应当可用");
+    let stream = transport
+        .open_subsystem("sftp")
+        .await
+        .expect("sftp 子系统应当可用");
     drop(stream);
     match transport.open_subsystem("nope").await {
         Ok(_) => panic!("未实现的子系统必须被拒绝"),
-        Err(err) => assert!(matches!(err, SshError::RequestRefused { request: "subsystem" }), "拒绝原因应当是 subsystem 请求被驳回，收到 {err:?}"),
+        Err(err) => assert!(
+            matches!(
+                err,
+                SshError::RequestRefused {
+                    request: "subsystem"
+                }
+            ),
+            "拒绝原因应当是 subsystem 请求被驳回，收到 {err:?}"
+        ),
     }
 
     transport.close().await;
@@ -182,7 +255,9 @@ async fn closing_the_client_ends_the_session_state() {
     let transport = login(&server).await;
     let mut updates = transport.state_updates();
     transport.close().await;
-    let reason = tokio::time::timeout(BUDGET, dbhx_ssh::wait_until_closed(&mut updates)).await.unwrap();
+    let reason = tokio::time::timeout(BUDGET, dbhx_ssh::wait_until_closed(&mut updates))
+        .await
+        .unwrap();
     assert_eq!(reason, dbhx_ssh::CloseReason::ClientRequested);
     server.shutdown().await;
 }
@@ -193,10 +268,11 @@ async fn a_rejected_host_key_reads_as_a_key_problem_not_a_network_one() {
     // 裁决为拒绝时 russh 交回的是一个笼统的握手错误。那个错误解释不了「为什么连不上」，
     // 必须让本地的 HostKeyRejected 结论盖掉它——否则中间人阻断在 UI 上就变成
     // 「请核对地址与端口」，用户会去改端口而不是去查密钥。
-    let err = match SshTransport::dial(DialOptions::new(endpoint(&server)), Box::new(RejectAll)).await {
-        Err(err) => err,
-        Ok(_) => panic!("一律拒绝的裁决不该把握手放过去"),
-    };
+    let err =
+        match SshTransport::dial(DialOptions::new(endpoint(&server)), Box::new(RejectAll)).await {
+            Err(err) => err,
+            Ok(_) => panic!("一律拒绝的裁决不该把握手放过去"),
+        };
     assert!(matches!(err, SshError::HostKeyUnknown), "{err:?}");
 
     server.shutdown().await;
@@ -232,10 +308,24 @@ async fn an_elevated_open_delivers_the_password_as_data_not_as_argv() {
         .expect("口令正确且 sudoers 放行时应当交出流");
 
     let observed = server.observed();
-    assert_eq!(observed.sudo_passwords, vec!["dbhx-test".to_string()], "口令应当作为通道的第一行数据到达");
-    let command = observed.execs.iter().find(|c| c.contains("sudo -k -A -u")).expect("提权 exec 应当到达服务器");
-    assert!(!command.contains("dbhx-test"), "口令绝不能进命令串（远端进程表里看得见）：{command}");
-    assert!(command.contains("-u 'root'"), "提权用户要被引号包住：{command}");
+    assert_eq!(
+        observed.sudo_passwords,
+        vec!["dbhx-test".to_string()],
+        "口令应当作为通道的第一行数据到达"
+    );
+    let command = observed
+        .execs
+        .iter()
+        .find(|c| c.contains("sudo -k -A -u"))
+        .expect("提权 exec 应当到达服务器");
+    assert!(
+        !command.contains("dbhx-test"),
+        "口令绝不能进命令串（远端进程表里看得见）：{command}"
+    );
+    assert!(
+        command.contains("-u 'root'"),
+        "提权用户要被引号包住：{command}"
+    );
 
     drop(stream);
     transport.close().await;
@@ -256,8 +346,16 @@ async fn an_elevated_open_without_sudo_rights_says_the_machine_refused_it() {
     assert!(matches!(err, SshError::ElevateDenied(_)), "收到 {err:?}");
     // 过一遍 IPC：用户在 UI 上看到的就是这一份，分类与可重试性都必须在这里也对
     let ipc = dbhx_model::IpcError::from(err);
-    assert!(ipc.message.contains("不允许") && ipc.message.contains("sudo"), "{}", ipc.message);
-    assert!(!ipc.message.contains("sudoers file"), "英文原文不该直接透给用户：{}", ipc.message);
+    assert!(
+        ipc.message.contains("不允许") && ipc.message.contains("sudo"),
+        "{}",
+        ipc.message
+    );
+    assert!(
+        !ipc.message.contains("sudoers file"),
+        "英文原文不该直接透给用户：{}",
+        ipc.message
+    );
     assert!(!ipc.retryable, "重试同一条 sudo 不会改变远端 sudoers");
 
     transport.close().await;
@@ -270,8 +368,13 @@ async fn a_wrong_sudo_password_is_named_as_a_password_problem() {
     let transport = login(&server).await;
 
     let err = elevate_err(&transport, "root", "not-it").await;
-    let SshError::ElevateDenied(message) = err else { panic!("应当是提权被拒，收到 {err:?}") };
-    assert!(message.contains("口令不正确"), "要和「机器不放行」分得清清楚楚：{message}");
+    let SshError::ElevateDenied(message) = err else {
+        panic!("应当是提权被拒，收到 {err:?}")
+    };
+    assert!(
+        message.contains("口令不正确"),
+        "要和「机器不放行」分得清清楚楚：{message}"
+    );
     assert_eq!(server.observed().sudo_passwords, vec!["not-it".to_string()]);
 
     transport.close().await;
@@ -289,8 +392,75 @@ async fn an_empty_sudo_password_never_reaches_the_server() {
 
     let err = elevate_err(&transport, "root", "").await;
     assert!(matches!(err, SshError::InvalidInput(_)), "{err:?}");
-    assert!(server.observed().execs.is_empty(), "本地就该拦下来，一条 exec 都不该发出去");
+    assert!(
+        server.observed().execs.is_empty(),
+        "本地就该拦下来，一条 exec 都不该发出去"
+    );
 
     transport.close().await;
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_tcpip_pipes_bytes_to_the_requested_endpoint() {
+    let server = TestServer::start(spec()).await.unwrap();
+    let transport = login(&server).await;
+
+    // 让服务器把通道接到它自己的 SSH 端口：另一头应当立刻发 banner
+    let mut tunnel = transport
+        .open_direct_tcpip("127.0.0.1", server.port())
+        .await
+        .expect("direct-tcpip 应当被接受");
+
+    let mut banner = vec![0u8; 64];
+    let n = tokio::time::timeout(BUDGET, tunnel.read(&mut banner))
+        .await
+        .expect("读 banner 超时")
+        .expect("通过通道读取失败");
+    assert!(
+        banner[..n].starts_with(b"SSH-2.0-"),
+        "隧道另一头应当是服务器的 SSH banner，实际是 {:?}",
+        String::from_utf8_lossy(&banner[..n])
+    );
+
+    transport.close().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ssh_over_a_direct_tcpip_channel_reaches_the_second_server() {
+    let jump = TestServer::start(spec()).await.unwrap();
+    let target = TestServer::start(spec()).await.unwrap();
+
+    // 经由 jump 的 direct-tcpip 连到 target 的 SSH 端口，再在通道里跑一次完整握手
+    let jump_transport = login(&jump).await;
+    let stream = jump_transport
+        .open_direct_tcpip("127.0.0.1", target.port())
+        .await
+        .expect("跳板服务器应当接受 direct-tcpip");
+    let target_transport = SshTransport::dial_stream(
+        DialOptions::new(endpoint(&target)),
+        Box::new(TrustAll),
+        stream,
+    )
+    .await
+    .expect("跳板通道里的握手应当成功");
+    target_transport
+        .authenticate(password())
+        .await
+        .expect("第二跳认证应当成功");
+
+    let out = target_transport
+        .open_exec("pwd")
+        .await
+        .unwrap()
+        .run_to_end()
+        .await
+        .unwrap();
+    assert_eq!(out.stdout, b"/home/app\n", "命令应当跑在第二台服务器上");
+
+    target_transport.close().await;
+    jump_transport.close().await;
+    target.shutdown().await;
+    jump.shutdown().await;
 }

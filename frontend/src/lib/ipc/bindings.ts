@@ -5,20 +5,8 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 
 /** Commands */
 export const commands = {
-	/**
-	 *  验证「命令入参含枚举 + 结构体返回 + TS 类型生成」闭环。
-	 * 
-	 *  这里的 `target` 是假数据：D1 还没有真正的会话层，只为把 `LiveEndpoint`
-	 *  推进类型生成器，确认它导出的 TS 形状符合预期。
-	 */
-	ping: (seq: number, echo: string) => typedError<Pong, IpcError>(__TAURI_INVOKE("plugin:dbhx|ping", { seq, echo })),
-	/**
-	 *  验证 `IpcError` 在错误通道上的序列化形状，以及枚举作为入参的可行性。
-	 *  永远返回 Err。
-	 */
-	pingFailure: (code: ErrorCode, message: string) => typedError<Pong, IpcError>(__TAURI_INVOKE("plugin:dbhx|ping_failure", { code, message })),
 	sessionOpenLocal: (spec: ConnectSpec, label: string) => typedError<SessionInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|session_open_local", { spec, label })),
-	sessionOpenRemote: (hostId: HostId, pty: PtySize) => typedError<SessionInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|session_open_remote", { hostId, pty })),
+	sessionOpenRemote: (hostId: HostId, pty: PtySize, term: string | null) => typedError<SessionInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|session_open_remote", { hostId, pty, term })),
 	/**
 	 *  键盘输入。方向与输出相反：这里用 `Vec<u8>` 而不是 base64。
 	 *  输入端每次只有几个字节，serde_json 的数字数组那点浪费可以忽略，
@@ -52,6 +40,8 @@ export const commands = {
 	vaultLock: () => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_lock")),
 	/**  解锁：PIN 从渲染层输入框进来，是唯一允许明文跨界的又一个入口（方向朝内）。 */
 	vaultUnlock: (pin: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_unlock", { pin })),
+	vaultExportOffline: (path: string, passphrase: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_export_offline", { path, passphrase })),
+	vaultImportOffline: (path: string, passphrase: string) => typedError<OfflineImportReport, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_import_offline", { path, passphrase })),
 	vaultSetLockPin: (pin: string) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_set_lock_pin", { pin })),
 	vaultClearLockPin: () => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|vault_clear_lock_pin")),
 	sftpOpenForSession: (session: SessionId) => typedError<PanelInfo, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_open_for_session", { session })),
@@ -67,8 +57,8 @@ export const commands = {
 	sftpClose: (connection: number) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_close", { connection })),
 	sftpSetFollowing: (connection: number, following: boolean) => typedError<SftpFollowed, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_set_following", { connection, following })),
 	sftpSetEditing: (connection: number, editing: boolean) => typedError<SftpFollowed, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_set_editing", { connection, editing })),
-	sftpDownload: (connection: number, targets: string[], localDir: string) => typedError<number, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_download", { connection, targets, localDir })),
-	sftpUpload: (connection: number, localPaths: string[], remoteDir: string | null) => typedError<number, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_upload", { connection, localPaths, remoteDir })),
+	sftpDownload: (connection: number, targets: string[], localDir: string, policy: "ask" | "overwrite" | "skip" | "rename" | null) => typedError<number, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_download", { connection, targets, localDir, policy })),
+	sftpUpload: (connection: number, localPaths: string[], remoteDir: string | null, policy: "ask" | "overwrite" | "skip" | "rename" | null) => typedError<number, IpcError>(__TAURI_INVOKE("plugin:dbhx|sftp_upload", { connection, localPaths, remoteDir, policy })),
 	transferCancel: (batch: number) => typedError<null, IpcError>(__TAURI_INVOKE("plugin:dbhx|transfer_cancel", { batch })),
 	transferRunning: () => typedError<BatchInfo[], IpcError>(__TAURI_INVOKE("plugin:dbhx|transfer_running")),
 	localHome: () => typedError<string, IpcError>(__TAURI_INVOKE("plugin:dbhx|local_home")),
@@ -125,7 +115,9 @@ export const events = {
 	sftpFollowed: makeEvent<SftpFollowed>("plugin:dbhx:sftp-followed"),
 	termData: makeEvent<TermData>("plugin:dbhx:term-data"),
 	transferBatchEnded: makeEvent<TransferBatchEnded>("plugin:dbhx:transfer-batch-ended"),
+	transferConflict: makeEvent<TransferConflict>("plugin:dbhx:transfer-conflict"),
 	transferProgress: makeEvent<TransferProgressEvent>("plugin:dbhx:transfer-progress"),
+	tunnelFailed: makeEvent<TunnelFailed>("plugin:dbhx:tunnel-failed"),
 	vaultChanged: makeEvent<VaultChanged>("plugin:dbhx:vault-changed"),
 };
 
@@ -163,6 +155,9 @@ export type BatchInfo = {
  *  导出成 TS `string` 靠 `#[specta(type = String)]`，它只影响类型生成、不参与序列化。
  */
 export type ByteBlob = string;
+
+/**  同名文件的处理方式。`Ask` 会让后端弹一次请求，前端的选择对整批生效。 */
+export type ConflictPolicy = "ask" | "overwrite" | "skip" | "rename";
 
 /**  统一的会话建立参数：本地 PTY 与 SSH 共用一个入口。 */
 export type ConnectSpec = {
@@ -268,6 +263,10 @@ export type HostDraft = {
 	tags: string[],
 	favorite: boolean,
 	protocol: Protocol,
+	/**  跳板链，从离本机最近的一跳开始。 */
+	jump?: HostId[],
+	/**  端口转发配置。 */
+	tunnels?: TunnelSpec[],
 	/**  列表图标用。表单从既有记录预填，所以「编辑不改」不会把它冲掉。 */
 	os: OsType,
 	endpoint: Endpoint,
@@ -295,6 +294,10 @@ export type HostInfo = {
 	tags: string[],
 	favorite: boolean,
 	protocol: Protocol,
+	/**  跳板链（只读投影，供列表/表单展示） */
+	jump?: HostId[],
+	/**  端口转发（只读投影） */
+	tunnels?: TunnelSpec[],
 	/**  列表图标用，见 `OsType` */
 	os: OsType,
 	endpoint: Endpoint,
@@ -355,6 +358,13 @@ export type IpcError = {
 	retryable: boolean,
 };
 
+/**  主密钥实际存在哪里。只用于设置页展示，不参与任何加解密判断。 */
+export type KeyStoreKind = 
+/**  应用目录下的 `master.key`（钥匙串不可用时的兜底） */
+"file" | 
+/**  系统钥匙串：Windows 凭据管理器 / macOS Keychain / Linux Secret Service */
+"system_keyring";
+
 /**  主机密钥记录。OpenSSH `known_hosts` 的一行，明文存（完整性敏感但不机密）。 */
 export type KnownHost = {
 	/**  `host:port` 或 `[host]:port`，与 OpenSSH 一致；通配模式按字面存 */
@@ -393,12 +403,26 @@ export type LockStatus = {
 	locked: boolean,
 	/**  是否设置过解锁 PIN。没设过就不可能进入锁定态，覆盖层据此决定显不显示。 */
 	has_pin: boolean,
+	/**  主密钥实际存在系统钥匙串还是本地文件（钥匙串不可用时的兜底） */
+	key_store: KeyStoreKind,
 };
 
 /**  停止记录之后回给前端的结果。 */
 export type LogSummary = {
 	path: string,
 	bytes: number,
+};
+
+/**  离线备份导入的结果。冲突副本与缺凭据都要逐条念给用户。 */
+export type OfflineImportReport = {
+	hosts: number,
+	identities: number,
+	/**  同 id 冲突后另存的副本名 */
+	conflicts: string[],
+	/**  备份引用了、但本机和备份里都没有的口令 */
+	missing_credentials: string[],
+	/**  备份引用了、但本机和备份里都没有的身份 */
+	missing_identities: string[],
 };
 
 /**
@@ -444,21 +468,6 @@ export type PanelInfo = {
 export type PassphraseRequest = {
 	request: number,
 	identity_label: string,
-};
-
-/**
- *  D1 用来验证「命令入参 + 结构体返回 + 类型生成」闭环。
- * 
- *  `u64` 能出现在契约里，是因为 `dbhx-ipc` 的 builder 开了
- *  `dangerously_cast_bigints_to_number()`：TS 侧统一看成 `number`。
- *  前提是值始终 < 2^53 ≈ 9.0e15——epoch 毫秒（~1.7e12）和字节计数都远不到，
- *  但任何可能超过该上界的量（累计字节、纳秒时间戳）必须改走 string。
- */
-export type Pong = {
-	seq: number,
-	server_time_ms: number,
-	echo: string,
-	target: LiveEndpoint,
 };
 
 /**  M6 落了 telnet；mosh/et/serial 仍未接，先不占位。 */
@@ -524,6 +533,8 @@ export type SessionInfo = {
 	live_endpoint: LiveEndpoint | null,
 	pty: PtySize,
 	encoding: TerminalEncoding,
+	/**  服务器在认证阶段推的登录横幅（第一条）。前端在会话打开后弹一次通知。 */
+	banner?: string | null,
 };
 
 /**
@@ -640,6 +651,18 @@ export type TransferBatchEnded = {
 	error: string | null,
 };
 
+/**
+ *  一批传输里发现同名文件，等用户决定整批怎么处理。
+ * 
+ *  只带前几个路径（`samples`）用于展示；`count` 是完整数量。回答走 `request_reply`。
+ */
+export type TransferConflict = {
+	request: number,
+	transfer_kind: TransferKind,
+	count: number,
+	samples: string[],
+};
+
 export type TransferKind = 
 /**  本机 → 远端 */
 "upload" | 
@@ -674,8 +697,35 @@ export type TransferProgressEvent = TransferProgress;
  */
 export type TransferState = "queued" | "running" | "completed" | "failed" | "cancelled";
 
+/**  端口转发没能启动（端口被占、钥匙串/通道不可用等）。纯通知，前端弹一条错误。 */
+export type TunnelFailed = {
+	host_id: string,
+	message: string,
+};
+
+export type TunnelKind = 
+/**  本机端口 → 远端固定目标 */
+"local" | 
+/**  本机端口做 SOCKS5 动态代理 */
+"dynamic" | 
+/**  远端端口 → 本机固定目标 */
+"remote";
+
+/**  一台主机上配置的端口转发。随该主机的 SSH 连接自动启动/停止。 */
+export type TunnelSpec = {
+	kind: TunnelKind,
+	/**  监听地址。本地/动态转发在本机，远端转发在服务器上。 */
+	bind_host: string,
+	bind_port: number,
+	/**  本地转发的目标（服务器侧地址）；动态转发不用。 */
+	target_host: string,
+	target_port: number,
+};
+
 /**  用户对后端询问的回答。 */
-export type UserReply = { kind: "confirmed" } | { kind: "cancelled" } | { kind: "secret"; text: string };
+export type UserReply = { kind: "confirmed" } | { kind: "cancelled" } | { kind: "secret"; text: string } | 
+/**  传输冲突的处理方式，对整批生效 */
+{ kind: "conflict"; policy: ConflictPolicy };
 
 /**  vault 变了，前端重取主机列表。计数不是秘密，可以直接用来更新侧栏徽章。 */
 export type VaultChanged = {

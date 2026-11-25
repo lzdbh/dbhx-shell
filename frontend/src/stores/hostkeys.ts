@@ -2,7 +2,7 @@ import { computed, ref } from 'vue'
 
 import { defineStore } from 'pinia'
 
-import type { HostKeyConflict, HostKeyPending, KnownHost, PassphraseRequest } from '../lib/ipc/bindings'
+import type { ConflictPolicy, HostKeyConflict, HostKeyPending, KnownHost, PassphraseRequest, TransferConflict, TransferKind } from '../lib/ipc/bindings'
 import { hostkeyApi, requestApi } from '../lib/ipc/client'
 import { describeIpcError, normalizeIpcError } from '../lib/ipc/errors'
 
@@ -17,6 +17,7 @@ export type Ask =
   | { kind: 'host_key', request: number, endpoint: HostKeyPending['endpoint'], presented: KnownHost }
   | { kind: 'passphrase', request: number, identityLabel: string }
   | { kind: 'conflict', endpoint: HostKeyConflict['endpoint'], stored: KnownHost, presented: KnownHost }
+  | { kind: 'transfer', request: number, transferKind: TransferKind, count: number, samples: string[] }
 
 export const useHostkeysStore = defineStore('hostkeys', () => {
   const known = ref<KnownHost[]>([])
@@ -81,6 +82,16 @@ export const useHostkeysStore = defineStore('hostkeys', () => {
     if (!duplicate) asks.value.push({ kind: 'conflict', ...event })
   }
 
+  function onTransferConflict(event: TransferConflict): void {
+    asks.value.push({
+      kind: 'transfer',
+      request: event.request,
+      transferKind: event.transfer_kind,
+      count: event.count,
+      samples: event.samples,
+    })
+  }
+
   /* 回答 */
 
   async function confirmKey(): Promise<void> {
@@ -134,6 +145,29 @@ export const useHostkeysStore = defineStore('hostkeys', () => {
     if (asks.value[0]?.kind === 'conflict') asks.value.shift()
   }
 
+  /** 冲突策略对整批生效；`ask` 不是合法回答，用户必须选一个具体动作。 */
+  async function answerTransferConflict(policy: Exclude<ConflictPolicy, 'ask'>): Promise<void> {
+    const ask = asks.value[0]
+    if (ask?.kind !== 'transfer') return
+    asks.value.shift()
+    try {
+      await requestApi.replyConflict(ask.request, policy)
+    } catch (err) {
+      error.value = describeIpcError(normalizeIpcError(err))
+    }
+  }
+
+  async function cancelTransferConflict(): Promise<void> {
+    const ask = asks.value[0]
+    if (ask?.kind !== 'transfer') return
+    asks.value.shift()
+    try {
+      await requestApi.replyCancelled(ask.request)
+    } catch (err) {
+      error.value = describeIpcError(normalizeIpcError(err))
+    }
+  }
+
   return {
     known,
     loading,
@@ -147,10 +181,13 @@ export const useHostkeysStore = defineStore('hostkeys', () => {
     onHostKeyPending,
     onPassphraseRequest,
     onHostKeyConflict,
+    onTransferConflict,
     confirmKey,
     rejectKey,
     answerPassphrase,
     skipPassphrase,
     dismissConflict,
+    answerTransferConflict,
+    cancelTransferConflict,
   }
 })

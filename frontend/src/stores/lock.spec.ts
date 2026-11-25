@@ -6,7 +6,7 @@ import { useLockStore } from './lock'
 
 vi.mock('../lib/ipc/client', () => ({
   lockApi: {
-    status: vi.fn(async () => ({ locked: false, has_pin: false })),
+    status: vi.fn(async () => ({ locked: false, has_pin: false, key_store: 'file' as const })),
     lock: vi.fn(async () => undefined),
     unlock: vi.fn(async () => undefined),
     setPin: vi.fn(async () => undefined),
@@ -17,7 +17,7 @@ vi.mock('../lib/ipc/client', () => ({
 const api = vi.mocked(lockApi)
 
 function status(locked: boolean, hasPin: boolean): void {
-  api.status.mockResolvedValue({ locked, has_pin: hasPin })
+  api.status.mockResolvedValue({ locked, has_pin: hasPin, key_store: 'file' })
 }
 
 beforeEach(() => {

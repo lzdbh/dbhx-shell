@@ -17,8 +17,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use dbhx_model::{
-    AuthMode, Endpoint, ErrorCode, HostId, HostInfo, HostRecord, IpcError, IdentityId, KnownHost, OsType, Protocol,
-    TerminalEncoding, now_ms,
+    now_ms, AuthMode, ConflictPolicy, Endpoint, ErrorCode, HostId, HostInfo, HostRecord,
+    IdentityId, IpcError, KeyStoreKind, KnownHost, OsType, Protocol, TerminalEncoding, TunnelSpec,
 };
 use dbhx_vault::SecretKind;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,12 @@ pub struct HostDraft {
     pub tags: Vec<String>,
     pub favorite: bool,
     pub protocol: Protocol,
+    /// 跳板链，从离本机最近的一跳开始。
+    #[serde(default)]
+    pub jump: Vec<HostId>,
+    /// 端口转发配置。
+    #[serde(default)]
+    pub tunnels: Vec<TunnelSpec>,
     /// 列表图标用。表单从既有记录预填，所以「编辑不改」不会把它冲掉。
     pub os: OsType,
     pub endpoint: Endpoint,
@@ -64,7 +70,13 @@ pub struct IdentityInfo {
 pub enum UserReply {
     Confirmed,
     Cancelled,
-    Secret { text: String },
+    Secret {
+        text: String,
+    },
+    /// 传输冲突的处理方式，对整批生效
+    Conflict {
+        policy: ConflictPolicy,
+    },
 }
 
 /// 应用锁状态。锁屏覆盖层与设置抽屉都只按这两个布尔分支，拿不到 PIN 本身。
@@ -74,12 +86,18 @@ pub struct LockStatus {
     pub locked: bool,
     /// 是否设置过解锁 PIN。没设过就不可能进入锁定态，覆盖层据此决定显不显示。
     pub has_pin: bool,
+    /// 主密钥实际存在系统钥匙串还是本地文件（钥匙串不可用时的兜底）
+    pub key_store: KeyStoreKind,
 }
 
 /// 草案 + 既有记录 ⇒ 落盘记录。**已有口令引用必须原样保留**，
 /// 否则「改个分组名」就会把凭据清空。
 pub fn merge_record(draft: HostDraft, existing: Option<&HostRecord>, now: u64) -> HostRecord {
-    let id = draft.id.clone().or_else(|| existing.map(|e| e.id.clone())).unwrap_or_else(|| HostId(String::new()));
+    let id = draft
+        .id
+        .clone()
+        .or_else(|| existing.map(|e| e.id.clone()))
+        .unwrap_or_else(|| HostId(String::new()));
     HostRecord {
         id,
         label: draft.label,
@@ -87,6 +105,8 @@ pub fn merge_record(draft: HostDraft, existing: Option<&HostRecord>, now: u64) -
         tags: draft.tags,
         favorite: draft.favorite,
         protocol: draft.protocol,
+        jump: draft.jump,
+        tunnels: draft.tunnels,
         os: draft.os,
         endpoint: draft.endpoint,
         auth_mode: draft.auth_mode,
@@ -115,31 +135,51 @@ pub fn upsert_host_impl(core: &Core, draft: HostDraft) -> Result<HostId, IpcErro
         reject_empty(&draft.endpoint.username, "登录用户名不能为空")?;
     }
     let now = now_ms();
-    let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
-    let existing = draft.id.as_ref().and_then(|id| vault.host(id)).cloned();
-    if existing.is_none() && draft.id.is_some() {
-        return Err(IpcError::new(ErrorCode::NotFound, "要修改的主机记录已不存在", false));
-    }
-    let record = merge_record(draft, existing.as_ref(), now);
-    let id = vault.upsert_host(record);
-    vault.flush()?;
-    emit_changed(core, &vault);
+    let id = {
+        let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+        let existing = draft.id.as_ref().and_then(|id| vault.host(id)).cloned();
+        if existing.is_none() && draft.id.is_some() {
+            return Err(IpcError::new(
+                ErrorCode::NotFound,
+                "要修改的主机记录已不存在",
+                false,
+            ));
+        }
+        let record = merge_record(draft, existing.as_ref(), now);
+        let id = vault.upsert_host(record);
+        vault.flush()?;
+        emit_changed(core, &vault);
+        id
+    };
+    // 转发配置可能改了：停掉旧的，下次连接按新配置重启
+    core.stop_tunnels_for_host(&id);
     Ok(id)
 }
 
 pub fn remove_host_impl(core: &Core, id: HostId) -> Result<(), IpcError> {
-    let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
-    vault.remove_host(&id)?;
-    vault.flush()?;
-    emit_changed(core, &vault);
+    {
+        let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+        vault.remove_host(&id)?;
+        vault.flush()?;
+        emit_changed(core, &vault);
+    }
+    core.stop_tunnels_for_host(&id);
     Ok(())
 }
 
 /// 存主机口令。明文只活在这一行：进 `Zeroizing` 后立刻交给 vault 加密。
-pub fn set_password_impl(core: &Core, id: HostId, password: Zeroizing<String>) -> Result<(), IpcError> {
+pub fn set_password_impl(
+    core: &Core,
+    id: HostId,
+    password: Zeroizing<String>,
+) -> Result<(), IpcError> {
     core.require_unlocked()?;
     if password.is_empty() {
-        return Err(IpcError::new(ErrorCode::InvalidInput, "口令不能为空", false));
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            "口令不能为空",
+            false,
+        ));
     }
     let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
     vault.set_host_password(&id, password.as_bytes())?;
@@ -159,18 +199,26 @@ pub fn reveal_password_impl(core: &Core, id: HostId) -> Result<String, IpcError>
     let secret = vault
         .password_of(&id)?
         .ok_or_else(|| IpcError::new(ErrorCode::NotFound, "该主机没有已保存的口令", false))?;
-    Ok(vault.with_secret(&secret, |bytes| Ok(String::from_utf8_lossy(bytes).into_owned()))?)
+    Ok(vault.with_secret(&secret, |bytes| {
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    })?)
 }
 pub fn identities_impl(core: &Core) -> Result<Vec<IdentityInfo>, IpcError> {
     let vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
-    Ok(vault.identities().iter().map(|i| identity_info(&vault, i)).collect())
+    Ok(vault
+        .identities()
+        .iter()
+        .map(|i| identity_info(&vault, i))
+        .collect())
 }
 
 /// 投影一条身份：只问 vault「有没有口令、是不是 ppk」，不把密文引用带出去。
 fn identity_info(vault: &dbhx_vault::Vault, identity: &dbhx_model::IdentityRecord) -> IdentityInfo {
     let is_ppk = vault
         .with_secret(&identity.private_key_secret_id, |bytes| {
-            Ok(String::from_utf8_lossy(bytes).trim_start().starts_with("PuTTY-User-Key-File-"))
+            Ok(String::from_utf8_lossy(bytes)
+                .trim_start()
+                .starts_with("PuTTY-User-Key-File-"))
         })
         .unwrap_or(false);
     let has_passphrase = identity
@@ -178,7 +226,12 @@ fn identity_info(vault: &dbhx_vault::Vault, identity: &dbhx_model::IdentityRecor
         .as_ref()
         .map(|id| vault.secret_kind(id) == Some(SecretKind::Passphrase))
         .unwrap_or(false);
-    IdentityInfo { id: identity.id.clone(), label: identity.label.clone(), has_passphrase, is_ppk }
+    IdentityInfo {
+        id: identity.id.clone(),
+        label: identity.label.clone(),
+        has_passphrase,
+        is_ppk,
+    }
 }
 
 pub fn add_identity_impl(
@@ -197,7 +250,11 @@ pub fn add_identity_impl(
         ));
     }
     let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
-    let id = vault.add_identity(&label, private_key.as_bytes(), passphrase.as_ref().map(|p| p.as_bytes()))?;
+    let id = vault.add_identity(
+        &label,
+        private_key.as_bytes(),
+        passphrase.as_ref().map(|p| p.as_bytes()),
+    )?;
     vault.flush()?;
     emit_changed(core, &vault);
     Ok(id)
@@ -216,7 +273,12 @@ pub fn known_hosts_impl(core: &Core) -> Result<Vec<KnownHost>, IpcError> {
     Ok(known.entries().to_vec())
 }
 
-pub fn forget_host_key_impl(core: &Core, host: String, port: u16, algorithm: String) -> Result<u32, IpcError> {
+pub fn forget_host_key_impl(
+    core: &Core,
+    host: String,
+    port: u16,
+    algorithm: String,
+) -> Result<u32, IpcError> {
     let mut known = core.known.lock().unwrap_or_else(|p| p.into_inner());
     let removed = known.forget(&host, port, &algorithm) as u32;
     known.save()?;
@@ -236,7 +298,9 @@ fn default_user_known_hosts() -> Result<std::path::PathBuf, IpcError> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| IpcError::new(ErrorCode::Io, "找不到用户目录，无法导入 known_hosts", false))?;
+        .ok_or_else(|| {
+            IpcError::new(ErrorCode::Io, "找不到用户目录，无法导入 known_hosts", false)
+        })?;
     Ok(home.join(".ssh").join("known_hosts"))
 }
 
@@ -245,24 +309,130 @@ pub fn reply_impl(core: &Core, request: u32, reply: UserReply) -> Result<(), Ipc
         UserReply::Confirmed => crate::state::UserAnswer::Confirmed,
         UserReply::Cancelled => crate::state::UserAnswer::Cancelled,
         UserReply::Secret { text } => crate::state::UserAnswer::Secret(Zeroizing::new(text)),
+        UserReply::Conflict { policy } => crate::state::UserAnswer::Conflict(policy),
     };
     core.awaits.reply(request, answer)
 }
 
-/// 应用锁：UI/授权门，**不是加密边界**。主密钥仍在进程里，锁的意义是「锁屏期间
-/// 不给渲染层任何读凭据或发起新连接的机会」，而非抵御能读到磁盘文件的攻击者。
-/// PIN 作为密封条目存在 vault 里，任何命令都不会把它投影出去——连计数之外的一切都不给。
+/// 离线备份导入的结果。冲突副本与缺凭据都要逐条念给用户。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct OfflineImportReport {
+    pub hosts: u32,
+    pub identities: u32,
+    /// 同 id 冲突后另存的副本名
+    pub conflicts: Vec<String>,
+    /// 备份引用了、但本机和备份里都没有的口令
+    pub missing_credentials: Vec<String>,
+    /// 备份引用了、但本机和备份里都没有的身份
+    pub missing_identities: Vec<String>,
+}
+
+/// 离线备份：整个库（含私钥）用口令加密写到一个绝对路径的文件。
+pub fn export_offline_impl(core: &Core, path: String, passphrase: String) -> Result<(), IpcError> {
+    core.require_unlocked()?;
+    let pass = Zeroizing::new(passphrase);
+    validate_backup(&path, pass.as_str())?;
+    let blob = {
+        let vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+        vault
+            .export_offline(pass.as_str())
+            .map_err(IpcError::from)?
+    };
+    std::fs::write(&path, &blob)
+        .map_err(|e| IpcError::new(ErrorCode::Io, format!("写备份文件失败：{e}"), false))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+    }
+    Ok(())
+}
+
+/// 离线备份导入。采用「导入版本优先」：同 id 覆盖本地，被覆盖的内容另存副本。
+pub fn import_offline_impl(
+    core: &Core,
+    path: String,
+    passphrase: String,
+) -> Result<OfflineImportReport, IpcError> {
+    core.require_unlocked()?;
+    let pass = Zeroizing::new(passphrase);
+    validate_backup(&path, pass.as_str())?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| IpcError::new(ErrorCode::Io, format!("读备份文件失败：{e}"), false))?;
+    let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+    let plan = vault
+        .import_offline(pass.as_str(), &bytes)
+        .map_err(|e| match e {
+            dbhx_vault::VaultError::Crypto => IpcError::new(
+                ErrorCode::PermissionDenied,
+                "口令不对，或备份文件已损坏",
+                false,
+            ),
+            other => IpcError::from(other),
+        })?;
+    emit_changed(core, &vault);
+    Ok(OfflineImportReport {
+        hosts: plan.hosts_upsert.len() as u32,
+        identities: plan.identities_upsert.len() as u32,
+        conflicts: plan.conflicts,
+        missing_credentials: plan.missing_credentials,
+        missing_identities: plan.missing_identities,
+    })
+}
+
+fn validate_backup(path: &str, passphrase: &str) -> Result<(), IpcError> {
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            "备份文件路径必须是绝对路径",
+            false,
+        ));
+    }
+    if passphrase.chars().count() < 16 {
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            "备份口令至少 16 位",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+// 应用锁：UI/授权门，**不是加密边界**。主密钥仍在进程里，锁的意义是「锁屏期间
+// 不给渲染层任何读凭据或发起新连接的机会」，而非抵御能读到磁盘文件的攻击者。
+// PIN 作为密封条目存在 vault 里，任何命令都不会把它投影出去——连计数之外的一切都不给。
 
 /// 锁状态。覆盖层与设置抽屉只按 `locked`/`has_pin` 分支，拿不到 PIN。
 pub fn lock_status_impl(core: &Core) -> LockStatus {
-    let has_pin = core.vault.lock().unwrap_or_else(|p| p.into_inner()).has_lock_pin();
-    LockStatus { locked: core.locked.load(Ordering::Relaxed), has_pin }
+    let has_pin = core
+        .vault
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .has_lock_pin();
+    LockStatus {
+        locked: core.locked.load(Ordering::Relaxed),
+        has_pin,
+        key_store: core.key_store,
+    }
 }
 
 /// 进入锁定态。没设过 PIN 时拒绝——否则会把用户永久关在门外。
 pub fn lock_impl(core: &Core) -> Result<(), IpcError> {
-    if !core.vault.lock().unwrap_or_else(|p| p.into_inner()).has_lock_pin() {
-        return Err(IpcError::new(ErrorCode::InvalidInput, "请先设置解锁 PIN 再启用应用锁", false));
+    if !core
+        .vault
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .has_lock_pin()
+    {
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            "请先设置解锁 PIN 再启用应用锁",
+            false,
+        ));
     }
     core.locked.store(true, Ordering::Relaxed);
     Ok(())
@@ -276,7 +446,11 @@ pub fn unlock_impl(core: &Core, pin: Zeroizing<String>) -> Result<(), IpcError> 
         .check_lock_pin(pin.as_bytes())
         .map_err(|_| IpcError::new(ErrorCode::Internal, "解锁校验失败，请稍后再试", true))?;
     if !ok {
-        return Err(IpcError::new(ErrorCode::PermissionDenied, "PIN 不正确", false));
+        return Err(IpcError::new(
+            ErrorCode::PermissionDenied,
+            "PIN 不正确",
+            false,
+        ));
     }
     core.locked.store(false, Ordering::Relaxed);
     Ok(())
@@ -287,7 +461,11 @@ pub fn set_lock_pin_impl(core: &Core, pin: Zeroizing<String>) -> Result<(), IpcE
     core.require_unlocked()?;
     let bytes = pin.as_bytes();
     if bytes.len() < MIN_PIN_LEN {
-        return Err(IpcError::new(ErrorCode::InvalidInput, format!("PIN 至少 {MIN_PIN_LEN} 位"), false));
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            format!("PIN 至少 {MIN_PIN_LEN} 位"),
+            false,
+        ));
     }
     let mut vault = core.vault.lock().unwrap_or_else(|p| p.into_inner());
     vault.set_lock_pin(bytes)?;
@@ -352,7 +530,11 @@ pub fn vault_remove_host(core: State<'_>, host_id: HostId) -> Result<(), IpcErro
 
 #[tauri::command]
 #[specta::specta]
-pub fn vault_set_password(core: State<'_>, host_id: HostId, password: String) -> Result<(), IpcError> {
+pub fn vault_set_password(
+    core: State<'_>,
+    host_id: HostId,
+    password: String,
+) -> Result<(), IpcError> {
     set_password_impl(&core, host_id, Zeroizing::new(password))
 }
 
@@ -400,7 +582,12 @@ pub fn hostkeys_list(core: State<'_>) -> Result<Vec<KnownHost>, IpcError> {
 
 #[tauri::command]
 #[specta::specta]
-pub fn hostkeys_forget(core: State<'_>, host: String, port: u16, algorithm: String) -> Result<u32, IpcError> {
+pub fn hostkeys_forget(
+    core: State<'_>,
+    host: String,
+    port: u16,
+    algorithm: String,
+) -> Result<u32, IpcError> {
     forget_host_key_impl(&core, host, port, algorithm)
 }
 
@@ -421,6 +608,26 @@ pub fn request_reply(core: State<'_>, request: u32, reply: UserReply) -> Result<
 #[specta::specta]
 pub fn vault_lock_status(core: State<'_>) -> LockStatus {
     lock_status_impl(&core)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn vault_export_offline(
+    core: State<'_>,
+    path: String,
+    passphrase: String,
+) -> Result<(), IpcError> {
+    export_offline_impl(&core, path, passphrase)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn vault_import_offline(
+    core: State<'_>,
+    path: String,
+    passphrase: String,
+) -> Result<OfflineImportReport, IpcError> {
+    import_offline_impl(&core, path, passphrase)
 }
 
 #[tauri::command]
@@ -463,11 +670,17 @@ mod tests {
             favorite: true,
             protocol: Protocol::Ssh,
             os: OsType::Linux,
-            endpoint: Endpoint { host: "10.0.0.1".into(), port: Some(2222), username: "app".into() },
+            endpoint: Endpoint {
+                host: "10.0.0.1".into(),
+                port: Some(2222),
+                username: "app".into(),
+            },
             auth_mode: AuthMode::Password,
             identity_id: None,
             keepalive_secs: 30,
             encoding: TerminalEncoding::Utf8,
+            jump: vec![],
+            tunnels: vec![],
         }
     }
 
@@ -482,7 +695,11 @@ mod tests {
             favorite: false,
             protocol: Protocol::Ssh,
             os: OsType::Unknown,
-            endpoint: Endpoint { host: "h".into(), port: None, username: "u".into() },
+            endpoint: Endpoint {
+                host: "h".into(),
+                port: None,
+                username: "u".into(),
+            },
             auth_mode: AuthMode::Password,
             identity_id: None,
             password_secret_id: Some(dbhx_model::SecretId("secret-keep".into())),
@@ -490,10 +707,22 @@ mod tests {
             encoding: TerminalEncoding::Utf8,
             created_at_ms: 7,
             updated_at_ms: 8,
+            jump: vec![],
+            tunnels: vec![],
         };
-        let merged = merge_record(HostDraft { id: Some(HostId("h1".into())), ..draft("新名") }, Some(&existing), 99);
+        let merged = merge_record(
+            HostDraft {
+                id: Some(HostId("h1".into())),
+                ..draft("新名")
+            },
+            Some(&existing),
+            99,
+        );
         assert_eq!(merged.label, "新名");
-        assert_eq!(merged.password_secret_id.as_ref().map(|s| s.0.as_str()), Some("secret-keep"));
+        assert_eq!(
+            merged.password_secret_id.as_ref().map(|s| s.0.as_str()),
+            Some("secret-keep")
+        );
         assert_eq!(merged.created_at_ms, 7, "创建时间不能被更新覆盖");
         assert_eq!(merged.updated_at_ms, 99);
     }
@@ -511,7 +740,11 @@ mod tests {
         let (core, _rx) = tests_harness("telnet-host", crate::state::fake_dialer());
         let telnet = HostDraft {
             protocol: Protocol::Telnet,
-            endpoint: Endpoint { host: "10.0.0.5".into(), port: None, username: String::new() },
+            endpoint: Endpoint {
+                host: "10.0.0.5".into(),
+                port: None,
+                username: String::new(),
+            },
             ..draft("老设备")
         };
         let id = upsert_host_impl(&core, telnet).expect("telnet 主机不该因为没填用户名而被拒");
@@ -525,7 +758,14 @@ mod tests {
     fn an_ssh_host_still_demands_a_username() {
         // 反过来也得钉住：放宽只针对 telnet，SSH 少了用户名照样报错
         let (core, _rx) = tests_harness("ssh-needs-user", crate::state::fake_dialer());
-        let broken = HostDraft { endpoint: Endpoint { host: "h".into(), port: None, username: String::new() }, ..draft("x") };
+        let broken = HostDraft {
+            endpoint: Endpoint {
+                host: "h".into(),
+                port: None,
+                username: String::new(),
+            },
+            ..draft("x")
+        };
         let err = upsert_host_impl(&core, broken).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
@@ -552,7 +792,10 @@ mod tests {
         let (core, _rx) = tests_harness("vault-empty", crate::state::fake_dialer());
         let err = upsert_host_impl(&core, draft("   ")).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
-        assert!(hosts_impl(&core).unwrap().is_empty(), "校验失败不能留下半条记录");
+        assert!(
+            hosts_impl(&core).unwrap().is_empty(),
+            "校验失败不能留下半条记录"
+        );
     }
 
     #[tokio::test]
@@ -570,11 +813,15 @@ mod tests {
             core.dir().to_path_buf()
         };
         // 重新打开同一个目录：证明 flush 真的落盘了，而不是只在内存里改了改
-        let vault = dbhx_vault::Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
+        let vault =
+            dbhx_vault::Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key")))
+                .unwrap();
         assert_eq!(vault.secret_count(), 1);
         let host = vault.hosts()[0].clone();
         let secret = host.password_secret_id.clone().expect("口令引用要在");
-        let plain = vault.with_secret(&secret, |b| Ok(String::from_utf8_lossy(b).into_owned())).unwrap();
+        let plain = vault
+            .with_secret(&secret, |b| Ok(String::from_utf8_lossy(b).into_owned()))
+            .unwrap();
         assert_eq!(plain, "hunter2");
     }
 
@@ -584,7 +831,11 @@ mod tests {
         let id = upsert_host_impl(&core, draft("db3")).unwrap();
         set_password_impl(&core, id.clone(), Zeroizing::new("first".into())).unwrap();
         set_password_impl(&core, id.clone(), Zeroizing::new("second".into())).unwrap();
-        assert_eq!(core.vault.lock().unwrap().secret_count(), 1, "旧密文没人引用就该回收");
+        assert_eq!(
+            core.vault.lock().unwrap().secret_count(),
+            1,
+            "旧密文没人引用就该回收"
+        );
     }
 
     #[tokio::test]
@@ -619,7 +870,13 @@ mod tests {
     #[tokio::test]
     async fn a_key_that_is_not_a_private_key_is_rejected() {
         let (core, _rx) = tests_harness("vault-key", crate::state::fake_dialer());
-        let err = add_identity_impl(&core, "跳板".into(), Zeroizing::new("ssh-ed25519 AAAA...".into()), None).unwrap_err();
+        let err = add_identity_impl(
+            &core,
+            "跳板".into(),
+            Zeroizing::new("ssh-ed25519 AAAA...".into()),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("私钥"), "{}", err.message);
         assert_eq!(core.vault.lock().unwrap().secret_count(), 0);
@@ -643,19 +900,36 @@ mod tests {
     async fn an_encrypted_key_projects_has_passphrase_false_until_the_user_stores_it() {
         // vault 里没存口令时，加密私钥要走「连的时候问人」那条路，见 state::build_plan
         let (core, _rx) = tests_harness("vault-enc", crate::state::fake_dialer());
-        let id = add_identity_impl(&core, "加密键".into(), Zeroizing::new(crate::test_keys::ENC_ED25519.to_string()), None)
-            .unwrap();
+        let id = add_identity_impl(
+            &core,
+            "加密键".into(),
+            Zeroizing::new(crate::test_keys::ENC_ED25519.to_string()),
+            None,
+        )
+        .unwrap();
         let listed = identities_impl(&core).unwrap();
         assert_eq!(listed[0].id, id);
         assert!(!listed[0].has_passphrase, "没存口令就是没有口令");
-        assert!(dbhx_ssh::key_is_encrypted(crate::test_keys::ENC_ED25519), "前提：这把测试密钥确实是加密的");
-        assert!(!dbhx_ssh::key_is_encrypted(crate::test_keys::PLAIN_ED25519), "前提：另一把是明文密钥");
+        assert!(
+            dbhx_ssh::key_is_encrypted(crate::test_keys::ENC_ED25519),
+            "前提：这把测试密钥确实是加密的"
+        );
+        assert!(
+            !dbhx_ssh::key_is_encrypted(crate::test_keys::PLAIN_ED25519),
+            "前提：另一把是明文密钥"
+        );
     }
 
     #[tokio::test]
     async fn a_putty_key_is_recognized_by_its_header_not_its_extension() {
         let (core, _rx) = tests_harness("vault-ppk", crate::state::fake_dialer());
-        add_identity_impl(&core, "ppk".into(), Zeroizing::new(crate::test_keys::PPK_HEADER.into()), None).unwrap();
+        add_identity_impl(
+            &core,
+            "ppk".into(),
+            Zeroizing::new(crate::test_keys::PPK_HEADER.into()),
+            None,
+        )
+        .unwrap();
         assert!(identities_impl(&core).unwrap()[0].is_ppk);
     }
 
@@ -664,14 +938,28 @@ mod tests {
         let (core, _rx) = tests_harness("vault-reply", crate::state::fake_dialer());
         let (request, _rx_answer) = core.awaits.register();
         reply_impl(&core, request, UserReply::Confirmed).unwrap();
-        let err = reply_impl(&core, request, UserReply::Secret { text: "again".into() }).unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotFound, "第二次回答必须失败，否则口令会送进已经放弃的拨号");
+        let err = reply_impl(
+            &core,
+            request,
+            UserReply::Secret {
+                text: "again".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::NotFound,
+            "第二次回答必须失败，否则口令会送进已经放弃的拨号"
+        );
     }
 
     #[tokio::test]
     async fn forgetting_an_unknown_host_key_reports_zero_not_an_error() {
         let (core, _rx) = tests_harness("vault-forget", crate::state::fake_dialer());
-        assert_eq!(forget_host_key_impl(&core, "nope".into(), 22, "ssh-ed25519".into()).unwrap(), 0);
+        assert_eq!(
+            forget_host_key_impl(&core, "nope".into(), 22, "ssh-ed25519".into()).unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -691,9 +979,13 @@ mod tests {
         lock_impl(&core).unwrap();
         assert!(lock_status_impl(&core).locked);
 
-        let err = crate::commands::session::open_remote_impl(&core, id.clone(), dbhx_model::PtySize::default())
-            .await
-            .unwrap_err();
+        let err = crate::commands::session::open_remote_impl(
+            &core,
+            id.clone(),
+            dbhx_model::PtySize::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::Locked, "锁定期间不得新拨号");
 
         let err = set_password_impl(&core, id.clone(), Zeroizing::new("x".into())).unwrap_err();
@@ -731,9 +1023,18 @@ mod tests {
         let (core, _rx) = tests_harness("lock-rotate", crate::state::fake_dialer());
         set_lock_pin_impl(&core, Zeroizing::new("aaaa".into())).unwrap();
         set_lock_pin_impl(&core, Zeroizing::new("bbbb".into())).unwrap();
-        assert_eq!(core.vault.lock().unwrap().secret_count(), 1, "换 PIN 不该留下两把密文");
+        assert_eq!(
+            core.vault.lock().unwrap().secret_count(),
+            1,
+            "换 PIN 不该留下两把密文"
+        );
         lock_impl(&core).unwrap();
-        assert_eq!(unlock_impl(&core, Zeroizing::new("aaaa".into())).unwrap_err().code, ErrorCode::PermissionDenied);
+        assert_eq!(
+            unlock_impl(&core, Zeroizing::new("aaaa".into()))
+                .unwrap_err()
+                .code,
+            ErrorCode::PermissionDenied
+        );
         unlock_impl(&core, Zeroizing::new("bbbb".into())).unwrap();
     }
 
@@ -748,7 +1049,11 @@ mod tests {
         let status = lock_status_impl(&core);
         assert!(!status.has_pin);
         assert!(!status.locked, "没有 PIN 就不该停在锁定态");
-        assert_eq!(core.vault.lock().unwrap().secret_count(), 0, "回收 PIN 条目后不该留密文");
+        assert_eq!(
+            core.vault.lock().unwrap().secret_count(),
+            0,
+            "回收 PIN 条目后不该留密文"
+        );
     }
 
     #[tokio::test]
@@ -811,26 +1116,65 @@ mod tests {
         outward.push_str(&serde_json::to_string(&identities_impl(&core).unwrap()).unwrap());
         outward.push_str(&serde_json::to_string(&known_hosts_impl(&core).unwrap()).unwrap());
         outward.push_str(&serde_json::to_string(&lock_status_impl(&core)).unwrap());
-        outward.push_str(&serde_json::to_string(&crate::commands::session::list_impl(&core)).unwrap());
-        outward.push_str(&serde_json::to_string(&crate::commands::transfer::running_impl(&core)).unwrap());
-        outward.push_str(&serde_json::to_string(&crate::commands::sync::status_impl(&core)).unwrap());
+        outward
+            .push_str(&serde_json::to_string(&crate::commands::session::list_impl(&core)).unwrap());
+        outward.push_str(
+            &serde_json::to_string(&crate::commands::transfer::running_impl(&core)).unwrap(),
+        );
+        outward
+            .push_str(&serde_json::to_string(&crate::commands::sync::status_impl(&core)).unwrap());
 
         // 明文秘密：一个都不许出现在 IPC 载荷里
-        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY", "BEGIN OPENSSH", SYNC_STR, TOKEN] {
+        for leak in [
+            "hunter2",
+            "key-pass",
+            "9-8-7-6",
+            "PRIVATE KEY",
+            "BEGIN OPENSSH",
+            SYNC_STR,
+            TOKEN,
+        ] {
             assert!(!outward.contains(leak), "IPC 载荷泄露了明文 {leak}");
         }
         // 内部引用字段名：渲染层拿到就能指名换出别的记录的口令
-        for field in ["cipher", "secret_id", "password_secret_id", "private_key_secret_id", "lock_pin", "secrets"] {
+        for field in [
+            "cipher",
+            "secret_id",
+            "password_secret_id",
+            "private_key_secret_id",
+            "lock_pin",
+            "secrets",
+        ] {
             assert!(!outward.contains(field), "IPC 载荷泄露了内部字段 {field}");
         }
 
         // 落盘的是密文：vault.json 里绝不该有裸明文
         let on_disk = std::fs::read_to_string(core.dir().join("vault.json")).unwrap();
-        for leak in ["hunter2", "key-pass", "9-8-7-6", "PRIVATE KEY", SYNC_STR, TOKEN] {
+        for leak in [
+            "hunter2",
+            "key-pass",
+            "9-8-7-6",
+            "PRIVATE KEY",
+            SYNC_STR,
+            TOKEN,
+        ] {
             assert!(!on_disk.contains(leak), "vault.json 明文落盘了 {leak}");
         }
 
         // 但主密钥文件确实在（否则上面根本加不了密），且不参与任何 IPC
         assert!(core.dir().join("master.key").exists());
+    }
+
+    #[test]
+    fn offline_backup_validates_path_and_passphrase_before_touching_disk() {
+        let (core, _rx) = crate::state::tests_harness("offline", crate::state::fake_dialer());
+        let err = export_offline_impl(&core, "relative.dbhx".into(), "x".repeat(16)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+
+        let abs = std::env::temp_dir().join("dbhx-offline-should-not-exist.dbhx");
+        let err =
+            export_offline_impl(&core, abs.display().to_string(), "short".into()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(!abs.exists(), "校验失败时不该先写文件");
     }
 }

@@ -24,7 +24,10 @@ pub async fn run_hub(core: Arc<Core>, mut rx: mpsc::Receiver<SessionEvent>) {
             SessionEvent::Data { id, bytes } => {
                 // 用 send 而不是 try_send：终端输出不能丢。队列满的时候这里 await，
                 // 背压顺着 SSH 通道一路传到对端，那是用户能看见的「卡了一下」。
-                let data = TermData { session: id, data: bytes.as_ref().to_vec().into() };
+                let data = TermData {
+                    session: id,
+                    data: bytes.as_ref().to_vec().into(),
+                };
                 if core.bus.send(BusEvent::TermData(data)).await.is_err() {
                     tracing::warn!("事件总线已关闭，会话输出无处可去");
                     return;
@@ -43,7 +46,10 @@ pub async fn run_hub(core: Arc<Core>, mut rx: mpsc::Receiver<SessionEvent>) {
                 }
             }
             SessionEvent::Cwd { id, path } => {
-                core.emit(BusEvent::SessionCwd(SessionCwd { session: id, path: path.clone() }));
+                core.emit(BusEvent::SessionCwd(SessionCwd {
+                    session: id,
+                    path: path.clone(),
+                }));
                 follow_cwd(&core, id, &path).await;
             }
             SessionEvent::Ended { id, info } => {
@@ -76,7 +82,9 @@ pub fn spawn(core: Arc<Core>) -> bool {
 /// 一条 transport 上可能同时开着普通面板和提权面板，两个号都要问一遍：各自的门控
 /// 自己决定跳不跳（提权面板默认是被用户锁住的），所以这里只做扇出，不做判断。
 async fn follow_cwd(core: &Core, session: SessionId, path: &str) {
-    let Some(key) = core.sessions.transport_key(session) else { return };
+    let Some(key) = core.sessions.transport_key(session) else {
+        return;
+    };
     // 先保证普通面板的号在表里（号先于面板存在），再取这条 transport 上的全部号
     core.conn_id_of(&key);
     for connection in core.conn_ids_for_key(&key) {
@@ -105,7 +113,10 @@ async fn follow_cwd(core: &Core, session: SessionId, path: &str) {
 /// 全列出来而不是写 `Some(_) => emit`：新增的内部记账变体默认应当**不**发，
 /// 让面板反复闪的代价比少提示一次大。
 fn worth_telling(hold: FollowHold) -> bool {
-    matches!(hold, FollowHold::UserLocked | FollowHold::Busy | FollowHold::Editing | FollowHold::Unreachable)
+    matches!(
+        hold,
+        FollowHold::UserLocked | FollowHold::Busy | FollowHold::Editing | FollowHold::Unreachable
+    )
 }
 
 #[cfg(test)]

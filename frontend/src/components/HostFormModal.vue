@@ -2,7 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 
-import type { AuthMode, HostDraft, HostId, HostInfo, Protocol, TerminalEncoding } from '@/lib/ipc/bindings'
+import type { AuthMode, HostDraft, HostId, HostInfo, Protocol, TerminalEncoding, TunnelSpec } from '@/lib/ipc/bindings'
 import { vaultApi } from '@/lib/ipc/client'
 import { UNGROUPED, useHostsStore } from '@/stores/hosts'
 
@@ -24,6 +24,8 @@ const form = reactive({
   group: '',
   favorite: false,
   protocol: 'ssh' as Protocol,
+  jump: [] as HostId[],
+  tunnels: [] as TunnelSpec[],
   host: '',
   port: 22,
   username: '',
@@ -38,6 +40,16 @@ const form = reactive({
 
 /** 各协议的默认端口；存回记录时等于默认值就归一成 null，让后端 `default_port` 兜底。 */
 const PROTOCOL_DEFAULT_PORT: Record<Protocol, number | null> = { ssh: 22, telnet: 23, local: null }
+
+function addTunnel(): void {
+  form.tunnels.push({
+    kind: 'local',
+    bind_host: '127.0.0.1',
+    bind_port: 8080,
+    target_host: '',
+    target_port: 80,
+  })
+}
 
 const submitting = ref(false)
 const revealing = ref(false)
@@ -56,6 +68,13 @@ const groupOptions = computed(() => {
 // tags 模式只吃数组：喂给它空串会被 normalize 成 `['']`，界面上就长出一个没有字的 × 标签。
 // 表单这里仍然只有一个组名，所以取最后一个，多余的不留。
 const groupTags = computed(() => (form.group ? [form.group] : []))
+
+/** 可选的跳板机：只有 SSH 主机能当跳板，编辑时不能选自己。 */
+const jumpOptions = computed(() =>
+  hosts.hosts
+    .filter(h => h.protocol === 'ssh' && h.id !== props.host?.id)
+    .map(h => ({ value: h.id, label: h.label })),
+)
 
 function onGroupChange(next: unknown): void {
   const last = Array.isArray(next) ? next[next.length - 1] : next
@@ -82,6 +101,8 @@ watch(() => [props.open, props.host, props.seed] as const, ([open]) => {
   form.group = host?.group ?? props.presetGroup ?? ''
   form.favorite = host?.favorite ?? false
   form.protocol = host?.protocol ?? 'ssh'
+  form.jump = [...(host?.jump ?? [])]
+  form.tunnels = (host?.tunnels ?? []).map(t => ({ ...t }))
   form.host = host?.endpoint.host ?? ''
   form.port = host?.endpoint.port ?? PROTOCOL_DEFAULT_PORT[host?.protocol ?? 'ssh'] ?? 22
   form.username = host?.endpoint.username ?? ''
@@ -108,6 +129,14 @@ function valid(): string | null {
   if (form.protocol === 'ssh' && !form.username.trim()) return '请填写用户名'
   if (isRemote.value && (form.port < 1 || form.port > 65535)) return '端口要在 1-65535 之间'
   if (needsIdentity.value && !form.identityId) return '私钥认证要选一把密钥'
+  for (const [i, t] of form.tunnels.entries()) {
+    if (!t.bind_host.trim()) return `第 ${i + 1} 条转发缺少监听地址`
+    if (t.bind_port < 1 || t.bind_port > 65535) return `第 ${i + 1} 条转发的监听端口要在 1-65535 之间`
+    if (t.kind !== 'dynamic') {
+      if (!t.target_host.trim()) return `第 ${i + 1} 条转发缺少目标地址`
+      if (t.target_port < 1 || t.target_port > 65535) return `第 ${i + 1} 条转发的目标端口要在 1-65535 之间`
+    }
+  }
   return null
 }
 
@@ -125,6 +154,8 @@ async function submit(): Promise<void> {
     tags: source.value?.tags ?? [],
     favorite: form.favorite,
     protocol: form.protocol,
+    jump: form.jump,
+    tunnels: form.tunnels.map(t => ({ ...t })),
     // 系统字段已不在表单里编辑：编辑/克隆沿用原记录，新建归为未知
     os: source.value?.os ?? 'unknown',
     endpoint: {
@@ -216,6 +247,42 @@ async function revealStored(): Promise<void> {
           <a-form-item label="用户名">
             <a-input v-model:value="form.username" placeholder="root" />
           </a-form-item>
+          <a-form-item label="跳板机（按顺序）">
+            <a-select
+              v-model:value="form.jump"
+              mode="multiple"
+              :options="jumpOptions"
+              placeholder="直连；按选择顺序经每一跳"
+              allow-clear
+            />
+            <div class="jump-tip">
+              顺序 = 本机 → 第 1 跳 → … → 目标；跳板机自己的跳板设置不会被递归展开
+            </div>
+          </a-form-item>
+          <a-form-item label="端口转发">
+            <div v-for="(t, i) in form.tunnels" :key="i" class="tunnel-row">
+              <a-select v-model:value="t.kind" style="width: 96px">
+                <a-select-option value="local">本地</a-select-option>
+                <a-select-option value="remote">远端</a-select-option>
+                <a-select-option value="dynamic">SOCKS5</a-select-option>
+              </a-select>
+              <a-input v-model:value="t.bind_host" placeholder="监听地址" style="width: 120px" />
+              <a-input-number v-model:value="t.bind_port" :min="1" :max="65535" placeholder="端口" style="width: 96px" />
+              <template v-if="t.kind !== 'dynamic'">
+                <a-input v-model:value="t.target_host" placeholder="目标地址" style="width: 130px" />
+                <a-input-number v-model:value="t.target_port" :min="1" :max="65535" placeholder="端口" style="width: 96px" />
+              </template>
+              <a-button type="text" danger size="small" @click="form.tunnels.splice(i, 1)">
+                删除
+              </a-button>
+            </div>
+            <a-button size="small" @click="addTunnel">
+              添加转发
+            </a-button>
+            <div class="jump-tip">
+              连接建立时自动启动、断开或改配置时停止；本地 = 本机端口→远端目标，远端 = 服务器端口→本机目标，SOCKS5 不需要填目标
+            </div>
+          </a-form-item>
           <a-form-item label="认证方式">
             <a-select v-model:value="form.authMode" :options="AUTH_OPTIONS" />
           </a-form-item>
@@ -250,3 +317,18 @@ async function revealStored(): Promise<void> {
     </a-form>
   </a-modal>
 </template>
+
+<style scoped>
+.jump-tip {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.tunnel-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+</style>

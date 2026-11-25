@@ -61,6 +61,17 @@ pub enum TransferKind {
     Download,
 }
 
+/// 同名文件的处理方式。`Ask` 会让后端弹一次请求，前端的选择对整批生效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictPolicy {
+    #[default]
+    Ask,
+    Overwrite,
+    Skip,
+    Rename,
+}
+
 /// 传输状态是**终态即停止**的：`Failed`/`Completed`/`Cancelled` 之后不再有该 id 的事件。
 /// `Queued` 存在是因为并发文件数有上限（默认 6），排队中的任务也要显示在列表里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -148,7 +159,11 @@ mod tests {
     fn terminal_states_are_terminal() {
         assert!(!TransferState::Queued.is_terminal());
         assert!(!TransferState::Running.is_terminal());
-        for state in [TransferState::Completed, TransferState::Failed, TransferState::Cancelled] {
+        for state in [
+            TransferState::Completed,
+            TransferState::Failed,
+            TransferState::Cancelled,
+        ] {
             assert!(state.is_terminal());
         }
     }

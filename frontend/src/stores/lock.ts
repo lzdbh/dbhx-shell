@@ -2,6 +2,7 @@ import { ref, watch } from 'vue'
 
 import { defineStore } from 'pinia'
 
+import type { KeyStoreKind } from '../lib/ipc/bindings'
 import { lockApi } from '../lib/ipc/client'
 
 /**
@@ -22,6 +23,8 @@ export const useLockStore = defineStore('lock', () => {
   const locked = ref(false)
   /** 是否设过解锁 PIN。没设过就没有锁，覆盖层与自动上锁都据此退场。 */
   const hasPin = ref(false)
+  /** 主密钥实际存在系统钥匙串还是本地文件。只用于设置页展示。 */
+  const keyStore = ref<KeyStoreKind>('file')
   /** 空闲多少分钟后自动上锁，0 表示关闭。这是前端偏好，不进 vault。 */
   const idleMinutes = ref(readIdle())
 
@@ -54,6 +57,7 @@ export const useLockStore = defineStore('lock', () => {
     const status = await lockApi.status()
     locked.value = status.locked
     hasPin.value = status.has_pin
+    keyStore.value = status.key_store
     armIdle()
   }
 
@@ -106,6 +110,7 @@ export const useLockStore = defineStore('lock', () => {
   return {
     locked,
     hasPin,
+    keyStore,
     idleMinutes,
     refresh,
     lock,

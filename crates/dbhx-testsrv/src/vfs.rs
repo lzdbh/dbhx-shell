@@ -73,11 +73,17 @@ enum Walk {
 }
 
 fn split(path: &str) -> Vec<&str> {
-    path.split('/').filter(|s| !s.is_empty() && *s != ".").collect()
+    path.split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect()
 }
 
 fn assemble(parts: &[&str]) -> String {
-    if parts.is_empty() { "/".to_string() } else { format!("/{}", parts.join("/")) }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
 }
 
 /// 把 `raw` 按 `base` 展开并折叠 `..`。`raw` 以 `/` 开头时 `base` 被忽略。
@@ -85,7 +91,11 @@ fn join_abs(base: &str, raw: &str) -> Result<String, FsError> {
     if raw.contains('\0') {
         return Err(FsError::BadPath);
     }
-    let mut parts: Vec<&str> = if raw.starts_with('/') { Vec::new() } else { split(base) };
+    let mut parts: Vec<&str> = if raw.starts_with('/') {
+        Vec::new()
+    } else {
+        split(base)
+    };
     for seg in split(raw) {
         if seg == ".." {
             parts.pop();
@@ -126,7 +136,16 @@ impl Vfs {
 
     fn insert(&mut self, path: &str, kind: Kind, data: Vec<u8>, target: &str, mode: u32) {
         let mtime = self.tick();
-        self.nodes.insert(path.to_string(), Node { kind, data, target: target.to_string(), mode, mtime });
+        self.nodes.insert(
+            path.to_string(),
+            Node {
+                kind,
+                data,
+                target: target.to_string(),
+                mode,
+                mtime,
+            },
+        );
     }
 
     // ---- 夹具侧的写接口（不走协议，返回 Self 以便链式搭场景）----
@@ -138,7 +157,13 @@ impl Vfs {
     }
 
     pub fn add_file(&mut self, path: &str, bytes: impl AsRef<[u8]>) -> &mut Self {
-        self.insert(&normalize(path), Kind::File, bytes.as_ref().to_vec(), "", 0o644);
+        self.insert(
+            &normalize(path),
+            Kind::File,
+            bytes.as_ref().to_vec(),
+            "",
+            0o644,
+        );
         self
     }
 
@@ -150,7 +175,10 @@ impl Vfs {
     /// 断言用：读内容（跟随符号链接）。
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let final_path = self.resolve_link(&normalize(path), true)?;
-        self.nodes.get(&final_path).filter(|n| n.kind == Kind::File).map(|n| n.data.clone())
+        self.nodes
+            .get(&final_path)
+            .filter(|n| n.kind == Kind::File)
+            .map(|n| n.data.clone())
     }
 
     pub fn exists(&self, path: &str) -> bool {
@@ -202,20 +230,34 @@ impl Vfs {
         let segments = split(path);
         for (index, seg) in segments.iter().enumerate() {
             let candidate = format!("{current}/{seg}");
-            let Some(node) = self.nodes.get(&candidate) else { return Walk::Missing };
+            let Some(node) = self.nodes.get(&candidate) else {
+                return Walk::Missing;
+            };
             let is_last = index + 1 == segments.len();
             if node.kind == Kind::Symlink && (follow_final || !is_last) {
-                let base = if current.is_empty() { "/" } else { current.as_str() };
+                let base = if current.is_empty() {
+                    "/"
+                } else {
+                    current.as_str()
+                };
                 let target = match join_abs(base, &node.target) {
                     Ok(t) => t,
                     Err(_) => return Walk::Missing,
                 };
                 let rest = segments[index + 1..].join("/");
-                return Walk::Redirect(if rest.is_empty() { target } else { format!("{target}/{rest}") });
+                return Walk::Redirect(if rest.is_empty() {
+                    target
+                } else {
+                    format!("{target}/{rest}")
+                });
             }
             current = candidate;
         }
-        Walk::Done(if current.is_empty() { "/".to_string() } else { current })
+        Walk::Done(if current.is_empty() {
+            "/".to_string()
+        } else {
+            current
+        })
     }
 
     /// `STAT` / `LSTAT`。返回的 `path` 是**解析过中间段**的形态，
@@ -243,12 +285,28 @@ impl Vfs {
 
     /// 目录的直接子项，按名字典序。返回 `(完整路径, 快照)`。
     pub fn list(&self, dir: &str) -> Vec<(String, Stat)> {
-        let prefix = if dir == "/" { "/".to_string() } else { format!("{dir}/") };
+        let prefix = if dir == "/" {
+            "/".to_string()
+        } else {
+            format!("{dir}/")
+        };
         self.nodes
             .iter()
             .filter(|(k, _)| k.starts_with(&prefix) && **k != dir)
             .filter(|(k, _)| k[prefix.len()..].find('/').is_none())
-            .map(|(k, v)| (k.clone(), Stat { path: k.clone(), kind: v.kind, size: v.data.len() as u64, mode: v.mode, mtime: v.mtime, target: (v.kind == Kind::Symlink).then(|| v.target.clone()) }))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    Stat {
+                        path: k.clone(),
+                        kind: v.kind,
+                        size: v.data.len() as u64,
+                        mode: v.mode,
+                        mtime: v.mtime,
+                        target: (v.kind == Kind::Symlink).then(|| v.target.clone()),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -313,12 +371,24 @@ impl Vfs {
             return Err(FsError::NotFound);
         }
         let mtime = self.tick();
-        self.nodes.insert(path.to_string(), Node { kind: Kind::Dir, data: Vec::new(), target: String::new(), mode: 0o755, mtime });
+        self.nodes.insert(
+            path.to_string(),
+            Node {
+                kind: Kind::Dir,
+                data: Vec::new(),
+                target: String::new(),
+                mode: 0o755,
+                mtime,
+            },
+        );
         Ok(())
     }
 
     pub fn opendir(&self, path: &str) -> Result<(), FsError> {
-        match self.resolve_link(path, true).and_then(|p| self.nodes.get(&p).map(|n| n.kind)) {
+        match self
+            .resolve_link(path, true)
+            .and_then(|p| self.nodes.get(&p).map(|n| n.kind))
+        {
             Some(Kind::Dir) => Ok(()),
             Some(Kind::File) => Err(FsError::NotDir),
             Some(Kind::Symlink) => Err(FsError::NotFound),
@@ -380,7 +450,16 @@ impl Vfs {
             return Err(FsError::NotFound);
         }
         let mtime = self.tick();
-        self.nodes.insert(link.to_string(), Node { kind: Kind::Symlink, data: Vec::new(), target: target.to_string(), mode: 0o777, mtime });
+        self.nodes.insert(
+            link.to_string(),
+            Node {
+                kind: Kind::Symlink,
+                data: Vec::new(),
+                target: target.to_string(),
+                mode: 0o777,
+                mtime,
+            },
+        );
         Ok(())
     }
 
@@ -447,8 +526,8 @@ mod tests {
         fs.add_dir("/home");
         fs.add_dir("/home/app");
         fs.add_dir("/home/app/logs");
-        fs.add_file("/home/app/readme.md", b"hello\n".to_vec());
-        fs.add_file("/home/app/logs/app.log", b"log\n".to_vec());
+        fs.add_file("/home/app/readme.md", b"hello\n");
+        fs.add_file("/home/app/logs/app.log", b"log\n");
         fs.add_symlink("/home/app/abs", "/home/app/readme.md");
         fs.add_symlink("/home/app/rel", "readme.md");
         fs.add_symlink("/home/app/two", "abs");
@@ -464,9 +543,19 @@ mod tests {
     #[test]
     fn relative_writes_are_expanded_against_the_session_cwd() {
         let fs = fs();
-        assert_eq!(fs.resolve("readme.md", "/home/app").unwrap(), "/home/app/readme.md");
-        assert_eq!(fs.resolve("./logs/../readme.md", "/home/app").unwrap(), "/home/app/readme.md");
-        assert_eq!(fs.resolve("/", "/home/app").unwrap(), "/", "绝对写法不该被 cwd 影响");
+        assert_eq!(
+            fs.resolve("readme.md", "/home/app").unwrap(),
+            "/home/app/readme.md"
+        );
+        assert_eq!(
+            fs.resolve("./logs/../readme.md", "/home/app").unwrap(),
+            "/home/app/readme.md"
+        );
+        assert_eq!(
+            fs.resolve("/", "/home/app").unwrap(),
+            "/",
+            "绝对写法不该被 cwd 影响"
+        );
         assert_eq!(fs.resolve("..", "/home/app/logs").unwrap(), "/home/app");
         // 根之上再往上仍是根，和 POSIX 一致
         assert_eq!(fs.resolve("../../..", "/home").unwrap(), "/");
@@ -474,12 +563,24 @@ mod tests {
 
     #[test]
     fn links_resolve_to_their_target_and_intermediate_segments_resolve_too() {
-        assert_eq!(resolved("/home/app/rel").as_deref(), Some("/home/app/readme.md"));
-        assert_eq!(resolved("/home/app/abs").as_deref(), Some("/home/app/readme.md"));
+        assert_eq!(
+            resolved("/home/app/rel").as_deref(),
+            Some("/home/app/readme.md")
+        );
+        assert_eq!(
+            resolved("/home/app/abs").as_deref(),
+            Some("/home/app/readme.md")
+        );
         // 链接的目标又是链接时要继续折到底，否则客户端拿到的是中间态
-        assert_eq!(resolved("/home/app/two").as_deref(), Some("/home/app/readme.md"));
+        assert_eq!(
+            resolved("/home/app/two").as_deref(),
+            Some("/home/app/readme.md")
+        );
         // 中间段是链接：路径后半截要接在解引用后的目标上
-        assert_eq!(resolved("/home/app/abs/../logs/app.log").as_deref(), Some("/home/app/logs/app.log"));
+        assert_eq!(
+            resolved("/home/app/abs/../logs/app.log").as_deref(),
+            Some("/home/app/logs/app.log")
+        );
     }
 
     #[test]
@@ -501,36 +602,58 @@ mod tests {
 
     #[test]
     fn missing_segments_report_not_found_rather_than_a_partial_path() {
-        assert_eq!(fs().stat("/home/app/nope/deeper", true), Err(FsError::NotFound));
-        assert_eq!(fs().stat("/home/app/readme.md/x", true), Err(FsError::NotFound));
+        assert_eq!(
+            fs().stat("/home/app/nope/deeper", true),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            fs().stat("/home/app/readme.md/x", true),
+            Err(FsError::NotFound)
+        );
     }
 
     #[test]
     fn listing_returns_direct_children_in_dictionary_order() {
         let mut fs = Vfs::new();
         fs.add_dir("/d");
-        fs.add_file("/d/b.txt", b"b".to_vec());
-        fs.add_file("/d/a.txt", b"a".to_vec());
+        fs.add_file("/d/b.txt", b"b");
+        fs.add_file("/d/a.txt", b"a");
         fs.add_dir("/d/sub");
-        fs.add_file("/d/sub/deep.txt", b"x".to_vec());
+        fs.add_file("/d/sub/deep.txt", b"x");
         let names: Vec<String> = fs.list("/d").into_iter().map(|(p, _)| p).collect();
-        assert_eq!(names, vec!["/d/a.txt", "/d/b.txt", "/d/sub"], "嵌套目录的内容不该混进父级列表");
+        assert_eq!(
+            names,
+            vec!["/d/a.txt", "/d/b.txt", "/d/sub"],
+            "嵌套目录的内容不该混进父级列表"
+        );
         assert_eq!(fs.list("/").len(), 1, "根下只有 /d，孙子辈都不该出现");
     }
 
     #[test]
     fn open_creates_truncates_and_writes_at_offsets() {
         let mut fs = fs();
-        assert_eq!(fs.open("/home/app/new.txt", true, false).unwrap(), "/home/app/new.txt");
+        assert_eq!(
+            fs.open("/home/app/new.txt", true, false).unwrap(),
+            "/home/app/new.txt"
+        );
         fs.write_at("/home/app/new.txt", 0, b"0123456789").unwrap();
         fs.write_at("/home/app/new.txt", 12, b"ab").unwrap();
-        assert_eq!(fs.read_at("/home/app/new.txt", 0, 64).unwrap(), b"0123456789\x00\x00ab");
+        assert_eq!(
+            fs.read_at("/home/app/new.txt", 0, 64).unwrap(),
+            b"0123456789\x00\x00ab"
+        );
         // 写进链接等于写进它的目标，这是真实服务端的行为。
         // 顺带固定一条容易被想当然的语义：`WRITE` 不截断，只覆盖写入的那段。
         fs.write_at("/home/app/readme.md", 0, b"BYE\n").unwrap();
         assert_eq!(fs.read_file("/home/app/abs").unwrap(), b"BYE\no\n");
-        assert_eq!(fs.open("/home/app/new.txt", false, true).unwrap(), "/home/app/new.txt");
-        assert!(fs.read_at("/home/app/new.txt", 0, 64).unwrap().is_empty(), "TRUNCATE 必须清空");
+        assert_eq!(
+            fs.open("/home/app/new.txt", false, true).unwrap(),
+            "/home/app/new.txt"
+        );
+        assert!(
+            fs.read_at("/home/app/new.txt", 0, 64).unwrap().is_empty(),
+            "TRUNCATE 必须清空"
+        );
         // 打开目录是 IsDir，不是「成功但读不到东西」
         assert_eq!(fs.open("/home/app", false, false), Err(FsError::IsDir));
     }
@@ -538,24 +661,41 @@ mod tests {
     #[test]
     fn reading_past_the_end_yields_nothing_and_a_missing_handle_target_is_not_found() {
         let fs = fs();
-        assert!(fs.read_at("/home/app/readme.md", 9_000, 32).unwrap().is_empty());
-        assert_eq!(fs.read_at("/home/app/missing", 0, 8), Err(FsError::NotFound));
+        assert!(fs
+            .read_at("/home/app/readme.md", 9_000, 32)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fs.read_at("/home/app/missing", 0, 8),
+            Err(FsError::NotFound)
+        );
     }
 
     #[test]
     fn rename_moves_the_node_and_refuses_to_overwrite() {
         let mut fs = fs();
-        fs.rename("/home/app/readme.md", "/home/app/moved.md").unwrap();
+        fs.rename("/home/app/readme.md", "/home/app/moved.md")
+            .unwrap();
         assert!(!fs.exists("/home/app/readme.md"));
         assert_eq!(fs.read_file("/home/app/moved.md").unwrap(), b"hello\n");
-        assert_eq!(fs.rename("/home/app/moved.md", "/home/app/logs"), Err(FsError::Exists));
-        assert_eq!(fs.rename("/home/app/gone.md", "/home/app/x.md"), Err(FsError::NotFound));
+        assert_eq!(
+            fs.rename("/home/app/moved.md", "/home/app/logs"),
+            Err(FsError::Exists)
+        );
+        assert_eq!(
+            fs.rename("/home/app/gone.md", "/home/app/x.md"),
+            Err(FsError::NotFound)
+        );
     }
 
     #[test]
     fn directory_removal_requires_an_empty_directory() {
         let mut fs = fs();
-        assert_eq!(fs.remove_dir("/home/app"), Err(FsError::Exists), "非空目录不该被删掉");
+        assert_eq!(
+            fs.remove_dir("/home/app"),
+            Err(FsError::Exists),
+            "非空目录不该被删掉"
+        );
         assert_eq!(fs.remove_dir("/home/app/readme.md"), Err(FsError::NotDir));
         fs.remove_file("/home/app/readme.md").unwrap();
         fs.remove_dir("/home/app/logs").unwrap_err();
@@ -578,9 +718,15 @@ mod tests {
     fn creating_inside_a_missing_parent_fails_instead_of_inventing_directories() {
         let mut fs = fs();
         assert_eq!(fs.mkdir("/home/app/sub/deep"), Err(FsError::NotFound));
-        assert_eq!(fs.open("/home/app/sub/x.txt", true, false), Err(FsError::NotFound));
+        assert_eq!(
+            fs.open("/home/app/sub/x.txt", true, false),
+            Err(FsError::NotFound)
+        );
         fs.mkdir("/home/app/sub").unwrap();
-        assert_eq!(fs.open("/home/app/sub/x.txt", true, false).unwrap(), "/home/app/sub/x.txt");
+        assert_eq!(
+            fs.open("/home/app/sub/x.txt", true, false).unwrap(),
+            "/home/app/sub/x.txt"
+        );
     }
 
     #[test]

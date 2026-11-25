@@ -120,7 +120,12 @@ pub struct ShellSession {
 
 impl ShellSession {
     /// 在一条已认证的连接上开 shell 通道并起读任务。
-    pub async fn start(id: SessionId, lease: Lease, term: String, pty: PtySize) -> Result<Self, SessionError> {
+    pub async fn start(
+        id: SessionId,
+        lease: Lease,
+        term: String,
+        pty: PtySize,
+    ) -> Result<Self, SessionError> {
         let shell = lease.open_shell(term, pty).await?;
         Ok(Self::from_shell(id, lease, shell))
     }
@@ -131,7 +136,13 @@ impl ShellSession {
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
         let (cwd_tx, cwd) = watch::channel(None);
         spawn_reader(reader, tx, cwd_tx, id);
-        Self { id, writer, events: Mutex::new(rx), cwd, lease }
+        Self {
+            id,
+            writer,
+            events: Mutex::new(rx),
+            cwd,
+            lease,
+        }
     }
 
     pub fn id(&self) -> SessionId {
@@ -240,7 +251,10 @@ mod tests {
     fn exit_status_alone_does_not_end_the_session() {
         // 本文件最容易写错的一条：退出码之后还有尾巴
         let mut pump = Pump::default();
-        assert!(pump.push(msg(Chunk::ExitStatus(0))).is_empty(), "退出码不该立刻收尾");
+        assert!(
+            pump.push(msg(Chunk::ExitStatus(0))).is_empty(),
+            "退出码不该立刻收尾"
+        );
         assert_eq!(pump.push(text("logout")).len(), 1);
         let ended = pump.push(None);
         assert!(matches!(&ended[0], ShellEvent::Ended(info) if info.exit_status == Some(0)));
@@ -269,8 +283,12 @@ mod tests {
         // mem::take 保证重复调用 push(None) 不会把同一份退出码报两次
         let mut pump = Pump::default();
         pump.push(msg(Chunk::ExitStatus(3)));
-        assert!(matches!(&pump.push(None)[0], ShellEvent::Ended(info) if info.exit_status == Some(3)));
-        assert!(matches!(&pump.push(None)[0], ShellEvent::Ended(info) if info.exit_status.is_none()));
+        assert!(
+            matches!(&pump.push(None)[0], ShellEvent::Ended(info) if info.exit_status == Some(3))
+        );
+        assert!(
+            matches!(&pump.push(None)[0], ShellEvent::Ended(info) if info.exit_status.is_none())
+        );
     }
 
     #[test]
@@ -287,7 +305,11 @@ mod tests {
         let mut pump = Pump::default();
         let mut seen = Vec::new();
         for chunk in [text("x\x1b]7;file://h/e"), text("tc\x07")] {
-            seen.extend(pump.push(chunk).into_iter().filter(|e| matches!(e, ShellEvent::Cwd(_))));
+            seen.extend(
+                pump.push(chunk)
+                    .into_iter()
+                    .filter(|e| matches!(e, ShellEvent::Cwd(_))),
+            );
         }
         assert_eq!(seen.len(), 1, "劈开的序列必须只报一次，否则面板连跳两下");
     }
@@ -295,8 +317,17 @@ mod tests {
     #[test]
     fn control_and_flow_messages_produce_no_events_but_keep_bytes() {
         let mut pump = Pump::default();
-        assert!(pump.push(msg(Chunk::WindowAdjusted { bytes: 4096 })).is_empty());
-        assert_eq!(pump.push(msg(Chunk::Stderr(b"oops".to_vec()))).len(), 1, "扩展错误按输出送，不丢字节");
-        assert!(pump.push(msg(Chunk::Stdout(Vec::new()))).is_empty(), "空包不该占一个事件位");
+        assert!(pump
+            .push(msg(Chunk::WindowAdjusted { bytes: 4096 }))
+            .is_empty());
+        assert_eq!(
+            pump.push(msg(Chunk::Stderr(b"oops".to_vec()))).len(),
+            1,
+            "扩展错误按输出送，不丢字节"
+        );
+        assert!(
+            pump.push(msg(Chunk::Stdout(Vec::new()))).is_empty(),
+            "空包不该占一个事件位"
+        );
     }
 }

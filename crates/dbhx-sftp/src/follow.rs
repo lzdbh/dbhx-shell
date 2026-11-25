@@ -191,7 +191,13 @@ impl FollowGate {
     ///
     /// `cwd` 为 `None` 代表「这个 tab 现在没有目录可报」（隐藏 tab 的合成事件）：
     /// 保持原样，既不清空已记录的终端目录，也不触发跳转。
-    pub fn report(&mut self, generation: u64, cwd: Option<&str>, source: CwdSource, blacklist: &Blacklist) -> Decision {
+    pub fn report(
+        &mut self,
+        generation: u64,
+        cwd: Option<&str>,
+        source: CwdSource,
+        blacklist: &Blacklist,
+    ) -> Decision {
         if generation != self.generation {
             return Decision::Hold(Hold::StaleGeneration);
         }
@@ -217,7 +223,11 @@ impl FollowGate {
     pub fn mark_unreachable(&mut self, blacklist: &mut Blacklist, target: &str) -> Decision {
         blacklist.add(self.connection, target);
         let normalized = path::normalize(target);
-        if self.terminal.as_ref().is_some_and(|(_, known)| *known == normalized) {
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|(_, known)| *known == normalized)
+        {
             self.terminal = None;
         }
         self.evaluate(blacklist)
@@ -270,7 +280,8 @@ impl Blacklist {
     }
 
     pub fn contains(&self, connection: u32, target: &str) -> bool {
-        self.entries.contains(&(connection, path::normalize(target)))
+        self.entries
+            .contains(&(connection, path::normalize(target)))
     }
 
     /// 连接断开时清掉它的全部记录：重连之后同一目录可能又可访问了，
@@ -314,7 +325,11 @@ mod tests {
         let mut gate = gate_at_shown(Some("/var/log"));
         let blacklist = Blacklist::default();
         let d = gate.report(0, Some("/var/log/"), CwdSource::Osc7, &blacklist);
-        assert_eq!(gate.terminal_cwd(), Some("/var/log"), "尾斜杠是写法差异，记录前先归一化");
+        assert_eq!(
+            gate.terminal_cwd(),
+            Some("/var/log"),
+            "尾斜杠是写法差异，记录前先归一化"
+        );
         assert_eq!(d, Decision::Hold(Hold::AlreadyShown));
     }
 
@@ -327,7 +342,11 @@ mod tests {
         gate.report(0, Some("/var/log"), CwdSource::Osc7, &blacklist);
         let d = gate.report(0, None, CwdSource::Osc7, &blacklist);
         assert_eq!(d, Decision::Hold(Hold::NothingReported));
-        assert_eq!(gate.terminal_cwd(), Some("/var/log"), "null 不许清空已记录的目录");
+        assert_eq!(
+            gate.terminal_cwd(),
+            Some("/var/log"),
+            "null 不许清空已记录的目录"
+        );
     }
 
     #[test]
@@ -376,7 +395,11 @@ mod tests {
         let blacklist = Blacklist::default();
         gate.set_editing(true, &blacklist);
         let d = gate.report(0, Some("/var/log"), CwdSource::Osc7, &blacklist);
-        assert_eq!(d, Decision::Hold(Hold::Editing), "用户正在输入路径时不能把地址栏换掉");
+        assert_eq!(
+            d,
+            Decision::Hold(Hold::Editing),
+            "用户正在输入路径时不能把地址栏换掉"
+        );
         let d = gate.set_editing(false, &blacklist);
         assert_eq!(d, Decision::Navigate("/var/log".into()), "输入结束后补跳");
 
@@ -387,7 +410,11 @@ mod tests {
         assert!(!gate.is_following(), "用户手动导航过，开关就该是关的");
         let d = gate.report(0, Some("/home/app"), CwdSource::Osc7, &blacklist);
         assert_eq!(d, Decision::Hold(Hold::UserLocked));
-        assert_eq!(gate.terminal_cwd(), Some("/home/app"), "用户接管期间仍要记账");
+        assert_eq!(
+            gate.terminal_cwd(),
+            Some("/home/app"),
+            "用户接管期间仍要记账"
+        );
         let d = gate.set_following(true, &blacklist);
         assert_eq!(d, Decision::Navigate("/home/app".into()));
         assert!(gate.is_following());
@@ -399,7 +426,11 @@ mod tests {
         let mut blacklist = Blacklist::default();
         gate.report(0, Some("/mnt/nfs"), CwdSource::Osc7, &blacklist);
         let d = gate.mark_unreachable(&mut blacklist, "/mnt/nfs");
-        assert_eq!(d, Decision::Hold(Hold::NothingReported), "拉黑后不再有想去的目标");
+        assert_eq!(
+            d,
+            Decision::Hold(Hold::NothingReported),
+            "拉黑后不再有想去的目标"
+        );
         // 终端再次报同一个目录：黑名单挡住了，不会又给一次 Navigate
         let d = gate.report(0, Some("/mnt/nfs"), CwdSource::Osc7, &blacklist);
         assert_eq!(d, Decision::Hold(Hold::Unreachable));
@@ -411,7 +442,10 @@ mod tests {
         let mut blacklist = Blacklist::default();
         blacklist.add(1, "/var/log/");
         assert!(blacklist.contains(1, "/var/log"));
-        assert!(!blacklist.contains(2, "/var/log"), "另一条连接上同一个目录可能可访问");
+        assert!(
+            !blacklist.contains(2, "/var/log"),
+            "另一条连接上同一个目录可能可访问"
+        );
         blacklist.clear_connection(1);
         assert!(blacklist.is_empty());
     }
@@ -435,11 +469,21 @@ mod tests {
         assert!(gate.should_probe());
         gate.mark_probe_sent();
         assert!(!gate.should_probe(), "同一代不重复探测");
-        gate.report(gate.generation(), Some("/var"), CwdSource::Probe, &blacklist);
+        gate.report(
+            gate.generation(),
+            Some("/var"),
+            CwdSource::Probe,
+            &blacklist,
+        );
         assert!(!gate.should_probe(), "探测已经给出答案");
         gate.renew();
         assert!(gate.should_probe(), "OSC 7 还没报过，新一代可以探");
-        gate.report(gate.generation(), Some("/var/log"), CwdSource::Osc7, &blacklist);
+        gate.report(
+            gate.generation(),
+            Some("/var/log"),
+            CwdSource::Osc7,
+            &blacklist,
+        );
         assert!(!gate.should_probe(), "OSC 7 报过就不再探测");
     }
 }

@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version};
+use russh_sftp::protocol::{
+    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
+};
 
 use crate::vfs::{FsError, Kind, Stat, Vfs};
 
@@ -32,7 +34,12 @@ pub struct SftpHandler {
 
 impl SftpHandler {
     pub fn new(fs: Arc<Mutex<Vfs>>, cwd: impl Into<String>) -> Self {
-        Self { fs, cwd: cwd.into(), handles: HashMap::new(), next_handle: 0 }
+        Self {
+            fs,
+            cwd: cwd.into(),
+            handles: HashMap::new(),
+            next_handle: 0,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vfs> {
@@ -70,7 +77,12 @@ fn to_status(err: FsError) -> StatusCode {
 }
 
 fn ok(id: u32) -> Status {
-    Status { id, status_code: StatusCode::Ok, error_message: String::new(), language_tag: "en".to_string() }
+    Status {
+        id,
+        status_code: StatusCode::Ok,
+        error_message: String::new(),
+        language_tag: "en".to_string(),
+    }
 }
 
 /// 把 VFS 的快照写成 SFTP 的属性位图。
@@ -78,14 +90,15 @@ fn ok(id: u32) -> Status {
 /// `permissions` 里必须带上**类型位**（`0o40000` 目录、`0o10000` 符号链接等），
 /// 客户端就是靠这几个位区分目录/文件/链接的；只写 rwxx 权限位会让面板把目录列成文件。
 fn attrs_of(node: &Stat) -> FileAttributes {
-    let mut attrs = FileAttributes::default();
-    attrs.size = Some(node.size);
-    attrs.uid = Some(1000);
-    attrs.gid = Some(1000);
-    attrs.permissions = Some(node.mode | type_bits(node.kind));
-    attrs.atime = Some(node.mtime);
-    attrs.mtime = Some(node.mtime);
-    attrs
+    FileAttributes {
+        size: Some(node.size),
+        uid: Some(1000),
+        gid: Some(1000),
+        permissions: Some(node.mode | type_bits(node.kind)),
+        atime: Some(node.mtime),
+        mtime: Some(node.mtime),
+        ..Default::default()
+    }
 }
 
 fn type_bits(kind: Kind) -> u32 {
@@ -103,11 +116,17 @@ impl russh_sftp::server::Handler for SftpHandler {
         StatusCode::OpUnsupported
     }
 
-    async fn init(&mut self, _version: u32, _extensions: HashMap<String, String>) -> Result<Version, Self::Error> {
+    async fn init(
+        &mut self,
+        _version: u32,
+        _extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
         // 报 `pwd` 扩展的存在：客户端的 canonicalize 会优先走它，
         // 不给的话 realpath 也能工作，但那条分支就永远测不到。
         let mut version = Version::new();
-        version.extensions.insert("posix-rename@openssh.com".to_string(), "1".to_string());
+        version
+            .extensions
+            .insert("posix-rename@openssh.com".to_string(), "1".to_string());
         Ok(version)
     }
 
@@ -115,26 +134,44 @@ impl russh_sftp::server::Handler for SftpHandler {
         let abs = self.abs(&path)?;
         let node = self.stat_of(&abs, true)?;
         let attrs = attrs_of(&node);
-        Ok(Name { id, files: vec![File::new(node.path, attrs)] })
+        Ok(Name {
+            id,
+            files: vec![File::new(node.path, attrs)],
+        })
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         let node = self.stat_of(&self.abs(&path)?, true)?;
-        Ok(Attrs { id, attrs: attrs_of(&node) })
+        Ok(Attrs {
+            id,
+            attrs: attrs_of(&node),
+        })
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         let node = self.stat_of(&self.abs(&path)?, false)?;
-        Ok(Attrs { id, attrs: attrs_of(&node) })
+        Ok(Attrs {
+            id,
+            attrs: attrs_of(&node),
+        })
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
         let path = self.take_file(&handle)?;
         let node = self.stat_of(&path, true)?;
-        Ok(Attrs { id, attrs: attrs_of(&node) })
+        Ok(Attrs {
+            id,
+            attrs: attrs_of(&node),
+        })
     }
 
-    async fn open(&mut self, id: u32, filename: String, pflags: OpenFlags, _attrs: FileAttributes) -> Result<Handle, Self::Error> {
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<Handle, Self::Error> {
         let abs = self.abs(&filename)?;
         let create = pflags.contains(OpenFlags::CREATE);
         let truncate = pflags.contains(OpenFlags::TRUNCATE);
@@ -143,11 +180,18 @@ impl russh_sftp::server::Handler for SftpHandler {
             fs.open(&abs, create, truncate).map_err(to_status)?
         };
         let handle = self.next_handle_name();
-        self.handles.insert(handle.clone(), Opened::File { path: final_path });
+        self.handles
+            .insert(handle.clone(), Opened::File { path: final_path });
         Ok(Handle { id, handle })
     }
 
-    async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
         let path = self.take_file(&handle)?;
         let bytes = self.lock().read_at(&path, offset, len).map_err(to_status)?;
         // 空返回就是 EOF 的意思，但报文层要求显式报错，客户端据此收尾
@@ -157,9 +201,17 @@ impl russh_sftp::server::Handler for SftpHandler {
         Ok(Data { id, data: bytes })
     }
 
-    async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
         let path = self.take_file(&handle)?;
-        self.lock().write_at(&path, offset, &data).map_err(to_status)?;
+        self.lock()
+            .write_at(&path, offset, &data)
+            .map_err(to_status)?;
         Ok(ok(id))
     }
 
@@ -172,12 +224,23 @@ impl russh_sftp::server::Handler for SftpHandler {
         let abs = self.abs(&path)?;
         self.lock().opendir(&abs).map_err(to_status)?;
         let handle = self.next_handle_name();
-        self.handles.insert(handle.clone(), Opened::Dir { path: abs, drained: false });
+        self.handles.insert(
+            handle.clone(),
+            Opened::Dir {
+                path: abs,
+                drained: false,
+            },
+        );
         Ok(Handle { id, handle })
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        let Opened::Dir { path, drained } = self.handles.get(&handle).cloned().ok_or(StatusCode::BadMessage)? else {
+        let Opened::Dir { path, drained } = self
+            .handles
+            .get(&handle)
+            .cloned()
+            .ok_or(StatusCode::BadMessage)?
+        else {
             return Err(StatusCode::BadMessage);
         };
         if drained {
@@ -185,10 +248,8 @@ impl russh_sftp::server::Handler for SftpHandler {
         }
         let listing = self.lock().list(&path);
         // 一次吐完，下一次调用就该是 EOF——客户端的 read_dir 正是这么收尾的
-        if let Some(entry) = self.handles.get_mut(&handle) {
-            if let Opened::Dir { drained, .. } = entry {
-                *drained = true;
-            }
+        if let Some(Opened::Dir { drained, .. }) = self.handles.get_mut(&handle) {
+            *drained = true;
         }
         Ok(Name {
             id,
@@ -208,7 +269,12 @@ impl russh_sftp::server::Handler for SftpHandler {
         Ok(ok(id))
     }
 
-    async fn mkdir(&mut self, id: u32, path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
         let abs = self.abs(&path)?;
         self.lock().mkdir(&abs).map_err(to_status)?;
         Ok(ok(id))
@@ -220,14 +286,24 @@ impl russh_sftp::server::Handler for SftpHandler {
         Ok(ok(id))
     }
 
-    async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, Self::Error> {
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
         let from = self.abs(&oldpath)?;
         let to = self.abs(&newpath)?;
         self.lock().rename(&from, &to).map_err(to_status)?;
         Ok(ok(id))
     }
 
-    async fn symlink(&mut self, id: u32, linkpath: String, targetpath: String) -> Result<Status, Self::Error> {
+    async fn symlink(
+        &mut self,
+        id: u32,
+        linkpath: String,
+        targetpath: String,
+    ) -> Result<Status, Self::Error> {
         // OpenSSH 的两个参数顺序和直觉相反（linkpath 在前），客户端按同一顺序发，
         // 这里保持原样，写反了测试也发现不了——所以把顺序写进注释。
         let link = self.abs(&linkpath)?;
@@ -239,10 +315,18 @@ impl russh_sftp::server::Handler for SftpHandler {
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         let abs = self.abs(&path)?;
         let target = self.lock().read_link(&abs).map_err(to_status)?;
-        Ok(Name { id, files: vec![File::new(target, FileAttributes::default())] })
+        Ok(Name {
+            id,
+            files: vec![File::new(target, FileAttributes::default())],
+        })
     }
 
-    async fn setstat(&mut self, id: u32, path: String, attrs: FileAttributes) -> Result<Status, Self::Error> {
+    async fn setstat(
+        &mut self,
+        id: u32,
+        path: String,
+        attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
         let abs = self.abs(&path)?;
         // 两个字段各管各的：只带 permissions 的 SETATTRS 就是 chmod，只带 size 就是截断，
         // 缺的那个字段绝不能顺手改动（客户端改权限时把 mtime 报成 0 就是这么来的）
@@ -256,7 +340,12 @@ impl russh_sftp::server::Handler for SftpHandler {
         Ok(ok(id))
     }
 
-    async fn fsetstat(&mut self, id: u32, handle: String, attrs: FileAttributes) -> Result<Status, Self::Error> {
+    async fn fsetstat(
+        &mut self,
+        id: u32,
+        handle: String,
+        attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
         let path = self.take_file(&handle)?;
         let mut fs = self.lock();
         if let Some(mode) = attrs.permissions {

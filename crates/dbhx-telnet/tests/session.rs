@@ -4,7 +4,7 @@
 //! 突然断开）都得由测试精确摆出，才能钉死客户端的两个不变量——协商字节绝不漏进终端、
 //! 用户数据里的 0xFF 绝不逃出去变成命令。
 
-use dbhx_telnet::{TelnetEvent, connect, iac};
+use dbhx_telnet::{connect, iac, TelnetEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -27,7 +27,9 @@ async fn negotiates_escapes_and_closes_against_a_live_server() {
         assert_eq!(&greeting[3..], &iac::naws(80, 24)[..]);
 
         // 2. 声明启用回声——客户端应当答 DO
-        sock.write_all(&[iac::IAC, iac::WILL, iac::OPT_ECHO]).await.unwrap();
+        sock.write_all(&[iac::IAC, iac::WILL, iac::OPT_ECHO])
+            .await
+            .unwrap();
         let mut reply = [0u8; 3];
         sock.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply, [iac::IAC, iac::DO, iac::OPT_ECHO]);
@@ -49,7 +51,13 @@ async fn negotiates_escapes_and_closes_against_a_live_server() {
         drop(sock);
     });
 
-    let (handle, mut events) = connect("127.0.0.1", port, &dbhx_model::PtySize { rows: 24, cols: 80 }).await.unwrap();
+    let (handle, mut events) = connect(
+        "127.0.0.1",
+        port,
+        &dbhx_model::PtySize { rows: 24, cols: 80 },
+    )
+    .await
+    .unwrap();
 
     // 握手先落地：服务器发 WILL ECHO，客户端只可能回 DO ECHO（此刻出站队列是空的，
     // select! 里没有别的帧可写，顺序才是确定的）。等数据到手再驱动出站。
@@ -60,7 +68,10 @@ async fn negotiates_escapes_and_closes_against_a_live_server() {
             other => panic!("期望终端数据，收到 {other:?}"),
         }
     }
-    assert_eq!(collected, b"pong\xFF!", "转义的 0xFF 应还原成数据，协商字节绝不能漏进来");
+    assert_eq!(
+        collected, b"pong\xFF!",
+        "转义的 0xFF 应还原成数据，协商字节绝不能漏进来"
+    );
 
     // 数据到手后再驱动出站：窗口变化 + 带 0xFF 的输入
     handle.resize(132, 43).unwrap();
@@ -80,7 +91,13 @@ async fn writing_after_the_peer_is_gone_reports_closed() {
         drop(sock);
     });
 
-    let (handle, mut events) = connect("127.0.0.1", port, &dbhx_model::PtySize { rows: 24, cols: 80 }).await.unwrap();
+    let (handle, mut events) = connect(
+        "127.0.0.1",
+        port,
+        &dbhx_model::PtySize { rows: 24, cols: 80 },
+    )
+    .await
+    .unwrap();
     // 读到 None 意味着会话任务已经结束：那一刻出站帧通道也随任务一起 drop 了，
     // 只有到这个点再写，「写失败」才是确定的，而不是抢在任务退出之前的竞态。
     loop {
@@ -93,5 +110,8 @@ async fn writing_after_the_peer_is_gone_reports_closed() {
 
     server.await.unwrap();
     // 会话没了之后继续写，应当明确失败而不是静默丢弃
-    assert!(matches!(handle.write(b"x"), Err(dbhx_telnet::TelnetError::Closed)));
+    assert!(matches!(
+        handle.write(b"x"),
+        Err(dbhx_telnet::TelnetError::Closed)
+    ));
 }

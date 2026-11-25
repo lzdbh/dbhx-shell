@@ -4,23 +4,55 @@
 //! 拆成 `*_impl`（拿 `&Core`）与 `#[tauri::command]`（拿 `State`）两层，
 //! 是为了让逻辑测试不需要 Tauri 运行时：测试直接调 `*_impl`。
 
+use std::collections::HashSet;
+
 use dbhx_model::{
-    ConnectSpec, ErrorCode, HostId, IpcError, LiveEndpoint, OsType, Protocol, PtySize, SessionId, SessionInfo,
-    TerminalEncoding,
+    ConnectSpec, ErrorCode, HostId, HostRecord, IpcError, LiveEndpoint, OsType, Protocol, PtySize,
+    SessionId, SessionInfo, TerminalEncoding,
 };
 use dbhx_pty::LocalSpec;
-use dbhx_session::TransportKey;
+use dbhx_session::{JumpKey, TransportKey};
+use dbhx_vault::Vault;
 
 use crate::state::Core;
 
-/// 终端类型。M4 会把它挪进设置里，现在固定一个兼容性最好的值。
+/// 终端类型默认值。设置里可覆盖；空串/非法值一律回落到它。
 const DEFAULT_TERM: &str = "xterm-256color";
 
-pub async fn open_local_impl(core: &Core, spec: ConnectSpec, label: String) -> Result<SessionInfo, IpcError> {
-    if spec.protocol != Protocol::Local {
-        return Err(IpcError::new(ErrorCode::InvalidInput, "本地终端的 protocol 必须是 local", false));
+/// 用户填的 TERM 直接进服务器环境变量，只接受常见字符集；不合法的回落默认。
+fn term_or_default(term: Option<String>) -> String {
+    let Some(term) = term else {
+        return DEFAULT_TERM.to_string();
+    };
+    let trimmed = term.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+    {
+        return DEFAULT_TERM.to_string();
     }
-    let record = core.sessions.open_local(&LocalSpec::from_connect(&spec), label, TerminalEncoding::default())?;
+    trimmed.to_string()
+}
+
+pub async fn open_local_impl(
+    core: &Core,
+    spec: ConnectSpec,
+    label: String,
+) -> Result<SessionInfo, IpcError> {
+    if spec.protocol != Protocol::Local {
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            "本地终端的 protocol 必须是 local",
+            false,
+        ));
+    }
+    let record = core.sessions.open_local(
+        &LocalSpec::from_connect(&spec),
+        label,
+        TerminalEncoding::default(),
+    )?;
     Ok(record.info())
 }
 
@@ -28,7 +60,21 @@ pub async fn open_local_impl(core: &Core, spec: ConnectSpec, label: String) -> R
 ///
 /// SSH 走 transport 池（要 lease、要主机密钥、要凭据）；telnet 是裸 TCP，
 /// 登录在流里发生，不碰池——两条路共用这一个命令入口，靠记录里的 `protocol` 分流。
-pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Result<SessionInfo, IpcError> {
+pub async fn open_remote_impl(
+    core: &Core,
+    host_id: HostId,
+    pty: PtySize,
+) -> Result<SessionInfo, IpcError> {
+    open_remote_with_term_impl(core, host_id, pty, None).await
+}
+
+/// 带 TERM 覆盖的打开入口。`open_remote_impl` 保持旧签名，测试与内部调用不必关心这个新参数。
+pub async fn open_remote_with_term_impl(
+    core: &Core,
+    host_id: HostId,
+    pty: PtySize,
+    term: Option<String>,
+) -> Result<SessionInfo, IpcError> {
     // 锁屏期间禁止新拨号：这是意图层的拦截，`build_plan` 里还有一道以原子值为准的兜底。
     core.require_unlocked()?;
     let record = core.host_of(&host_id)?;
@@ -37,12 +83,34 @@ pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Res
     let session = match record.protocol {
         Protocol::Telnet => {
             // 缺省端口取 telnet 的 23，不能沿用 SSH 的 22
-            let port = record.endpoint.port.or(Protocol::Telnet.default_port()).unwrap_or(23);
-            core.sessions.open_telnet(record.endpoint.host.clone(), port, pty, encoding, label, host_id.clone()).await?
+            let port = record
+                .endpoint
+                .port
+                .or(Protocol::Telnet.default_port())
+                .unwrap_or(23);
+            core.sessions
+                .open_telnet(
+                    record.endpoint.host.clone(),
+                    port,
+                    pty,
+                    encoding,
+                    label,
+                    host_id.clone(),
+                )
+                .await?
         }
         Protocol::Ssh => {
-            let key = key_of_record(&record);
-            let session = core.sessions.open_remote(key.clone(), DEFAULT_TERM.to_string(), pty, encoding, label).await?;
+            let jumps = {
+                let guard = core.vault.lock().unwrap_or_else(|p| p.into_inner());
+                jump_keys(&guard, &record)?
+            };
+            let key = key_of_record(&record, jumps);
+            let session = core
+                .sessions
+                .open_remote(key.clone(), term_or_default(term), pty, encoding, label)
+                .await?;
+            // 连上就把这台机器配置的端口转发拉起来；失败只发通知，不阻断会话
+            core.ensure_tunnels(&key, &record.tunnels).await;
             // 记录是「未知」时顺手探测远端真实系统（见 `crate::osdetect`）：一次借道的
             // exec，失败静默。手选过的不探测——省一次往返，也免得给「不覆盖」写两条路。
             if record.os == OsType::Unknown {
@@ -51,7 +119,13 @@ pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Res
             session
         }
         // 本机终端不该从「开远端」进来：它有自己的入口，且没有 host_id 可言
-        Protocol::Local => return Err(IpcError::new(ErrorCode::InvalidInput, "本机终端不走远端打开入口", false)),
+        Protocol::Local => {
+            return Err(IpcError::new(
+                ErrorCode::InvalidInput,
+                "本机终端不走远端打开入口",
+                false,
+            ))
+        }
     };
     Ok(session.info())
 }
@@ -60,17 +134,58 @@ pub async fn open_remote_impl(core: &Core, host_id: HostId, pty: PtySize) -> Res
 ///
 /// 面板要复用终端那条 transport 时，两边的键必须同构，所以这个函数是 `pub`，
 /// 而且只有一个入参——少一个入参就少一处可能算错的地方。
-pub fn key_of_record(record: &dbhx_model::HostRecord) -> TransportKey {
+pub fn key_of_record(record: &HostRecord, jumps: Vec<JumpKey>) -> TransportKey {
     let auth = dbhx_model::HostInfo::from_record(record).auth;
-    TransportKey::new(record.id.clone(), LiveEndpoint::from_endpoint(&record.endpoint), auth, record.keepalive_secs)
+    TransportKey::new(
+        record.id.clone(),
+        LiveEndpoint::from_endpoint(&record.endpoint),
+        auth,
+        record.keepalive_secs,
+        jumps,
+    )
+}
+
+/// 把记录里的跳板 id 展开成连接身份。只做一层：每个跳板自己的 `jump` 字段
+/// 不会被继续展开，选的列表就是完整链路，避免环和「以为多跳了其实没有」。
+pub fn jump_keys(vault: &Vault, record: &HostRecord) -> Result<Vec<JumpKey>, IpcError> {
+    let mut seen = HashSet::new();
+    seen.insert(record.id.clone());
+    let mut jumps = Vec::with_capacity(record.jump.len());
+    for id in &record.jump {
+        if !seen.insert(id.clone()) {
+            return Err(IpcError::new(
+                ErrorCode::InvalidInput,
+                "跳板链里有重复主机（或指回自己）",
+                false,
+            ));
+        }
+        let hop = vault.host(id).ok_or_else(|| {
+            IpcError::new(
+                ErrorCode::NotFound,
+                format!("跳板主机 {} 不存在", id.0),
+                false,
+            )
+        })?;
+        jumps.push(JumpKey {
+            host_id: hop.id.clone(),
+            endpoint: LiveEndpoint::from_endpoint(&hop.endpoint),
+        });
+    }
+    Ok(jumps)
 }
 
 pub async fn write_impl(core: &Core, session: SessionId, bytes: Vec<u8>) -> Result<(), IpcError> {
-    core.sessions.write(session, &bytes).await.map_err(Into::into)
+    core.sessions
+        .write(session, &bytes)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn resize_impl(core: &Core, session: SessionId, pty: PtySize) -> Result<(), IpcError> {
-    core.sessions.resize(session, &pty).await.map_err(Into::into)
+    core.sessions
+        .resize(session, &pty)
+        .await
+        .map_err(Into::into)
 }
 
 /// 关闭 tab。连接不会因此断开——idle park 归池管，见 `dbhx-session`。
@@ -114,8 +229,13 @@ pub async fn session_open_local(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn session_open_remote(core: State<'_>, host_id: HostId, pty: PtySize) -> Result<SessionInfo, IpcError> {
-    open_remote_impl(&core, host_id, pty).await
+pub async fn session_open_remote(
+    core: State<'_>,
+    host_id: HostId,
+    pty: PtySize,
+    term: Option<String>,
+) -> Result<SessionInfo, IpcError> {
+    open_remote_with_term_impl(&core, host_id, pty, term).await
 }
 
 /// 键盘输入。方向与输出相反：这里用 `Vec<u8>` 而不是 base64。
@@ -123,13 +243,21 @@ pub async fn session_open_remote(core: State<'_>, host_id: HostId, pty: PtySize)
 /// 而少一处编解码就少一处出错的可能。
 #[tauri::command]
 #[specta::specta]
-pub async fn session_write(core: State<'_>, session: SessionId, bytes: Vec<u8>) -> Result<(), IpcError> {
+pub async fn session_write(
+    core: State<'_>,
+    session: SessionId,
+    bytes: Vec<u8>,
+) -> Result<(), IpcError> {
     write_impl(&core, session, bytes).await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn session_resize(core: State<'_>, session: SessionId, pty: PtySize) -> Result<(), IpcError> {
+pub async fn session_resize(
+    core: State<'_>,
+    session: SessionId,
+    pty: PtySize,
+) -> Result<(), IpcError> {
     resize_impl(&core, session, pty).await
 }
 
@@ -159,7 +287,11 @@ mod tests {
             favorite: false,
             protocol: Protocol::Ssh,
             os: OsType::Linux,
-            endpoint: Endpoint { host: "10.0.0.1".into(), port: None, username: "app".into() },
+            endpoint: Endpoint {
+                host: "10.0.0.1".into(),
+                port: None,
+                username: "app".into(),
+            },
             auth_mode: AuthMode::Agent,
             identity_id: None,
             password_secret_id: None,
@@ -167,14 +299,32 @@ mod tests {
             encoding: TerminalEncoding::Utf8,
             created_at_ms: 1,
             updated_at_ms: 2,
+            jump: vec![],
+            tunnels: vec![],
         }
+    }
+
+    #[test]
+    fn a_blank_or_illegal_term_falls_back_to_the_default() {
+        assert_eq!(term_or_default(None), "xterm-256color");
+        assert_eq!(term_or_default(Some("  ".into())), "xterm-256color");
+        assert_eq!(term_or_default(Some("bad term!".into())), "xterm-256color");
+        assert_eq!(
+            term_or_default(Some("xterm".into())),
+            "xterm",
+            "合法值应当原样透传"
+        );
+        assert_eq!(
+            term_or_default(Some("screen-256color".into())),
+            "screen-256color"
+        );
     }
 
     #[test]
     fn missing_port_becomes_22_in_the_transport_key() {
         // 面板复用终端的连接全靠这个键：端口归一化不一致会另开一条 transport，
         // 于是「免二次登录」变成「多登录一次」
-        let key = key_of_record(&host());
+        let key = key_of_record(&host(), Vec::new());
         assert_eq!(key.endpoint.port, 22);
         assert_eq!(key.endpoint.host, "10.0.0.1");
         assert_eq!(key.auth, dbhx_model::AuthRef::Agent);
@@ -183,7 +333,13 @@ mod tests {
 
     #[test]
     fn local_spec_leaves_the_shell_to_the_platform() {
-        let spec = default_local_spec(Some("/tmp".into()), PtySize { rows: 40, cols: 120 });
+        let spec = default_local_spec(
+            Some("/tmp".into()),
+            PtySize {
+                rows: 40,
+                cols: 120,
+            },
+        );
         assert_eq!(spec.protocol, Protocol::Local);
         assert_eq!(spec.term, "xterm-256color");
         let local = LocalSpec::from_connect(&spec);
@@ -195,7 +351,9 @@ mod tests {
     async fn a_remote_open_for_an_unknown_host_is_not_retryable() {
         // 记录被删了以后还拿着旧 id 的 tab：重试不会凭空变出记录
         let (core, _rx) = crate::state::tests_harness("unknown-host", crate::state::fake_dialer());
-        let err = open_remote_impl(&core, HostId("gone".into()), PtySize::default()).await.unwrap_err();
+        let err = open_remote_impl(&core, HostId("gone".into()), PtySize::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(!err.retryable, "{}", err.message);
     }
@@ -203,11 +361,20 @@ mod tests {
     #[tokio::test]
     async fn a_local_session_shows_up_in_the_list_and_closes_again() {
         let (core, _rx) = crate::state::tests_harness("local-list", crate::state::fake_dialer());
-        let info = open_local_impl(&core, default_local_spec(None, PtySize::default()), "本地".into()).await.unwrap();
+        let info = open_local_impl(
+            &core,
+            default_local_spec(None, PtySize::default()),
+            "本地".into(),
+        )
+        .await
+        .unwrap();
         assert_eq!(info.protocol, Protocol::Local);
         assert_eq!(info.label, "本地");
         assert_eq!(list_impl(&core).len(), 1);
-        assert!(transport_of(&core, info.id).is_none(), "本地终端没有 transport");
+        assert!(
+            transport_of(&core, info.id).is_none(),
+            "本地终端没有 transport"
+        );
 
         close_impl(&core, info.id).await.unwrap();
         // 关闭是异步收尾：进程退出、读端 EOF、条目摘除串在一条链上，这里给它一点时间
@@ -224,7 +391,8 @@ mod tests {
     async fn opening_a_local_protocol_host_through_the_remote_entry_is_refused() {
         // 本机终端有自己的入口；万一有人把 protocol=local 存成主机记录再从「开远端」点它，
         // 也要干净拒绝，而不是拿 SSH 的拨号路径去撞一个不存在的连接。
-        let (core, _rx) = crate::state::tests_harness("local-through-remote", crate::state::fake_dialer());
+        let (core, _rx) =
+            crate::state::tests_harness("local-through-remote", crate::state::fake_dialer());
         let id = crate::commands::vault::upsert_host_impl(
             &core,
             crate::commands::vault::HostDraft {
@@ -234,8 +402,14 @@ mod tests {
                 tags: vec![],
                 favorite: false,
                 protocol: Protocol::Local,
+                jump: vec![],
+                tunnels: vec![],
                 os: OsType::Unknown,
-                endpoint: Endpoint { host: String::new(), port: None, username: String::new() },
+                endpoint: Endpoint {
+                    host: String::new(),
+                    port: None,
+                    username: String::new(),
+                },
                 auth_mode: AuthMode::Agent,
                 identity_id: None,
                 keepalive_secs: 0,
@@ -243,14 +417,18 @@ mod tests {
             },
         )
         .unwrap();
-        let err = open_remote_impl(&core, id, PtySize::default()).await.unwrap_err();
+        let err = open_remote_impl(&core, id, PtySize::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
     #[tokio::test]
     async fn writing_to_a_session_that_is_not_there_reports_the_right_code() {
         let (core, _rx) = crate::state::tests_harness("write-missing", crate::state::fake_dialer());
-        let err = write_impl(&core, SessionId(999), b"ls\r".to_vec()).await.unwrap_err();
+        let err = write_impl(&core, SessionId(999), b"ls\r".to_vec())
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(err.message.contains("999"), "{}", err.message);
     }

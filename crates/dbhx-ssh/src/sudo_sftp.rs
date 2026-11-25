@@ -134,7 +134,9 @@ pub(crate) fn validate_inputs(sudo_user: &str, password: &str) -> Result<(), Ssh
         return Err(SshError::InvalidInput("提权用户不能为空".into()));
     }
     if password.is_empty() {
-        return Err(SshError::InvalidInput("提权需要输入当前用户的 sudo 口令".into()));
+        return Err(SshError::InvalidInput(
+            "提权需要输入当前用户的 sudo 口令".into(),
+        ));
     }
     if password.len() > MAX_PASSWORD_BYTES {
         return Err(SshError::InvalidInput(format!(
@@ -162,7 +164,9 @@ enum Marker {
 /// 按字节而不是按字符串做：标记之前到达的是远端文本，但 pty 上什么编码都可能出现，
 /// 用 `from_utf8_lossy` 之后的偏移量和原始字节已经对不上了。
 fn marker_state(heard: &[u8]) -> Marker {
-    let Some(at) = find_marker(heard) else { return Marker::Absent };
+    let Some(at) = find_marker(heard) else {
+        return Marker::Absent;
+    };
     let rest = &heard[at + READY_MARKER.len()..];
     let tail = match rest {
         // 标记刚到行尾；`[b'\r']` 是 `\r\n` 的第二个字节还在下一个报文里
@@ -171,7 +175,11 @@ fn marker_state(heard: &[u8]) -> Marker {
         // 标记后面连换行都没等到就跟了别的东西，一样不干净
         _ => return Marker::Dirty,
     };
-    if tail.is_empty() { Marker::Ready } else { Marker::Dirty }
+    if tail.is_empty() {
+        Marker::Ready
+    } else {
+        Marker::Dirty
+    }
 }
 
 /// 找**站在行首**的就绪标记。
@@ -210,7 +218,8 @@ pub fn classify_elevate_failure(text: &str, password: &str) -> String {
     if lower.contains("is not a setuid program") || lower.contains("must be owned by uid") {
         return "远端 sudo 的属主或权限不正确，提权失败".to_string();
     }
-    if lower.contains("command not found") || lower.contains("dbhx-elevate: cannot create temp dir") {
+    if lower.contains("command not found") || lower.contains("dbhx-elevate: cannot create temp dir")
+    {
         return "远端提权环境不完整（缺 sudo 或 mktemp），提权失败".to_string();
     }
     // sudo 的原文是「N incorrect password attempt(s)」，单复数都要认得住
@@ -305,7 +314,9 @@ async fn await_channel_success(
         match recv(channel, endpoint, password, &[]).await? {
             ChannelMsg::Success => return Ok(()),
             ChannelMsg::Failure => {
-                return Err(SshError::ElevateDenied("远端 sshd 拒绝了提权所需的终端请求".into()));
+                return Err(SshError::ElevateDenied(
+                    "远端 sshd 拒绝了提权所需的终端请求".into(),
+                ));
             }
             ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
                 tracing::debug!(count = data.len(), "pty 确认前收到意外数据，已丢弃");
@@ -379,7 +390,12 @@ async fn await_ready(
 /// 而这条连接明明活着、只是提权没被确认。用户看见「超时」会去查网络，实际该查的是远端 sudo。
 ///
 /// `heard` 是已经收到的喊话，只用于日志与失败定性；pty 阶段传空切片。
-async fn recv(channel: &mut Channel<Msg>, endpoint: &LiveEndpoint, password: &str, heard: &[u8]) -> Result<ChannelMsg, SshError> {
+async fn recv(
+    channel: &mut Channel<Msg>,
+    endpoint: &LiveEndpoint,
+    password: &str,
+    heard: &[u8],
+) -> Result<ChannelMsg, SshError> {
     match timeout(ELEVATE_TIMEOUT, channel.wait()).await {
         Err(_elapsed) => {
             tracing::debug!(
@@ -393,7 +409,11 @@ async fn recv(channel: &mut Channel<Msg>, endpoint: &LiveEndpoint, password: &st
         }
         Ok(Some(msg)) => Ok(msg),
         // 通道尽头：`wait()` 把 Eof/Close 都收成 None
-        Ok(None) => Err(denied(heard, password, "远端在提权过程中关闭了通道，未给出原因")),
+        Ok(None) => Err(denied(
+            heard,
+            password,
+            "远端在提权过程中关闭了通道，未给出原因",
+        )),
     }
 }
 
@@ -402,7 +422,10 @@ fn denied(heard: &[u8], password: &str, fallback: &str) -> SshError {
     if heard.iter().all(u8::is_ascii_whitespace) {
         return SshError::ElevateDenied(fallback.to_string());
     }
-    SshError::ElevateDenied(classify_elevate_failure(&String::from_utf8_lossy(heard), password))
+    SshError::ElevateDenied(classify_elevate_failure(
+        &String::from_utf8_lossy(heard),
+        password,
+    ))
 }
 
 #[cfg(test)]
@@ -456,7 +479,10 @@ mod tests {
             .expect("标记要由远端 echo 出来");
         let sudo_at = cmd.find("sudo -k -A").expect("必须有 sudo");
         assert!(echo_at > sudo_at, "echo 必须在 sudo 之后：{cmd}");
-        assert!(cmd.contains("exec \"$0\""), "打印完就换成 sftp-server，不能多留一个 shell：{cmd}");
+        assert!(
+            cmd.contains("exec \"$0\""),
+            "打印完就换成 sftp-server，不能多留一个 shell：{cmd}"
+        );
         assert!(cmd.contains("\"$srv\""), "{cmd}");
     }
 
@@ -466,7 +492,8 @@ mod tests {
         // 是同一条字节流——日志一进来，SFTP 报文就毁了。
         let cmd = build_exec_command("root");
         assert!(
-            !cmd.split(|c: char| c.is_whitespace() || c == ';').any(|tok| tok == "-e"),
+            !cmd.split(|c: char| c.is_whitespace() || c == ';')
+                .any(|tok| tok == "-e"),
             "提权起的 sftp-server 不能带 -e：{cmd}"
         );
     }
@@ -508,11 +535,19 @@ mod tests {
     fn overlong_or_empty_inputs_are_refused_locally() {
         // 空口令在远端的症状是「卡住直到超时」，超长是「明明对却失败」，都不如当场拒
         let too_long = "x".repeat(MAX_PASSWORD_BYTES + 1);
-        let cases: [(&str, &str); 4] =
-            [("", "hunter2"), ("  ", "hunter2"), ("root", ""), ("root", &too_long)];
+        let cases: [(&str, &str); 4] = [
+            ("", "hunter2"),
+            ("  ", "hunter2"),
+            ("root", ""),
+            ("root", &too_long),
+        ];
         for (user, password) in cases {
             let err = validate_inputs(user, password).expect_err("这一组必须在本地被拒");
-            assert!(matches!(err, SshError::InvalidInput(_)), "user={user:?} 长度={}：{err:?}", password.len());
+            assert!(
+                matches!(err, SshError::InvalidInput(_)),
+                "user={user:?} 长度={}：{err:?}",
+                password.len()
+            );
         }
         assert!(validate_inputs("root", &"x".repeat(MAX_PASSWORD_BYTES)).is_ok());
     }
@@ -577,7 +612,10 @@ mod tests {
     #[test]
     fn missing_sudo_is_not_blamed_on_the_user() {
         let msg = classify("bash: sudo: command not found");
-        assert!(msg.contains("没有安装 sudo") || msg.contains("环境不完整"), "{msg}");
+        assert!(
+            msg.contains("没有安装 sudo") || msg.contains("环境不完整"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -593,7 +631,10 @@ mod tests {
     fn an_unrecognised_sudo_line_keeps_the_remote_text_but_redacts_it() {
         let msg = classify("sudo: pam_tally2: something we have never seen about hunter2");
         assert!(msg.contains("远端 sudo 报错"), "{msg}");
-        assert!(msg.contains("pam_tally2"), "原文要留住，别替用户编原因：{msg}");
+        assert!(
+            msg.contains("pam_tally2"),
+            "原文要留住，别替用户编原因：{msg}"
+        );
         assert!(!msg.contains("hunter2"), "{msg}");
     }
 
@@ -601,7 +642,7 @@ mod tests {
     fn total_silence_still_gets_a_chinese_reason() {
         let msg = classify("");
         assert!(!msg.is_empty());
-        assert!(msg.chars().any(|c| c >= '一' && c <= '龥'), "{msg}");
+        assert!(msg.chars().any(|c| ('一'..='龥').contains(&c)), "{msg}");
     }
 
     #[test]

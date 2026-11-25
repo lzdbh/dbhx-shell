@@ -1,0 +1,14 @@
+[package]
+name = "dbhx-forward"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "本地/动态端口转发：监听本机端口，把连接经一条已认证的通道送去远端"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

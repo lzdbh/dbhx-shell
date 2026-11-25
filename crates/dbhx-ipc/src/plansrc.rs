@@ -13,8 +13,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use dbhx_model::{HostKeyDecision, KnownHost, KnownHostSource, LiveEndpoint, now_ms};
-use dbhx_ssh::{HostKeyVerifier, ServerKey, pattern_of};
+use dbhx_model::{now_ms, HostKeyDecision, KnownHost, KnownHostSource, LiveEndpoint};
+use dbhx_ssh::{pattern_of, HostKeyVerifier, ServerKey};
 use dbhx_vault::KnownHosts;
 use tokio::sync::mpsc;
 
@@ -28,7 +28,11 @@ pub struct VaultVerifier {
 }
 
 impl VaultVerifier {
-    pub fn new(known: Arc<Mutex<KnownHosts>>, awaits: Arc<Awaits>, bus: mpsc::Sender<BusEvent>) -> Self {
+    pub fn new(
+        known: Arc<Mutex<KnownHosts>>,
+        awaits: Arc<Awaits>,
+        bus: mpsc::Sender<BusEvent>,
+    ) -> Self {
         Self { known, awaits, bus }
     }
 
@@ -42,18 +46,24 @@ impl VaultVerifier {
         match decision {
             HostKeyDecision::Trusted => true,
             HostKeyDecision::Changed { stored, .. } => {
-                let _ = self.bus.send(BusEvent::HostKeyConflict(HostKeyConflict {
-                    endpoint: endpoint_of(&presented),
-                    stored: *stored,
-                    presented: presented.clone(),
-                }))
-                .await;
+                let _ = self
+                    .bus
+                    .send(BusEvent::HostKeyConflict(HostKeyConflict {
+                        endpoint: endpoint_of(&presented),
+                        stored: *stored,
+                        presented: presented.clone(),
+                    }))
+                    .await;
                 false
             }
             HostKeyDecision::Unknown { pending } => {
                 let endpoint = endpoint_of(&presented);
                 let (id, rx) = self.awaits.register();
-                let event = BusEvent::HostKeyPending(HostKeyPending { request: id, endpoint, presented: *pending });
+                let event = BusEvent::HostKeyPending(HostKeyPending {
+                    request: id,
+                    endpoint,
+                    presented: *pending,
+                });
                 if self.bus.send(event).await.is_err() {
                     self.awaits.drop_request(id);
                     return false;
@@ -113,11 +123,22 @@ fn endpoint_of(host: &KnownHost) -> LiveEndpoint {
     let (h, port) = match host.pattern.strip_prefix('[') {
         Some(rest) => rest
             .split_once(']')
-            .map(|(h, tail)| (h.to_string(), tail.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(22)))
+            .map(|(h, tail)| {
+                (
+                    h.to_string(),
+                    tail.strip_prefix(':')
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(22),
+                )
+            })
             .unwrap_or_else(|| (host.pattern.clone(), 22)),
         None => (host.pattern.clone(), 22),
     };
-    LiveEndpoint { host: h, port, username: String::new() }
+    LiveEndpoint {
+        host: h,
+        port,
+        username: String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -127,27 +148,49 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dbhx-ipc-verify-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dbhx-ipc-verify-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     fn key(b64: &str) -> ServerKey {
-        ServerKey { algorithm: "ssh-ed25519".into(), base64_key: b64.into(), fingerprint: "SHA256:xx".into(), is_certificate: false }
+        ServerKey {
+            algorithm: "ssh-ed25519".into(),
+            base64_key: b64.into(),
+            fingerprint: "SHA256:xx".into(),
+            is_certificate: false,
+        }
     }
 
     fn endpoint(host: &str, port: u16) -> LiveEndpoint {
-        LiveEndpoint { host: host.into(), port, username: "app".into() }
+        LiveEndpoint {
+            host: host.into(),
+            port,
+            username: "app".into(),
+        }
     }
 
     /// 起一套「verifier + 事件队列 + 回答通道」，不碰网络也不起 webview。
-    fn harness(tag: &str) -> (VaultVerifier, mpsc::Receiver<BusEvent>, Arc<Awaits>, Arc<Mutex<KnownHosts>>) {
+    fn harness(
+        tag: &str,
+    ) -> (
+        VaultVerifier,
+        mpsc::Receiver<BusEvent>,
+        Arc<Awaits>,
+        Arc<Mutex<KnownHosts>>,
+    ) {
         let dir = temp_dir(tag);
         let _ = std::fs::remove_file(dir.join("known_hosts"));
         let known = Arc::new(Mutex::new(KnownHosts::load(&dir).unwrap()));
         let awaits = Arc::new(Awaits::default());
         let (tx, rx) = mpsc::channel(32);
-        (VaultVerifier::new(Arc::clone(&known), Arc::clone(&awaits), tx), rx, awaits, known)
+        (
+            VaultVerifier::new(Arc::clone(&known), Arc::clone(&awaits), tx),
+            rx,
+            awaits,
+            known,
+        )
     }
 
     /// 在别的任务里替用户点按钮。返回 JoinHandle 是为了让调用方 await 它，
@@ -186,7 +229,10 @@ mod tests {
         let responder = answer_when_pending(rx, Arc::clone(&awaits), UserAnswerFactory::Accept);
         let presented = known_host_of(&endpoint("db1", 22), &key("AAAAB3"));
 
-        assert!(verifier.decide(presented.clone()).await, "用户确认后必须放行");
+        assert!(
+            verifier.decide(presented.clone()).await,
+            "用户确认后必须放行"
+        );
         let event = responder.await.unwrap();
         match event {
             BusEvent::HostKeyPending(p) => {
@@ -198,7 +244,12 @@ mod tests {
         }
         // 先落盘再放行：这条连接之后即使失败，也不该再问第二遍
         assert_eq!(known.lock().unwrap().entries().len(), 1);
-        assert_eq!(std::fs::read_to_string(temp_dir("unknown").join("known_hosts")).unwrap().trim(), "db1 ssh-ed25519 AAAAB3");
+        assert_eq!(
+            std::fs::read_to_string(temp_dir("unknown").join("known_hosts"))
+                .unwrap()
+                .trim(),
+            "db1 ssh-ed25519 AAAAB3"
+        );
         assert_eq!(awaits.pending(), 0, "回答之后请求要从表里消失");
     }
 
@@ -209,7 +260,11 @@ mod tests {
             let mut guard = known.lock().unwrap();
             guard.trust(known_host_of(&endpoint("db5", 22), &key("SAME")));
         }
-        assert!(verifier.decide(known_host_of(&endpoint("db5", 22), &key("SAME"))).await);
+        assert!(
+            verifier
+                .decide(known_host_of(&endpoint("db5", 22), &key("SAME")))
+                .await
+        );
         assert_eq!(awaits.pending(), 0, "已信任的主机不该再登记询问");
         assert!(rx.try_recv().is_err(), "一条消息都不该发出去");
     }
@@ -218,9 +273,17 @@ mod tests {
     async fn cancelling_the_prompt_leaves_no_trust_behind() {
         let (verifier, rx, awaits, known) = harness("cancel");
         let responder = answer_when_pending(rx, Arc::clone(&awaits), UserAnswerFactory::Refuse);
-        assert!(!verifier.decide(known_host_of(&endpoint("db4", 22), &key("CCCC"))).await, "用户取消就是不放行");
+        assert!(
+            !verifier
+                .decide(known_host_of(&endpoint("db4", 22), &key("CCCC")))
+                .await,
+            "用户取消就是不放行"
+        );
         responder.await.unwrap();
-        assert!(known.lock().unwrap().entries().is_empty(), "取消不能留下信任记录");
+        assert!(
+            known.lock().unwrap().entries().is_empty(),
+            "取消不能留下信任记录"
+        );
     }
 
     #[tokio::test]
@@ -230,9 +293,15 @@ mod tests {
             let mut guard = known.lock().unwrap();
             guard.trust(known_host_of(&endpoint("db3", 22), &key("OLDKEY")));
         }
-        let decided = verifier.decide(known_host_of(&endpoint("db3", 22), &key("NEWKEY"))).await;
+        let decided = verifier
+            .decide(known_host_of(&endpoint("db3", 22), &key("NEWKEY")))
+            .await;
         assert!(!decided, "密钥变更必须阻断");
-        assert_eq!(awaits.pending(), 0, "变更不该发起确认请求——没有「仍然连接」这个选项");
+        assert_eq!(
+            awaits.pending(),
+            0,
+            "变更不该发起确认请求——没有「仍然连接」这个选项"
+        );
         match rx.recv().await {
             Some(BusEvent::HostKeyConflict(e)) => {
                 assert_eq!(e.stored.base64_key, "OLDKEY");
@@ -249,7 +318,10 @@ mod tests {
     #[test]
     fn pattern_and_endpoint_round_trip_through_the_known_hosts_format() {
         let host = known_host_of(&endpoint("db1", 2222), &key("AAAA"));
-        assert_eq!(host.pattern, "[db1]:2222", "非默认端口必须按 OpenSSH 写法带方括号");
+        assert_eq!(
+            host.pattern, "[db1]:2222",
+            "非默认端口必须按 OpenSSH 写法带方括号"
+        );
         let back = endpoint_of(&host);
         assert_eq!((back.host.as_str(), back.port), ("db1", 2222));
 
@@ -259,8 +331,8 @@ mod tests {
     }
 
     #[test]
-    fn master_key_source_is_a_file_in_the_app_dir() {
-        // 只是把「生产用哪把主密钥」这个决定写进测试，防止哪天悄悄换成 Memory
+    fn file_key_source_remains_a_working_fallback() {
+        // 生产首选系统钥匙串（`Vault::open_default`）；File 是无钥匙串环境的兜底。
         let dir = temp_dir("keystore");
         let source = KeySource::File(dir.join("master.key"));
         let key = source.load_or_create().unwrap();

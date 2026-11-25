@@ -18,15 +18,24 @@ use std::time::Duration;
 
 use dbhx_ipc::commands::log::{start_impl as start_log_impl, stop_impl as stop_log_impl};
 use dbhx_ipc::commands::session::{close_impl as close_session_impl, open_remote_impl, write_impl};
-use dbhx_ipc::commands::sftp::{browse_impl, chmod_impl, close_impl as close_panel_impl, create_file_impl, mkdir_impl, open_elevated_impl, open_for_session_impl, rename_impl, set_following_impl};
+use dbhx_ipc::commands::sftp::{
+    browse_impl, chmod_impl, close_impl as close_panel_impl, create_file_impl, mkdir_impl,
+    open_elevated_impl, open_for_session_impl, rename_impl, set_following_impl,
+};
 use dbhx_ipc::commands::transfer::download_impl;
-use dbhx_ipc::commands::vault::{HostDraft, UserReply, reply_impl, set_password_impl, upsert_host_impl};
+use dbhx_ipc::commands::vault::{
+    reply_impl, set_password_impl, upsert_host_impl, HostDraft, UserReply,
+};
 use dbhx_ipc::events::{BusEvent, FollowHold, TermData};
 use dbhx_ipc::hub;
-use dbhx_ipc::state::{BUS_QUEUE, Core};
-use dbhx_model::{AuthMode, Endpoint, ErrorCode, FileKind, KnownHost, KnownHostSource, OsType, Protocol, PtySize, TerminalEncoding};
+use dbhx_ipc::state::{Core, BUS_QUEUE};
+use dbhx_model::{
+    AuthMode, Endpoint, ErrorCode, FileKind, KnownHost, KnownHostSource, OsType, Protocol, PtySize,
+    TerminalEncoding, TunnelKind, TunnelSpec,
+};
 use dbhx_ssh::pattern_of;
-use dbhx_testsrv::{HOST_KEY_ALGO, HOST_KEY_B64, TestServer, TestSpec, sample_fs};
+use dbhx_testsrv::{sample_fs, TestServer, TestSpec, HOST_KEY_ALGO, HOST_KEY_B64};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
@@ -36,17 +45,22 @@ const BUDGET: Duration = Duration::from_secs(15);
 /// 起一套与生产同构的装配（真实 SSH 拨号器），并接上唯一的会话事件读者。
 fn live_core(tag: &str) -> (Arc<Core>, mpsc::Receiver<BusEvent>) {
     let (tx, rx) = mpsc::channel(BUS_QUEUE);
-    let core = Core::production(scratch(tag), tx).expect("Core 装配失败");
-    assert!(hub::spawn(Arc::clone(&core)), "会话事件读者只能有一个，起不来说明装配重复");
+    let core = Core::production_for_test(scratch(tag), tx).expect("Core 装配失败");
+    assert!(
+        hub::spawn(Arc::clone(&core)),
+        "会话事件读者只能有一个，起不来说明装配重复"
+    );
     (core, rx)
 }
 
 /// 用例之间互不踩目录：vault、known_hosts 与下载落盘都会跨用例残留。
 fn scratch(tag: &str) -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir()
-        .join("dbhx-ipc-live")
-        .join(format!("{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let dir = std::env::temp_dir().join("dbhx-ipc-live").join(format!(
+        "{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -64,14 +78,22 @@ fn trust_the_server(core: &Arc<Core>, server: &TestServer) {
         added_at_ms: 0,
         source: KnownHostSource::UserConfirmed,
     };
-    core.known.lock().unwrap_or_else(|p| p.into_inner()).trust(host);
+    core.known
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .trust(host);
 }
 
 /// 取出第一个满足条件的事件。
 ///
 /// 途中遇到主机密钥询问就代用户点「信任并保存」：本用例关心的不是这一段，
 /// 但拨号会一直等在那里，不把答案送回去只会变成超时。
-async fn await_event<F>(core: &Arc<Core>, rx: &mut mpsc::Receiver<BusEvent>, what: &str, pred: F) -> BusEvent
+async fn await_event<F>(
+    core: &Arc<Core>,
+    rx: &mut mpsc::Receiver<BusEvent>,
+    what: &str,
+    pred: F,
+) -> BusEvent
 where
     F: Fn(&BusEvent) -> bool,
 {
@@ -85,7 +107,8 @@ where
             return event;
         }
         if let BusEvent::HostKeyPending(pending) = &event {
-            reply_impl(core.as_ref(), pending.request, UserReply::Confirmed).expect("代用户确认主机密钥失败");
+            reply_impl(core.as_ref(), pending.request, UserReply::Confirmed)
+                .expect("代用户确认主机密钥失败");
         }
     }
 }
@@ -107,11 +130,17 @@ fn draft(server: &TestServer) -> HostDraft {
         favorite: false,
         protocol: Protocol::Ssh,
         os: OsType::Linux,
-        endpoint: Endpoint { host: server.host(), port: Some(server.port()), username: "app".into() },
+        endpoint: Endpoint {
+            host: server.host(),
+            port: Some(server.port()),
+            username: "app".into(),
+        },
         auth_mode: AuthMode::Password,
         identity_id: None,
         keepalive_secs: 0,
         encoding: TerminalEncoding::Utf8,
+        jump: vec![],
+        tunnels: vec![],
     }
 }
 
@@ -123,12 +152,22 @@ fn register_host(core: &Arc<Core>, server: &TestServer) -> dbhx_model::HostId {
 /// 按给定草案登记（口令统一用测试口令）。要试「未知系统」这类变体的用例走它。
 fn register_with(core: &Arc<Core>, draft: HostDraft) -> dbhx_model::HostId {
     let id = upsert_host_impl(core.as_ref(), draft).unwrap();
-    set_password_impl(core.as_ref(), id.clone(), Zeroizing::new("dbhx-test".to_string())).unwrap();
+    set_password_impl(
+        core.as_ref(),
+        id.clone(),
+        Zeroizing::new("dbhx-test".to_string()),
+    )
+    .unwrap();
     id
 }
 
 async fn started_server() -> TestServer {
     server_running(TestSpec::new().with_fs(sample_fs())).await
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("拿不到空闲端口");
+    listener.local_addr().expect("取不到端口").port()
 }
 
 async fn server_running(spec: TestSpec) -> TestServer {
@@ -142,58 +181,126 @@ async fn terminal_cd_then_panel_then_download_reuse_one_login() {
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
-        .await
-        .expect("远端 shell 应当开起来");
+    let session = open_remote_impl(
+        core.as_ref(),
+        host_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("远端 shell 应当开起来");
 
     // 提示符本身就带一次 OSC 7：先确认字节流真的经过了 hub
     await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
 
-    write_impl(core.as_ref(), session.id, b"cd /home/app/logs\r".to_vec()).await.unwrap();
-    await_event(&core, &mut rx, "终端切换目录", cwd_reported("/home/app/logs")).await;
+    write_impl(core.as_ref(), session.id, b"cd /home/app/logs\r".to_vec())
+        .await
+        .unwrap();
+    await_event(
+        &core,
+        &mut rx,
+        "终端切换目录",
+        cwd_reported("/home/app/logs"),
+    )
+    .await;
 
     // 从终端开面板：复用那条 transport，服务端不该看到第二次认证
-    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
-    assert_eq!(panel.listing.path, "/home/app/logs", "面板要停在终端报过的目录");
-    assert_eq!(server.observed().auth_attempts.len(), 1, "开面板绝不能重新登录");
+    let panel = open_for_session_impl(core.as_ref(), session.id)
+        .await
+        .expect("面板应当免登录打开");
+    assert_eq!(
+        panel.listing.path, "/home/app/logs",
+        "面板要停在终端报过的目录"
+    );
+    assert_eq!(
+        server.observed().auth_attempts.len(),
+        1,
+        "开面板绝不能重新登录"
+    );
 
-    let refreshed = browse_impl(core.as_ref(), panel.connection, None).await.unwrap();
-    assert_eq!(refreshed.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["app.log"]);
+    let refreshed = browse_impl(core.as_ref(), panel.connection, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        ["app.log"]
+    );
 
     // 下载：相对路径按面板当前目录解析，收尾事件的字节数要等于文件真实长度
     let dest = scratch("download");
-    let batch =
-        download_impl(&core, panel.connection, vec!["app.log".to_string()], dest.display().to_string()).await.expect("批次应当起跑");
+    let batch = download_impl(
+        &core,
+        panel.connection,
+        vec!["app.log".to_string()],
+        dest.display().to_string(),
+        Some(dbhx_model::ConflictPolicy::Overwrite),
+    )
+    .await
+    .expect("批次应当起跑");
     let ended = match await_event(&core, &mut rx, "传输收尾", batch_ended(batch)).await {
         BusEvent::TransferBatchEnded(t) => t,
         other => panic!("期望批次收尾事件，收到 {other:?}"),
     };
-    assert_eq!((ended.completed, ended.failed, ended.cancelled), (1, 0, 0), "一个文件该成一次");
+    assert_eq!(
+        (ended.completed, ended.failed, ended.cancelled),
+        (1, 0, 0),
+        "一个文件该成一次"
+    );
     assert_eq!(ended.bytes, 14, "收尾字节数错了就是引擎与命令层对不上");
     assert_eq!(ended.error, None, "{:?}", ended.error);
-    assert_eq!(std::fs::read(dest.join("app.log")).unwrap(), b"line-1\nline-2\n", "落盘内容必须与服务器一致");
+    assert_eq!(
+        std::fs::read(dest.join("app.log")).unwrap(),
+        b"line-1\nline-2\n",
+        "落盘内容必须与服务器一致"
+    );
 
     // 面板还开着，终端再 `cd` 一次。但用户刚才手动浏览过面板，于是这次跳转必须**被压住**——
     // 「点了目录结果自己跳回去」正是参考实现里被投诉过的行为。
-    write_impl(core.as_ref(), session.id, b"cd /home/app\r".to_vec()).await.unwrap();
+    write_impl(core.as_ref(), session.id, b"cd /home/app\r".to_vec())
+        .await
+        .unwrap();
     await_event(&core, &mut rx, "终端切换目录", cwd_reported("/home/app")).await;
-    let held = match await_event(&core, &mut rx, "手动浏览后的锁定", |e| {
-        matches!(e, BusEvent::SftpFollowed(f) if f.listing.is_none() && f.hold.is_some())
-    })
+    let held = match await_event(
+        &core,
+        &mut rx,
+        "手动浏览后的锁定",
+        |e| matches!(e, BusEvent::SftpFollowed(f) if f.listing.is_none() && f.hold.is_some()),
+    )
     .await
     {
         BusEvent::SftpFollowed(f) => f.hold,
         other => panic!("期望面板停在原处，收到 {other:?}"),
     };
     assert!(matches!(held, Some(FollowHold::UserLocked)), "{held:?}");
-    assert_eq!(core.panel_shown(panel.connection).as_deref(), Some("/home/app/logs"), "锁定期内面板不能动");
+    assert_eq!(
+        core.panel_shown(panel.connection).as_deref(),
+        Some("/home/app/logs"),
+        "锁定期内面板不能动"
+    );
 
     // 用户重新打开跟随 ⇒ 立刻补上期间被压住的那次跳转
-    let followed = set_following_impl(core.as_ref(), panel.connection, true).await.unwrap();
-    assert_eq!(followed.listing.as_ref().map(|l| l.path.as_str()), Some("/home/app"), "恢复跟随时要补跳");
-    assert_eq!(core.panel_shown(panel.connection).as_deref(), Some("/home/app"));
+    let followed = set_following_impl(core.as_ref(), panel.connection, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        followed.listing.as_ref().map(|l| l.path.as_str()),
+        Some("/home/app"),
+        "恢复跟随时要补跳"
+    );
+    assert_eq!(
+        core.panel_shown(panel.connection).as_deref(),
+        Some("/home/app")
+    );
 
-    close_panel_impl(core.as_ref(), panel.connection).await.unwrap();
+    close_panel_impl(core.as_ref(), panel.connection)
+        .await
+        .unwrap();
     close_session_impl(core.as_ref(), session.id).await.unwrap();
     server.shutdown().await;
 }
@@ -210,40 +317,92 @@ async fn the_elevated_panel_shares_the_login_and_keeps_the_directory() {
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
-        .await
-        .expect("远端 shell 应当开起来");
+    let session = open_remote_impl(
+        core.as_ref(),
+        host_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("远端 shell 应当开起来");
     await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
-    write_impl(core.as_ref(), session.id, b"cd /home/app/logs\r".to_vec()).await.unwrap();
-    await_event(&core, &mut rx, "终端切换目录", cwd_reported("/home/app/logs")).await;
-    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
-
-    let root = open_elevated_impl(core.as_ref(), panel.connection, "root".into(), Zeroizing::new("dbhx-test".into()))
+    write_impl(core.as_ref(), session.id, b"cd /home/app/logs\r".to_vec())
         .await
-        .expect("提权面板应当开起来");
+        .unwrap();
+    await_event(
+        &core,
+        &mut rx,
+        "终端切换目录",
+        cwd_reported("/home/app/logs"),
+    )
+    .await;
+    let panel = open_for_session_impl(core.as_ref(), session.id)
+        .await
+        .expect("面板应当免登录打开");
 
-    assert_eq!(root.sudo_user.as_deref(), Some("root"), "面板要带上它是以谁的身份在读写");
-    assert_ne!(root.connection, panel.connection, "提权面板要占另一个号，不能把普通面板顶掉");
-    assert_eq!(root.listing.path, "/home/app/logs", "提权后停在用户正看着的目录，不是 root 的家目录");
-    assert_eq!(root.following, false, "提权面板默认不跟终端的命令行跑");
+    let root = open_elevated_impl(
+        core.as_ref(),
+        panel.connection,
+        "root".into(),
+        Zeroizing::new("dbhx-test".into()),
+    )
+    .await
+    .expect("提权面板应当开起来");
+
+    assert_eq!(
+        root.sudo_user.as_deref(),
+        Some("root"),
+        "面板要带上它是以谁的身份在读写"
+    );
+    assert_ne!(
+        root.connection, panel.connection,
+        "提权面板要占另一个号，不能把普通面板顶掉"
+    );
+    assert_eq!(
+        root.listing.path, "/home/app/logs",
+        "提权后停在用户正看着的目录，不是 root 的家目录"
+    );
+    assert!(!root.following, "提权面板默认不跟终端的命令行跑");
     assert_eq!(core.panels.lock().unwrap().len(), 2, "两个面板要同时在表里");
-    assert_eq!(server.observed().auth_attempts.len(), 1, "提权绝不能重新登录");
+    assert_eq!(
+        server.observed().auth_attempts.len(),
+        1,
+        "提权绝不能重新登录"
+    );
 
     // 口令走的是通道数据，不进远端命令行：两头都断言，缺一头都抓不住另一半 bug
     let seen = server.observed();
-    assert_eq!(seen.sudo_passwords, vec!["dbhx-test".to_string()], "sudo 要拿到口令");
-    assert!(seen.execs.iter().all(|c| !c.contains("dbhx-test")), "命令行里不许出现口令：{:?}", seen.execs);
+    assert_eq!(
+        seen.sudo_passwords,
+        vec!["dbhx-test".to_string()],
+        "sudo 要拿到口令"
+    );
+    assert!(
+        seen.execs.iter().all(|c| !c.contains("dbhx-test")),
+        "命令行里不许出现口令：{:?}",
+        seen.execs
+    );
 
     // 提权面板上照常列目录
-    let refreshed = browse_impl(core.as_ref(), root.connection, None).await.unwrap();
+    let refreshed = browse_impl(core.as_ref(), root.connection, None)
+        .await
+        .unwrap();
     assert_eq!(refreshed.path, "/home/app/logs");
 
     // 关掉提权面板不影响普通面板：它还留着，号也没被顺手销掉
-    close_panel_impl(core.as_ref(), root.connection).await.unwrap();
+    close_panel_impl(core.as_ref(), root.connection)
+        .await
+        .unwrap();
     assert_eq!(core.panels.lock().unwrap().len(), 1);
-    assert!(browse_impl(core.as_ref(), panel.connection, None).await.is_ok());
+    assert!(browse_impl(core.as_ref(), panel.connection, None)
+        .await
+        .is_ok());
 
-    close_panel_impl(core.as_ref(), panel.connection).await.unwrap();
+    close_panel_impl(core.as_ref(), panel.connection)
+        .await
+        .unwrap();
     close_session_impl(core.as_ref(), session.id).await.unwrap();
     server.shutdown().await;
 }
@@ -260,22 +419,51 @@ async fn a_refused_sudo_is_reported_and_never_degrades_to_the_plain_identity() {
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize::default()).await.expect("shell 应当开起来");
-    await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
-    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
-
-    let err = open_elevated_impl(core.as_ref(), panel.connection, "root".into(), Zeroizing::new("dbhx-test".into()))
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize::default())
         .await
-        .expect_err("sudoers 拒绝了就不该有面板");
+        .expect("shell 应当开起来");
+    await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
+    let panel = open_for_session_impl(core.as_ref(), session.id)
+        .await
+        .expect("面板应当免登录打开");
+
+    let err = open_elevated_impl(
+        core.as_ref(),
+        panel.connection,
+        "root".into(),
+        Zeroizing::new("dbhx-test".into()),
+    )
+    .await
+    .expect_err("sudoers 拒绝了就不该有面板");
     assert_eq!(err.code, ErrorCode::PermissionDenied, "{:?}", err.code);
     assert!(err.message.contains("不允许"), "要说人话：{}", err.message);
-    assert!(!err.retryable, "远端 sudoers 不会因为再点一次就变：{}", err.message);
-    assert!(!err.message.contains("dbhx-test"), "错误文案里不能出现口令：{}", err.message);
+    assert!(
+        !err.retryable,
+        "远端 sudoers 不会因为再点一次就变：{}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("dbhx-test"),
+        "错误文案里不能出现口令：{}",
+        err.message
+    );
 
-    assert_eq!(core.panels.lock().unwrap().len(), 1, "失败绝不能留下第二个面板");
-    assert_eq!(browse_impl(core.as_ref(), panel.connection, None).await.unwrap().path, "/home/app");
+    assert_eq!(
+        core.panels.lock().unwrap().len(),
+        1,
+        "失败绝不能留下第二个面板"
+    );
+    assert_eq!(
+        browse_impl(core.as_ref(), panel.connection, None)
+            .await
+            .unwrap()
+            .path,
+        "/home/app"
+    );
 
-    close_panel_impl(core.as_ref(), panel.connection).await.unwrap();
+    close_panel_impl(core.as_ref(), panel.connection)
+        .await
+        .unwrap();
     close_session_impl(core.as_ref(), session.id).await.unwrap();
     server.shutdown().await;
 }
@@ -290,21 +478,38 @@ async fn untrusted_host_key_is_asked_once_then_persisted() {
     // 拨号会卡在「等用户点按钮」上，所以它必须与「回答」同时在跑
     let dial = {
         let core = Arc::clone(&core);
-        tokio::spawn(async move { open_remote_impl(core.as_ref(), host_id, PtySize::default()).await })
+        tokio::spawn(
+            async move { open_remote_impl(core.as_ref(), host_id, PtySize::default()).await },
+        )
     };
-    let pending = match await_event(&core, &mut rx, "主机密钥询问", |e| matches!(e, BusEvent::HostKeyPending(_))).await {
+    let pending = match await_event(&core, &mut rx, "主机密钥询问", |e| {
+        matches!(e, BusEvent::HostKeyPending(_))
+    })
+    .await
+    {
         BusEvent::HostKeyPending(p) => p,
         other => panic!("期望主机密钥询问，收到 {other:?}"),
     };
-    assert_eq!(pending.presented.base64_key, HOST_KEY_B64, "对话框里要显示服务器此刻出示的密钥");
+    assert_eq!(
+        pending.presented.base64_key, HOST_KEY_B64,
+        "对话框里要显示服务器此刻出示的密钥"
+    );
     assert_ne!(pending.request, 0, "没有请求号前端就答不回来");
     // await_event 的代答已经被谓词拦下（谓词命中就不该代答），这里由用例自己答一次
     reply_impl(core.as_ref(), pending.request, UserReply::Confirmed).unwrap();
 
-    let session = dial.await.expect("拨号任务不该被取消").expect("确认之后应当连上");
+    let session = dial
+        .await
+        .expect("拨号任务不该被取消")
+        .expect("确认之后应当连上");
 
     // TOFU 的「一次」必须是真的：确认过就落盘，重新打开同一份 known_hosts 不再问
-    let in_memory = core.known.lock().unwrap_or_else(|p| p.into_inner()).entries().to_vec();
+    let in_memory = core
+        .known
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entries()
+        .to_vec();
     assert_eq!(in_memory.len(), 1, "确认后要留下一条信任记录");
     assert_eq!(in_memory[0].source, KnownHostSource::UserConfirmed);
     let reloaded = dbhx_vault::KnownHosts::load(core.dir()).expect("known_hosts 要真的落盘");
@@ -336,22 +541,46 @@ async fn a_changed_host_key_blocks_the_connection_and_asks_nobody() {
         added_at_ms: 0,
         source: KnownHostSource::Imported,
     };
-    core.known.lock().unwrap_or_else(|p| p.into_inner()).trust(stored.clone());
+    core.known
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .trust(stored.clone());
 
-    let err = open_remote_impl(core.as_ref(), host_id, PtySize::default()).await.expect_err("密钥变更必须连不上");
+    let err = open_remote_impl(core.as_ref(), host_id, PtySize::default())
+        .await
+        .expect_err("密钥变更必须连不上");
     // actor 分不清「没记录」与「不一致」，所以错误码统一是 Unknown；
     // 真正告诉用户为什么连不上的是下面那条冲突事件
     assert_eq!(err.code, ErrorCode::HostKeyUnknown, "{:?}", err.code);
     assert!(!err.retryable, "中间人告警不该给出「重试」");
 
-    let conflict = match await_event(&core, &mut rx, "主机密钥冲突", |e| matches!(e, BusEvent::HostKeyConflict(_))).await {
+    let conflict = match await_event(&core, &mut rx, "主机密钥冲突", |e| {
+        matches!(e, BusEvent::HostKeyConflict(_))
+    })
+    .await
+    {
         BusEvent::HostKeyConflict(c) => c,
         other => panic!("期望冲突通知，收到 {other:?}"),
     };
     assert_eq!(conflict.stored.base64_key, stored.base64_key);
-    assert_eq!(conflict.presented.base64_key, HOST_KEY_B64, "要让用户看见服务器现在出示的是哪把");
-    assert_eq!(core.awaits.pending(), 0, "变更不给「仍然连接」，所以不该登记任何等待");
-    assert_eq!(core.known.lock().unwrap_or_else(|p| p.into_inner()).entries().len(), 1, "被拒绝的密钥不能写盘");
+    assert_eq!(
+        conflict.presented.base64_key, HOST_KEY_B64,
+        "要让用户看见服务器现在出示的是哪把"
+    );
+    assert_eq!(
+        core.awaits.pending(),
+        0,
+        "变更不给「仍然连接」，所以不该登记任何等待"
+    );
+    assert_eq!(
+        core.known
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries()
+            .len(),
+        1,
+        "被拒绝的密钥不能写盘"
+    );
 
     server.shutdown().await;
 }
@@ -369,34 +598,94 @@ async fn bare_names_resolve_against_the_browsed_dir() {
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 }).await.expect("远端 shell 应当开起来");
+    let session = open_remote_impl(
+        core.as_ref(),
+        host_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("远端 shell 应当开起来");
     await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
-    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
+    let panel = open_for_session_impl(core.as_ref(), session.id)
+        .await
+        .expect("面板应当免登录打开");
 
     // 手动进到子目录，之后面板显示的就是 /home/app/logs
-    let entered = browse_impl(core.as_ref(), panel.connection, Some("logs".into())).await.unwrap();
+    let entered = browse_impl(core.as_ref(), panel.connection, Some("logs".into()))
+        .await
+        .unwrap();
     assert_eq!(entered.path, "/home/app/logs");
 
-    mkdir_impl(core.as_ref(), panel.connection, "inbox".into(), false).await.unwrap();
-    rename_impl(core.as_ref(), panel.connection, "/home/app/logs/app.log".into(), "app-2.log".into(), false).await.unwrap();
+    mkdir_impl(core.as_ref(), panel.connection, "inbox".into(), false)
+        .await
+        .unwrap();
+    rename_impl(
+        core.as_ref(),
+        panel.connection,
+        "/home/app/logs/app.log".into(),
+        "app-2.log".into(),
+        false,
+    )
+    .await
+    .unwrap();
 
-    let names = |listing: dbhx_model::DirListing| listing.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
-    let here = names(browse_impl(core.as_ref(), panel.connection, None).await.unwrap());
-    assert!(here.contains(&"inbox".to_string()), "新建的目录要出现在正看着的这一栏，实际 {here:?}");
-    assert!(here.contains(&"app-2.log".to_string()), "改名要原地改，实际 {here:?}");
-    assert!(!here.contains(&"app.log".to_string()), "旧名字该没了，实际 {here:?}");
+    let names = |listing: dbhx_model::DirListing| {
+        listing
+            .entries
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let here = names(
+        browse_impl(core.as_ref(), panel.connection, None)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        here.contains(&"inbox".to_string()),
+        "新建的目录要出现在正看着的这一栏，实际 {here:?}"
+    );
+    assert!(
+        here.contains(&"app-2.log".to_string()),
+        "改名要原地改，实际 {here:?}"
+    );
+    assert!(
+        !here.contains(&"app.log".to_string()),
+        "旧名字该没了，实际 {here:?}"
+    );
     assert_eq!(
-        browse_impl(core.as_ref(), panel.connection, Some("/home/app/logs/inbox".into())).await.unwrap().entries.len(),
+        browse_impl(
+            core.as_ref(),
+            panel.connection,
+            Some("/home/app/logs/inbox".into())
+        )
+        .await
+        .unwrap()
+        .entries
+        .len(),
         0,
         "新建的得是个空目录"
     );
 
     // 这一条才是本次回归的核心：上层目录绝不能凭空多出这两个名字
-    let parent = names(browse_impl(core.as_ref(), panel.connection, Some("/home/app".into())).await.unwrap());
+    let parent = names(
+        browse_impl(core.as_ref(), panel.connection, Some("/home/app".into()))
+            .await
+            .unwrap(),
+    );
     for leaked in ["inbox", "app-2.log"] {
-        assert!(!parent.contains(&leaked.to_string()), "「{leaked}」被建到了上一级目录，说明裸名字没按显示目录解析：{parent:?}");
+        assert!(
+            !parent.contains(&leaked.to_string()),
+            "「{leaked}」被建到了上一级目录，说明裸名字没按显示目录解析：{parent:?}"
+        );
     }
-    assert!(parent.contains(&"logs".to_string()), "上一级本来该有的东西不能被弄丢：{parent:?}");
+    assert!(
+        parent.contains(&"logs".to_string()),
+        "上一级本来该有的东西不能被弄丢：{parent:?}"
+    );
 
     server.shutdown().await;
 }
@@ -413,33 +702,83 @@ async fn create_file_and_chmod_act_on_the_browsed_dir() {
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 }).await.expect("远端 shell 应当开起来");
-    let panel = open_for_session_impl(core.as_ref(), session.id).await.expect("面板应当免登录打开");
-    browse_impl(core.as_ref(), panel.connection, Some("logs".into())).await.unwrap();
+    let session = open_remote_impl(
+        core.as_ref(),
+        host_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("远端 shell 应当开起来");
+    let panel = open_for_session_impl(core.as_ref(), session.id)
+        .await
+        .expect("面板应当免登录打开");
+    browse_impl(core.as_ref(), panel.connection, Some("logs".into()))
+        .await
+        .unwrap();
 
-    create_file_impl(core.as_ref(), panel.connection, "note.txt".into()).await.expect("空文件应当建起来");
+    create_file_impl(core.as_ref(), panel.connection, "note.txt".into())
+        .await
+        .expect("空文件应当建起来");
 
-    let here = browse_impl(core.as_ref(), panel.connection, None).await.unwrap();
-    let note = here.entries.iter().find(|e| e.name == "note.txt").expect("新建的文件要出现在正看着的这一栏");
-    assert_eq!((note.kind, note.size, note.mode), (FileKind::File, 0, Some(0o644)), "新文件该是 0 字节的普通文件");
+    let here = browse_impl(core.as_ref(), panel.connection, None)
+        .await
+        .unwrap();
+    let note = here
+        .entries
+        .iter()
+        .find(|e| e.name == "note.txt")
+        .expect("新建的文件要出现在正看着的这一栏");
+    assert_eq!(
+        (note.kind, note.size, note.mode),
+        (FileKind::File, 0, Some(0o644)),
+        "新文件该是 0 字节的普通文件"
+    );
 
     // 同名再建必须是「已存在」，绝不能走截断
     let again = create_file_impl(core.as_ref(), panel.connection, "note.txt".into()).await;
-    assert_eq!(again.err().map(|e| e.code), Some(ErrorCode::AlreadyExists), "同名文件被清空了");
+    assert_eq!(
+        again.err().map(|e| e.code),
+        Some(ErrorCode::AlreadyExists),
+        "同名文件被清空了"
+    );
 
     // 上层不该凭空多出这个名字——又一次证明裸名字必须按显示目录拼
-    let upper = browse_impl(core.as_ref(), panel.connection, Some("/home/app".into())).await.unwrap();
-    assert!(!upper.entries.iter().any(|e| e.name == "note.txt"), "文件被建到了会话初始目录：{upper:?}");
+    let upper = browse_impl(core.as_ref(), panel.connection, Some("/home/app".into()))
+        .await
+        .unwrap();
+    assert!(
+        !upper.entries.iter().any(|e| e.name == "note.txt"),
+        "文件被建到了会话初始目录：{upper:?}"
+    );
 
-    chmod_impl(core.as_ref(), panel.connection, note.path.clone(), 0o600).await.expect("改权限应当落进服务端");
+    chmod_impl(core.as_ref(), panel.connection, note.path.clone(), 0o600)
+        .await
+        .expect("改权限应当落进服务端");
     // 上面那次检查把面板带到了上层目录，这里必须显式跳回来，否则读的是另一个目录
-    let after = browse_impl(core.as_ref(), panel.connection, Some(here.path.clone())).await.unwrap();
-    let changed = after.entries.iter().find(|e| e.name == "note.txt").expect("改完文件还在原处");
-    assert_eq!(changed.mode, Some(0o600), "SETATTRS 没生效的话这里仍然是 644");
+    let after = browse_impl(core.as_ref(), panel.connection, Some(here.path.clone()))
+        .await
+        .unwrap();
+    let changed = after
+        .entries
+        .iter()
+        .find(|e| e.name == "note.txt")
+        .expect("改完文件还在原处");
+    assert_eq!(
+        changed.mode,
+        Some(0o600),
+        "SETATTRS 没生效的话这里仍然是 644"
+    );
 
     // 越界的权限位是非法输入，不能被悄悄取模之后回一个成功
     let bad = chmod_impl(core.as_ref(), panel.connection, note.path.clone(), 0o10000).await;
-    assert_eq!(bad.err().map(|e| e.code), Some(ErrorCode::InvalidInput), "越界权限位必须挡下来");
+    assert_eq!(
+        bad.err().map(|e| e.code),
+        Some(ErrorCode::InvalidInput),
+        "越界权限位必须挡下来"
+    );
 
     server.shutdown().await;
 }
@@ -457,32 +796,63 @@ async fn the_log_copies_what_the_terminal_received_and_stops_when_told() {
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
-        .await
-        .expect("远端 shell 应当开起来");
+    let session = open_remote_impl(
+        core.as_ref(),
+        host_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("远端 shell 应当开起来");
     await_event(&core, &mut rx, "初始目录", cwd_reported("/home/app")).await;
 
-    let started = start_log_impl(core.as_ref(), session.id, None, "现场日志.log").await.expect("日志应当开起来");
-    write_impl(core.as_ref(), session.id, b"echo dbhx-log-marker\r".to_vec()).await.unwrap();
+    let started = start_log_impl(core.as_ref(), session.id, None, "现场日志.log")
+        .await
+        .expect("日志应当开起来");
+    write_impl(
+        core.as_ref(),
+        session.id,
+        b"echo dbhx-log-marker\r".to_vec(),
+    )
+    .await
+    .unwrap();
 
     let text = wait_for_file_text(&started.path, "echo dbhx-log-marker").await;
-    assert!(text.contains("dbhx-log-marker"), "命令与其回显都要落进日志：{text}");
-    assert!(text.contains("\r\n"), "抄的是原始字节流，行尾不该被改成 \\n：{text:?}");
+    assert!(
+        text.contains("dbhx-log-marker"),
+        "命令与其回显都要落进日志：{text}"
+    );
+    assert!(
+        text.contains("\r\n"),
+        "抄的是原始字节流，行尾不该被改成 \\n：{text:?}"
+    );
 
     let stopped = stop_log_impl(core.as_ref(), session.id).await.unwrap();
     assert_eq!(stopped.path, started.path, "停止回的路径必须就是开始那一个");
     assert!(stopped.bytes > 0, "已经抄到的字节数要如实报出来");
     let before = std::fs::read(&started.path).unwrap();
 
-    write_impl(core.as_ref(), session.id, b"echo after-the-stop\r".to_vec()).await.unwrap();
+    write_impl(core.as_ref(), session.id, b"echo after-the-stop\r".to_vec())
+        .await
+        .unwrap();
     // 先把这条输出真正等到 hub 那儿走一趟，再回头看文件——否则「没写」只是因为还没到
     await_event(&core, &mut rx, "停止之后的输出", |e| match e {
-        BusEvent::TermData(d) => d.session == session.id && String::from_utf8_lossy(&d.data.to_bytes().unwrap_or_default()).contains("after-the-stop"),
+        BusEvent::TermData(d) => {
+            d.session == session.id
+                && String::from_utf8_lossy(&d.data.to_bytes().unwrap_or_default())
+                    .contains("after-the-stop")
+        }
         _ => false,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(std::fs::read(&started.path).unwrap(), before, "停止之后一个字都不该再多写");
+    assert_eq!(
+        std::fs::read(&started.path).unwrap(),
+        before,
+        "停止之后一个字都不该再多写"
+    );
 
     close_session_impl(core.as_ref(), session.id).await.unwrap();
     server.shutdown().await;
@@ -496,7 +866,10 @@ async fn wait_for_file_text(path: &str, needle: &str) -> String {
         if text.contains(needle) {
             return text;
         }
-        assert!(tokio::time::Instant::now() < deadline, "等「{needle}」落进 {path} 超时");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等「{needle}」落进 {path} 超时"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -514,9 +887,16 @@ async fn the_login_banner_arrives_as_terminal_output() {
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
-        .await
-        .expect("远端 shell 应当开起来");
+    let session = open_remote_impl(
+        core.as_ref(),
+        host_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("远端 shell 应当开起来");
 
     let contains_banner = |event: &BusEvent| match event {
         BusEvent::TermData(data) => banner_text(data).contains("Welcome to Ubuntu"),
@@ -528,7 +908,10 @@ async fn the_login_banner_arrives_as_terminal_output() {
     };
     assert_eq!(data.session, session.id, "横幅要落在刚开的那个会话上");
     let text = banner_text(&data);
-    assert!(text.contains("Last login: "), "横幅该连同上次登录时间一起到：{text}");
+    assert!(
+        text.contains("Last login: "),
+        "横幅该连同上次登录时间一起到：{text}"
+    );
 
     server.shutdown().await;
 }
@@ -547,14 +930,26 @@ fn banner_text(data: &TermData) -> String {
 /// 上面那条测试走的是「确认先到」的顺利时序，抓不住这个 bug。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_banner_arriving_before_the_success_is_not_swallowed() {
-    let server = server_running(TestSpec::new().with_fs(sample_fs()).with_banner_before_success()).await;
+    let server = server_running(
+        TestSpec::new()
+            .with_fs(sample_fs())
+            .with_banner_before_success(),
+    )
+    .await;
     let (core, mut rx) = live_core("banner-race");
     trust_the_server(&core, &server);
     let host_id = register_host(&core, &server);
 
-    let session = open_remote_impl(core.as_ref(), host_id, PtySize { rows: 30, cols: 110 })
-        .await
-        .expect("远端 shell 应当开起来");
+    let session = open_remote_impl(
+        core.as_ref(),
+        host_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("远端 shell 应当开起来");
 
     // 攒到提示符出现，再整段比对：少一块、错一位都过不了
     let mut got: Vec<u8> = Vec::new();
@@ -576,8 +971,14 @@ async fn a_banner_arriving_before_the_success_is_not_swallowed() {
         }
     }
     let text = String::from_utf8_lossy(&got).into_owned();
-    assert!(text.starts_with("Welcome to Ubuntu"), "横幅必须完整地排在最前面：{text}");
-    assert!(text.contains("Last login: "), "横幅该连同上次登录时间一起到：{text}");
+    assert!(
+        text.starts_with("Welcome to Ubuntu"),
+        "横幅必须完整地排在最前面：{text}"
+    );
+    assert!(
+        text.contains("Last login: "),
+        "横幅该连同上次登录时间一起到：{text}"
+    );
 }
 
 /// 连上「未知系统」的主机后，探测要把远端真实系统落库，并推事件让图标自己换。
@@ -590,7 +991,13 @@ async fn connecting_an_unknown_host_learns_the_remote_os() {
     let (core, mut rx) = live_core("os-probe");
     trust_the_server(&core, &server);
     // 与 `draft()` 只差一个字段：新建时没选系统，记录停在「未知」
-    let host_id = register_with(&core, HostDraft { os: OsType::Unknown, ..draft(&server) });
+    let host_id = register_with(
+        &core,
+        HostDraft {
+            os: OsType::Unknown,
+            ..draft(&server)
+        },
+    );
 
     // 登记阶段自己发过变更事件；先清干净，下面等的必须是探测发的那一条
     while rx.try_recv().is_ok() {}
@@ -598,16 +1005,172 @@ async fn connecting_an_unknown_host_learns_the_remote_os() {
     open_remote_impl(core.as_ref(), host_id.clone(), PtySize::default())
         .await
         .expect("远端 shell 应当开起来");
-    await_event(&core, &mut rx, "探测落库", |e| matches!(e, BusEvent::VaultChanged(_))).await;
+    await_event(&core, &mut rx, "探测落库", |e| {
+        matches!(e, BusEvent::VaultChanged(_))
+    })
+    .await;
 
-    assert_eq!(server.observed().auth_attempts.len(), 1, "探测必须借会话的 transport，不能再登录一次");
+    assert_eq!(
+        server.observed().auth_attempts.len(),
+        1,
+        "探测必须借会话的 transport，不能再登录一次"
+    );
     assert!(
-        server.observed().execs.iter().any(|c| c == dbhx_ipc::osdetect::PROBE_COMMAND),
+        server
+            .observed()
+            .execs
+            .iter()
+            .any(|c| c == dbhx_ipc::osdetect::PROBE_COMMAND),
         "服务端应当收到过探测命令：{:?}",
         server.observed().execs
     );
-    let os = core.vault.lock().unwrap_or_else(|p| p.into_inner()).host(&host_id).map(|r| r.os);
+    let os = core
+        .vault
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .host(&host_id)
+        .map(|r| r.os);
     assert_eq!(os, Some(OsType::Ubuntu), "记录该照着远端报的系统更新");
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_through_a_jump_host_reaches_the_target() {
+    let jump_server = started_server().await;
+    let target_server = started_server().await;
+    let (core, mut rx) = live_core("jump-chain");
+    trust_the_server(&core, &jump_server);
+    trust_the_server(&core, &target_server);
+
+    let jump_id = register_host(&core, &jump_server);
+    let mut target = draft(&target_server);
+    target.label = "目标机".into();
+    target.jump = vec![jump_id.clone()];
+    let target_id = register_with(&core, target);
+
+    let session = open_remote_impl(
+        core.as_ref(),
+        target_id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("经跳板应当连上目标");
+    await_event(
+        &core,
+        &mut rx,
+        "目标 shell 报目录",
+        cwd_reported("/home/app"),
+    )
+    .await;
+
+    // 数据必须真的经过跳板：跳板服务器记录到了通往目标端口的 direct-tcpip
+    let tunnels = jump_server.observed().tunnels;
+    assert!(
+        tunnels
+            .iter()
+            .any(|(host, port)| host == "127.0.0.1" && *port == u32::from(target_server.port())),
+        "跳板没有接到目标的 direct-tcpip：{tunnels:?}"
+    );
+    // 两台服务器各只认证一次：目标连接是在跳板通道里建立的，没有直连
+    assert_eq!(jump_server.observed().auth_attempts.len(), 1);
+    assert_eq!(target_server.observed().auth_attempts.len(), 1);
+
+    close_session_impl(core.as_ref(), session.id).await.unwrap();
+    target_server.shutdown().await;
+    jump_server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_forward_reaches_a_local_echo_server() {
+    // 本机回显服务：远端转发最终要把字节送到这里
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("回显服务起不来");
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                while let Ok(n) = conn.read(&mut buf).await {
+                    if n == 0 || conn.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let remote_port = free_port();
+    let server = started_server().await;
+    let (core, _rx) = live_core("remote-forward");
+    trust_the_server(&core, &server);
+
+    let mut d = draft(&server);
+    d.tunnels = vec![TunnelSpec {
+        kind: TunnelKind::Remote,
+        bind_host: "127.0.0.1".into(),
+        bind_port: remote_port,
+        target_host: "127.0.0.1".into(),
+        target_port: echo_port,
+    }];
+    let id = register_with(&core, d);
+    let _session = open_remote_impl(
+        core.as_ref(),
+        id,
+        PtySize {
+            rows: 30,
+            cols: 110,
+        },
+    )
+    .await
+    .expect("会话应当建立");
+
+    // 服务器上的监听由 ensure_tunnels 拉起；给它一点时间，用重试避开竞态
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let mut client = loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", remote_port)).await {
+            Ok(client) => break client,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("连不上远端转发端口：{e}"),
+        }
+    };
+    client.write_all(b"ping").await.unwrap();
+    let mut back = [0u8; 4];
+    tokio::time::timeout(BUDGET, client.read_exact(&mut back))
+        .await
+        .expect("等远端转发回包超时")
+        .unwrap();
+    assert_eq!(&back, b"ping");
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pre_auth_banner_is_carried_to_the_session_info() {
+    let mut spec = TestSpec::new().with_fs(sample_fs());
+    spec.banner = Some("维护窗口 02:00-03:00".into());
+    let server = server_running(spec).await;
+    let (core, _rx) = live_core("auth-banner");
+    trust_the_server(&core, &server);
+    let host_id = register_host(&core, &server);
+
+    let session = open_remote_impl(core.as_ref(), host_id, PtySize::default())
+        .await
+        .expect("远端 shell 应当开起来");
+    assert_eq!(
+        session.banner.as_deref(),
+        Some("维护窗口 02:00-03:00"),
+        "认证横幅应当随 SessionInfo 一起交给前端"
+    );
 
     server.shutdown().await;
 }

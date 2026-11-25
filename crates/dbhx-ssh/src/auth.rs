@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
+use russh::client::AuthResult;
 use russh::client::{Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
-use russh::client::AuthResult;
 use russh::{MethodKind, MethodSet};
 use zeroize::Zeroizing;
 
@@ -45,10 +45,12 @@ pub(crate) async fn authenticate(
     credential: Credential,
 ) -> Result<(), SshError> {
     let result = match credential {
-        Credential::Password(password) => {
-            password_flow(handle, username, &password).await?
-        }
-        Credential::PrivateKey { pem, passphrase, is_ppk } => {
+        Credential::Password(password) => password_flow(handle, username, &password).await?,
+        Credential::PrivateKey {
+            pem,
+            passphrase,
+            is_ppk,
+        } => {
             let key = load_private_key(&pem, passphrase.as_ref(), is_ppk)?;
             publickey_flow(handle, username, key).await?
         }
@@ -56,7 +58,9 @@ pub(crate) async fn authenticate(
     };
     match result {
         AuthResult::Success => Ok(()),
-        AuthResult::Failure { partial_success, .. } if partial_success => {
+        AuthResult::Failure {
+            partial_success, ..
+        } if partial_success => {
             // 服务器说「这一步过了但还要继续」，M1 没有第二因子能力，明确报出来
             Err(SshError::InteractiveAuthRequired)
         }
@@ -70,7 +74,9 @@ async fn password_flow(
     username: &str,
     password: &Zeroizing<String>,
 ) -> Result<AuthResult, SshError> {
-    let first = handle.authenticate_password(username, password.as_str()).await?;
+    let first = handle
+        .authenticate_password(username, password.as_str())
+        .await?;
     if first.success() {
         return Ok(first);
     }
@@ -98,7 +104,9 @@ async fn keyboard_flow(
             KeyboardInteractiveAuthResponse::Success => {
                 return Ok(AuthResult::Success);
             }
-            KeyboardInteractiveAuthResponse::Failure { partial_success, .. } => {
+            KeyboardInteractiveAuthResponse::Failure {
+                partial_success, ..
+            } => {
                 return Ok(AuthResult::Failure {
                     remaining_methods: MethodSet::empty(),
                     partial_success,
@@ -109,11 +117,20 @@ async fn keyboard_flow(
                 if prompts.len() > 1 {
                     return Err(SshError::InteractiveAuthRequired);
                 }
-                let answers = prompts.iter().map(|p| {
-                    // echo=false 的提示按惯例是口令，填密码；echo=true 的一般是「请输入用户名」
-                    if p.echo { username.to_string() } else { password.to_string() }
-                }).collect::<Vec<_>>();
-                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+                let answers = prompts
+                    .iter()
+                    .map(|p| {
+                        // echo=false 的提示按惯例是口令，填密码；echo=true 的一般是「请输入用户名」
+                        if p.echo {
+                            username.to_string()
+                        } else {
+                            password.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                resp = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await?;
             }
         }
     }
@@ -127,7 +144,10 @@ async fn publickey_flow(
 ) -> Result<AuthResult, SshError> {
     let hash = rsa_hash(handle, &key).await?;
     let with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-    handle.authenticate_publickey(username, with_hash).await.map_err(Into::into)
+    handle
+        .authenticate_publickey(username, with_hash)
+        .await
+        .map_err(Into::into)
 }
 
 /// RSA 必须协商签名算法；非 RSA 直接 `None`（russh 内部也会忽略）。
@@ -150,9 +170,8 @@ async fn rsa_hash(
 #[cfg(unix)]
 type Agent = russh::keys::agent::client::AgentClient<tokio::net::UnixStream>;
 #[cfg(windows)]
-type Agent = russh::keys::agent::client::AgentClient<
-    tokio::net::windows::named_pipe::NamedPipeClient,
->;
+type Agent =
+    russh::keys::agent::client::AgentClient<tokio::net::windows::named_pipe::NamedPipeClient>;
 
 /// Windows 上 OpenSSH 的 agent 固定走这条命名管道（服务名 `ssh-agent`）。
 /// Pageant（WinSCP 那批用户）需要 russh 的 `pageant` 具体类型，M1 先不接，
@@ -165,7 +184,10 @@ async fn agent_flow(
     username: &str,
 ) -> Result<AuthResult, SshError> {
     let mut agent = connect_agent().await?;
-    let identities = agent.request_identities().await.map_err(|e| SshError::Russh(e.into()))?;
+    let identities = agent
+        .request_identities()
+        .await
+        .map_err(|e| SshError::Russh(e.into()))?;
     if identities.is_empty() {
         // agent 在跑但一把钥匙都没有：这跟「认证失败」要区分，UI 才能提示先 ssh-add
         return Err(SshError::KeyLoad("ssh-agent 里没有任何身份".into()));
@@ -182,7 +204,10 @@ async fn agent_flow(
         } else {
             None
         };
-        match handle.authenticate_publickey_with(username, pubkey, hash, &mut agent).await {
+        match handle
+            .authenticate_publickey_with(username, pubkey, hash, &mut agent)
+            .await
+        {
             Ok(r) => {
                 if r.success() {
                     return Ok(r);
@@ -224,13 +249,13 @@ fn load_private_key(
         PrivateKey::from_ppk(pem.as_str(), passphrase.map(|p| p.to_string()))
             .map_err(|e| SshError::KeyLoad(e.to_string()))?
     } else {
-        PrivateKey::from_openssh(pem.as_str())
-            .map_err(|e| SshError::KeyLoad(e.to_string()))?
+        PrivateKey::from_openssh(pem.as_str()).map_err(|e| SshError::KeyLoad(e.to_string()))?
     };
     if !parsed.is_encrypted() {
         return Ok(parsed);
     }
-    let pass = passphrase.ok_or_else(|| SshError::KeyLoad("该私钥有口令保护，但未提供口令".into()))?;
+    let pass =
+        passphrase.ok_or_else(|| SshError::KeyLoad("该私钥有口令保护，但未提供口令".into()))?;
     parsed
         .decrypt(pass.as_str())
         .map_err(|_| SshError::KeyLoad("私钥口令不正确".into()))
@@ -251,7 +276,10 @@ pub fn key_is_encrypted(pem: &str) -> bool {
 pub fn describe_failure(auth: &AuthResult) -> &'static str {
     match auth {
         AuthResult::Success => "success",
-        AuthResult::Failure { partial_success: true, .. } => "partial",
+        AuthResult::Failure {
+            partial_success: true,
+            ..
+        } => "partial",
         AuthResult::Failure { .. } => "rejected",
     }
 }
@@ -280,7 +308,10 @@ mod tests {
     #[test]
     fn unencrypted_key_loads_without_a_passphrase() {
         let k = load_private_key(&zero(PLAIN_ED25519), None, false).unwrap();
-        assert_eq!(k.public_key().to_openssh().unwrap(), format!("ssh-ed25519 {PLAIN_ED25519_B64} dbhx-test"));
+        assert_eq!(
+            k.public_key().to_openssh().unwrap(),
+            format!("ssh-ed25519 {PLAIN_ED25519_B64} dbhx-test")
+        );
     }
 
     #[test]
@@ -297,7 +328,15 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(k.public_key().to_openssh().unwrap().split(' ').nth(1).unwrap(), ENC_ED25519_B64);
+        assert_eq!(
+            k.public_key()
+                .to_openssh()
+                .unwrap()
+                .split(' ')
+                .nth(1)
+                .unwrap(),
+            ENC_ED25519_B64
+        );
     }
 
     #[test]
@@ -310,7 +349,10 @@ mod tests {
 
     #[test]
     fn garbled_pem_is_key_load_error() {
-        assert!(matches!(load_private_key(&zero("not a key"), None, false), Err(SshError::KeyLoad(_))));
+        assert!(matches!(
+            load_private_key(&zero("not a key"), None, false),
+            Err(SshError::KeyLoad(_))
+        ));
     }
 
     #[test]

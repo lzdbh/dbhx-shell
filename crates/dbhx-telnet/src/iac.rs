@@ -48,9 +48,10 @@ pub struct Parsed {
     pub commands: Vec<TelnetCommand>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum State {
     /// 正常数据流。
+    #[default]
     Data,
     /// 读到 `IAC`，下一个字节决定它是转义还是命令。
     AfterIac,
@@ -59,13 +60,11 @@ enum State {
     /// 读到 `IAC SB`，下一个字节是子协商的选项号。
     SbOption,
     /// 在子协商里收集数据，直到 `IAC SE`。
-    SbData { option: u8, data: Vec<u8>, saw_iac: bool },
-}
-
-impl Default for State {
-    fn default() -> Self {
-        State::Data
-    }
+    SbData {
+        option: u8,
+        data: Vec<u8>,
+        saw_iac: bool,
+    },
 }
 
 /// 跨 chunk 存活的 telnet 解析器。
@@ -111,31 +110,56 @@ impl IacParser {
                     out.commands.push(command_from(cmd, b));
                     State::Data
                 }
-                State::SbOption => State::SbData { option: b, data: Vec::new(), saw_iac: false },
-                State::SbData { option, mut data, saw_iac } => {
+                State::SbOption => State::SbData {
+                    option: b,
+                    data: Vec::new(),
+                    saw_iac: false,
+                },
+                State::SbData {
+                    option,
+                    mut data,
+                    saw_iac,
+                } => {
                     if saw_iac {
                         match b {
                             SE => {
-                                out.commands.push(TelnetCommand::Subnegotiation { option, data });
+                                out.commands
+                                    .push(TelnetCommand::Subnegotiation { option, data });
                                 State::Data
                             }
                             // 子协商里 `IAC IAC` 是转义出来的一个 0xFF
                             IAC => {
                                 data.push(IAC);
-                                State::SbData { option, data, saw_iac: false }
+                                State::SbData {
+                                    option,
+                                    data,
+                                    saw_iac: false,
+                                }
                             }
                             // 罕见的非法序列：宽松把 IAC 与当前字节都当数据收下
                             other => {
                                 data.push(IAC);
                                 data.push(other);
-                                State::SbData { option, data, saw_iac: false }
+                                State::SbData {
+                                    option,
+                                    data,
+                                    saw_iac: false,
+                                }
                             }
                         }
                     } else if b == IAC {
-                        State::SbData { option, data, saw_iac: true }
+                        State::SbData {
+                            option,
+                            data,
+                            saw_iac: true,
+                        }
                     } else {
                         data.push(b);
-                        State::SbData { option, data, saw_iac: false }
+                        State::SbData {
+                            option,
+                            data,
+                            saw_iac: false,
+                        }
                     }
                 }
             };
@@ -186,7 +210,9 @@ pub fn naws(cols: u16, rows: u16) -> Vec<u8> {
 pub fn reply_to(cmd: &TelnetCommand, cols: u16, rows: u16) -> Vec<u8> {
     match cmd {
         // 对端要启用某选项：ECHO/SGA/STATUS 接受（DO），其余请它别做（DONT）
-        TelnetCommand::Will(opt) if matches!(*opt, OPT_ECHO | OPT_SGA | OPT_STATUS) => iac_option(DO, *opt),
+        TelnetCommand::Will(opt) if matches!(*opt, OPT_ECHO | OPT_SGA | OPT_STATUS) => {
+            iac_option(DO, *opt)
+        }
         TelnetCommand::Will(opt) => iac_option(DONT, *opt),
         // 对端停用选项：无需回应
         TelnetCommand::Wont(_) => Vec::new(),
@@ -226,7 +252,11 @@ mod tests {
     fn a_bare_ff_in_data_survives_the_escape() {
         let mut p = IacParser::new();
         let r = p.feed(&[b'A', IAC, IAC, b'B']);
-        assert_eq!(r.data, [b'A', IAC, b'B'], "IAC IAC 必须还原成一个 0xFF 数据字节");
+        assert_eq!(
+            r.data,
+            [b'A', IAC, b'B'],
+            "IAC IAC 必须还原成一个 0xFF 数据字节"
+        );
         assert!(r.commands.is_empty());
     }
 
@@ -235,7 +265,10 @@ mod tests {
         let mut p = IacParser::new();
         let r = p.feed(&[IAC, WILL, OPT_ECHO, b'x', IAC, DO, OPT_NAWS]);
         assert_eq!(r.data, b"x", "只有非命令字节进终端");
-        assert_eq!(r.commands, [TelnetCommand::Will(OPT_ECHO), TelnetCommand::Do(OPT_NAWS)]);
+        assert_eq!(
+            r.commands,
+            [TelnetCommand::Will(OPT_ECHO), TelnetCommand::Do(OPT_NAWS)]
+        );
     }
 
     #[test]
@@ -254,7 +287,13 @@ mod tests {
         let mut stream = vec![IAC, SB, OPT_NAWS, 0, 80, 0, 24, IAC, IAC, 7, IAC, SE];
         let r = p.feed(&stream);
         assert!(r.data.is_empty(), "子协商内容不进终端");
-        assert_eq!(r.commands, [TelnetCommand::Subnegotiation { option: OPT_NAWS, data: vec![0, 80, 0, 24, IAC, 7] }]);
+        assert_eq!(
+            r.commands,
+            [TelnetCommand::Subnegotiation {
+                option: OPT_NAWS,
+                data: vec![0, 80, 0, 24, IAC, 7]
+            }]
+        );
         stream.clear();
         // 解析完应干净回到数据态：后面就是普通数据
         assert_eq!(p.feed(b"hi").data, b"hi");
@@ -262,13 +301,22 @@ mod tests {
 
     #[test]
     fn outgoing_data_escapes_every_ff() {
-        assert_eq!(escape(&[b'a', IAC, b'b', IAC, IAC]), [b'a', IAC, IAC, b'b', IAC, IAC, IAC, IAC]);
+        assert_eq!(
+            escape(&[b'a', IAC, b'b', IAC, IAC]),
+            [b'a', IAC, IAC, b'b', IAC, IAC, IAC, IAC]
+        );
     }
 
     #[test]
     fn will_echo_is_accepted_but_unknown_options_are_declined() {
-        assert_eq!(reply_to(&TelnetCommand::Will(OPT_ECHO), 80, 24), iac_option(DO, OPT_ECHO));
-        assert_eq!(reply_to(&TelnetCommand::Will(99), 80, 24), iac_option(DONT, 99));
+        assert_eq!(
+            reply_to(&TelnetCommand::Will(OPT_ECHO), 80, 24),
+            iac_option(DO, OPT_ECHO)
+        );
+        assert_eq!(
+            reply_to(&TelnetCommand::Will(99), 80, 24),
+            iac_option(DONT, 99)
+        );
     }
 
     #[test]
@@ -280,7 +328,10 @@ mod tests {
 
     #[test]
     fn being_asked_to_do_anything_else_is_a_polite_no() {
-        assert_eq!(reply_to(&TelnetCommand::Do(OPT_ECHO), 80, 24), iac_option(DONT, OPT_ECHO));
+        assert_eq!(
+            reply_to(&TelnetCommand::Do(OPT_ECHO), 80, 24),
+            iac_option(DONT, OPT_ECHO)
+        );
     }
 
     #[test]

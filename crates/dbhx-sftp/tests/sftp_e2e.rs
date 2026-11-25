@@ -10,12 +10,16 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dbhx_model::{LiveEndpoint, TransferKind, TransferProgress};
-use dbhx_sftp::{Batch, Copier, Engine, Plan, SftpClient, SftpError, SftpCopier, Task, TransferOptions};
+use dbhx_sftp::{
+    Batch, Copier, Engine, Plan, ResumeJournal, ResumeTarget, SftpClient, SftpCopier, SftpError,
+    Task, TransferOptions,
+};
 use dbhx_ssh::{Credential, DialOptions, SshTransport, TrustAll};
-use dbhx_testsrv::{TestServer, TestSpec, sample_fs, vfs::Kind};
+use dbhx_testsrv::{sample_fs, vfs::Kind, TestServer, TestSpec};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
@@ -25,21 +29,32 @@ const BUDGET: Duration = Duration::from_secs(10);
 ///
 /// 返回 `SshTransport` 是为了让它活到用例结束：它一 drop，通道就没了。
 async fn login(server: &TestServer) -> SshTransport {
-    let endpoint =
-        LiveEndpoint { host: server.host(), port: server.port(), username: "app".to_string() };
+    let endpoint = LiveEndpoint {
+        host: server.host(),
+        port: server.port(),
+        username: "app".to_string(),
+    };
     let transport = SshTransport::dial(DialOptions::new(endpoint), Box::new(TrustAll))
         .await
         .expect("握手应当成功");
     let credential = Credential::Password(Zeroizing::new("dbhx-test".to_string()));
-    transport.authenticate(credential).await.expect("口令应当正确");
+    transport
+        .authenticate(credential)
+        .await
+        .expect("口令应当正确");
     transport
 }
 
 /// 走 sftp 子系统拿一条 SFTP 线。
 async fn sftp(server: &TestServer) -> (SshTransport, SftpClient) {
     let transport = login(server).await;
-    let stream = transport.open_subsystem("sftp").await.expect("sftp 子系统应当可用");
-    let client = SftpClient::connect(stream).await.expect("SFTP 握手应当成功");
+    let stream = transport
+        .open_subsystem("sftp")
+        .await
+        .expect("sftp 子系统应当可用");
+    let client = SftpClient::connect(stream)
+        .await
+        .expect("SFTP 握手应当成功");
     (transport, client)
 }
 
@@ -54,20 +69,26 @@ async fn elevated(server: &TestServer) -> (SshTransport, SftpClient) {
         .open_sftp_elevated("root", "dbhx-test")
         .await
         .expect("提权通道应当交出可用的流");
-    let client = SftpClient::connect(stream).await.expect("提权通道上的 SFTP 握手应当成功");
+    let client = SftpClient::connect(stream)
+        .await
+        .expect("提权通道上的 SFTP 握手应当成功");
     (transport, client)
 }
 
 async fn started() -> TestServer {
-    TestServer::start(TestSpec::new().with_fs(sample_fs())).await.unwrap()
+    TestServer::start(TestSpec::new().with_fs(sample_fs()))
+        .await
+        .unwrap()
 }
 
 /// 每次跑一个独立的本机目录：并发执行的用例不该互相踩文件。
 fn local_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir()
-        .join("dbhx-sftp-e2e")
-        .join(format!("{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let dir = std::env::temp_dir().join("dbhx-sftp-e2e").join(format!(
+        "{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -77,11 +98,17 @@ fn local_dir(tag: &str) -> PathBuf {
 ///
 /// 必须有人抽：`Engine::start` 的 sink 是有界的，写满就整批停摆，
 /// 那会把「传输本身有没有问题」测成「通道够不够大」。
-fn progress_sink() -> (mpsc::Sender<TransferProgress>, mpsc::Receiver<TransferProgress>) {
+fn progress_sink() -> (
+    mpsc::Sender<TransferProgress>,
+    mpsc::Receiver<TransferProgress>,
+) {
     mpsc::channel(256)
 }
 
-async fn run(copier: std::sync::Arc<dyn Copier>, plan: Plan) -> (Batch, mpsc::Receiver<TransferProgress>) {
+async fn run(
+    copier: std::sync::Arc<dyn Copier>,
+    plan: Plan,
+) -> (Batch, mpsc::Receiver<TransferProgress>) {
     let (tx, rx) = progress_sink();
     let batch = Engine::new(TransferOptions::default()).start(copier, plan, tx);
     (batch, rx)
@@ -92,16 +119,29 @@ async fn browse_resolves_the_path_and_lists_directories_first() {
     let server = started().await;
     let (_transport, client) = sftp(&server).await;
 
-    let listing = tokio::time::timeout(BUDGET, client.browse("/home/app")).await.unwrap().unwrap();
+    let listing = tokio::time::timeout(BUDGET, client.browse("/home/app"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(listing.path, "/home/app", "地址栏要显示服务端确认过的路径");
 
     let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, ["logs", "latest", "readme.link", "big.bin", "readme.md"]);
+    assert_eq!(
+        names,
+        ["logs", "latest", "readme.link", "big.bin", "readme.md"]
+    );
 
     // 每条的 path 必须是「父目录 + basename」，这是面板双击导航用的
-    let big = listing.entries.iter().find(|e| e.name == "big.bin").unwrap();
+    let big = listing
+        .entries
+        .iter()
+        .find(|e| e.name == "big.bin")
+        .unwrap();
     assert_eq!(big.path, "/home/app/big.bin");
-    assert_eq!(big.size, 4096, "size 直接来自属性报文，错了就是服务端没给或客户端读错字段");
+    assert_eq!(
+        big.size, 4096,
+        "size 直接来自属性报文，错了就是服务端没给或客户端读错字段"
+    );
     assert_eq!(listing.entries[0].kind, dbhx_model::FileKind::Dir);
     assert_eq!(listing.entries[1].kind, dbhx_model::FileKind::Symlink);
 
@@ -116,9 +156,16 @@ async fn an_elevated_channel_lists_the_same_directories() {
     let server = started().await;
     let (_transport, client) = elevated(&server).await;
 
-    let listing = tokio::time::timeout(BUDGET, client.browse("/home/app")).await.unwrap().unwrap();
+    let listing = tokio::time::timeout(BUDGET, client.browse("/home/app"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        listing.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+        listing
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
         ["logs", "latest", "readme.link", "big.bin", "readme.md"],
         "提权面板看到的目录必须和 subsystem 那条一模一样"
     );
@@ -133,7 +180,10 @@ async fn relative_paths_resolve_against_the_home_directory() {
     let server = started().await;
     let (_transport, client) = sftp(&server).await;
 
-    let logs = tokio::time::timeout(BUDGET, client.canonicalize("logs")).await.unwrap().unwrap();
+    let logs = tokio::time::timeout(BUDGET, client.canonicalize("logs"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(logs, "/home/app/logs");
 
     // 链接会被解引用：面板要停在真实位置，而不是链接的字面路径
@@ -142,7 +192,14 @@ async fn relative_paths_resolve_against_the_home_directory() {
 
     let listing = client.browse("logs").await.unwrap();
     assert_eq!(listing.path, "/home/app/logs");
-    assert_eq!(listing.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["app.log"]);
+    assert_eq!(
+        listing
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        ["app.log"]
+    );
 
     server.shutdown().await;
 }
@@ -153,10 +210,18 @@ async fn stat_follows_the_link_and_lstat_stops_on_it() {
     let (_transport, client) = sftp(&server).await;
 
     let followed = client.stat("/home/app/latest").await.unwrap();
-    assert_eq!(followed.kind, dbhx_model::FileKind::Dir, "stat 要看到链接指向的目录");
+    assert_eq!(
+        followed.kind,
+        dbhx_model::FileKind::Dir,
+        "stat 要看到链接指向的目录"
+    );
 
     let itself = client.lstat("/home/app/latest").await.unwrap();
-    assert_eq!(itself.kind, dbhx_model::FileKind::Symlink, "lstat 必须停在链接本身");
+    assert_eq!(
+        itself.kind,
+        dbhx_model::FileKind::Symlink,
+        "lstat 必须停在链接本身"
+    );
 
     server.shutdown().await;
 }
@@ -184,14 +249,18 @@ async fn mkdir_all_builds_every_level_and_skips_what_exists() {
 
     client.mkdir_all("/home/app/a/b/c").await.unwrap();
     for level in ["/home/app/a", "/home/app/a/b", "/home/app/a/b/c"] {
-        assert!(client.exists(level).await.unwrap(), "{level} 应当已经被建出来");
+        assert!(
+            client.exists(level).await.unwrap(),
+            "{level} 应当已经被建出来"
+        );
     }
     // 重复调用必须无害：并发传输里两个任务同时建同一层是常态
     client.mkdir_all("/home/app/a/b/c").await.unwrap();
 
-    let fs = server.spec.fs.lock().unwrap();
-    assert_eq!(fs.stat("/home/app/a/b/c", true).unwrap().kind, Kind::Dir);
-    drop(fs);
+    {
+        let fs = server.spec.fs.lock().unwrap();
+        assert_eq!(fs.stat("/home/app/a/b/c", true).unwrap().kind, Kind::Dir);
+    }
 
     server.shutdown().await;
 }
@@ -207,15 +276,28 @@ async fn rename_without_overwrite_refuses_and_with_overwrite_replaces() {
         .rename("/home/app/readme.md", "/home/app/logs/app.log", false)
         .await
         .expect_err("目标已存在且没开覆盖，必须失败");
-    assert!(!matches!(err, SftpError::NotFound(_)), "不该被误报成路径不存在：{err:?}");
+    assert!(
+        !matches!(err, SftpError::NotFound(_)),
+        "不该被误报成路径不存在：{err:?}"
+    );
     // 失败不能留下半个结果
     assert!(client.exists("/home/app/readme.md").await.unwrap());
 
-    client.rename("/home/app/readme.md", "/home/app/logs/app.log", true).await.unwrap();
-    let fs = server.spec.fs.lock().unwrap();
-    assert!(fs.read_file("/home/app/readme.md").is_none(), "源文件应当已经没了");
-    assert_eq!(fs.read_file("/home/app/logs/app.log").unwrap(), b"hello sftp\n");
-    drop(fs);
+    client
+        .rename("/home/app/readme.md", "/home/app/logs/app.log", true)
+        .await
+        .unwrap();
+    {
+        let fs = server.spec.fs.lock().unwrap();
+        assert!(
+            fs.read_file("/home/app/readme.md").is_none(),
+            "源文件应当已经没了"
+        );
+        assert_eq!(
+            fs.read_file("/home/app/logs/app.log").unwrap(),
+            b"hello sftp\n"
+        );
+    }
 
     server.shutdown().await;
 }
@@ -237,13 +319,25 @@ async fn download_moves_the_remote_bytes_onto_disk() {
         remote_dirs: Vec::new(),
         total_bytes: 4096,
     };
-    let copier: std::sync::Arc<dyn Copier> =
-        std::sync::Arc::new(SftpCopier::new(client.session(), TransferKind::Download, 1024));
+    let copier: std::sync::Arc<dyn Copier> = std::sync::Arc::new(SftpCopier::new(
+        client.session(),
+        TransferKind::Download,
+        1024,
+    ));
     let (batch, mut events) = run(copier, plan).await;
-    let report = tokio::time::timeout(BUDGET, batch.joined()).await.unwrap().unwrap();
+    let report = tokio::time::timeout(BUDGET, batch.joined())
+        .await
+        .unwrap()
+        .unwrap();
 
-    assert_eq!((report.completed, report.failed, report.cancelled), (1, 0, 0));
-    assert_eq!(report.bytes, 4096, "字节数是引擎累计的，缺一块就是进度条永远到不了底");
+    assert_eq!(
+        (report.completed, report.failed, report.cancelled),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        report.bytes, 4096,
+        "字节数是引擎累计的，缺一块就是进度条永远到不了底"
+    );
     assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), vec![7u8; 4096]);
 
     let mut saw_progress = false;
@@ -252,7 +346,10 @@ async fn download_moves_the_remote_bytes_onto_disk() {
             saw_progress = true;
         }
     }
-    assert!(saw_progress, "传输过程中必须发过 Running 事件，否则面板是静止的");
+    assert!(
+        saw_progress,
+        "传输过程中必须发过 Running 事件，否则面板是静止的"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     server.shutdown().await;
@@ -279,16 +376,30 @@ async fn upload_lands_in_the_server_side_filesystem() {
         remote_dirs: vec!["/home/app/uploads".to_string()],
         total_bytes: payload.len() as u64,
     };
-    let copier: std::sync::Arc<dyn Copier> =
-        std::sync::Arc::new(SftpCopier::new(client.session(), TransferKind::Upload, 1024));
+    let copier: std::sync::Arc<dyn Copier> = std::sync::Arc::new(SftpCopier::new(
+        client.session(),
+        TransferKind::Upload,
+        1024,
+    ));
     let (batch, _events) = run(copier, plan).await;
-    let report = tokio::time::timeout(BUDGET, batch.joined()).await.unwrap().unwrap();
+    let report = tokio::time::timeout(BUDGET, batch.joined())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!((report.completed, report.failed), (1, 0));
 
-    let fs = server.spec.fs.lock().unwrap();
-    assert_eq!(fs.read_file("/home/app/uploads/up.bin").unwrap(), payload, "分块写回的字节必须原样落地");
-    drop(fs);
-    assert_eq!(client.stat("/home/app/uploads/up.bin").await.unwrap().size, payload.len() as u64);
+    {
+        let fs = server.spec.fs.lock().unwrap();
+        assert_eq!(
+            fs.read_file("/home/app/uploads/up.bin").unwrap(),
+            payload,
+            "分块写回的字节必须原样落地"
+        );
+    }
+    assert_eq!(
+        client.stat("/home/app/uploads/up.bin").await.unwrap().size,
+        payload.len() as u64
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     server.shutdown().await;
@@ -303,22 +414,43 @@ async fn one_missing_file_fails_its_own_task_and_not_the_batch() {
     let plan = Plan {
         kind: TransferKind::Download,
         tasks: vec![
-            Task { remote: "/home/app/big.bin".to_string(), local: dir.join("big.bin"), size: 4096 },
-            Task { remote: "/home/app/gone.bin".to_string(), local: dir.join("gone.bin"), size: 1 },
+            Task {
+                remote: "/home/app/big.bin".to_string(),
+                local: dir.join("big.bin"),
+                size: 4096,
+            },
+            Task {
+                remote: "/home/app/gone.bin".to_string(),
+                local: dir.join("gone.bin"),
+                size: 1,
+            },
         ],
         local_dirs: vec![dir.clone()],
         remote_dirs: Vec::new(),
         total_bytes: 4097,
     };
-    let copier: std::sync::Arc<dyn Copier> =
-        std::sync::Arc::new(SftpCopier::new(client.session(), TransferKind::Download, 1024));
+    let copier: std::sync::Arc<dyn Copier> = std::sync::Arc::new(SftpCopier::new(
+        client.session(),
+        TransferKind::Download,
+        1024,
+    ));
     let (batch, _events) = run(copier, plan).await;
-    let report = tokio::time::timeout(BUDGET, batch.joined()).await.unwrap().unwrap();
+    let report = tokio::time::timeout(BUDGET, batch.joined())
+        .await
+        .unwrap()
+        .unwrap();
 
-    assert_eq!((report.completed, report.failed, report.cancelled), (1, 1, 0), "一个失败不该把整批带走");
+    assert_eq!(
+        (report.completed, report.failed, report.cancelled),
+        (1, 1, 0),
+        "一个失败不该把整批带走"
+    );
     assert_eq!(report.bytes, 4096);
     assert_eq!(std::fs::read(dir.join("big.bin")).unwrap().len(), 4096);
-    assert!(!dir.join("gone.bin").exists(), "失败的任务不该留下一个空文件当结果");
+    assert!(
+        !dir.join("gone.bin").exists(),
+        "失败的任务不该留下一个空文件当结果"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     server.shutdown().await;
@@ -332,10 +464,180 @@ async fn closing_the_sftp_session_leaves_the_ssh_connection_usable() {
     client.close().await.unwrap();
     assert!(transport.is_ready(), "SFTP 会话关闭不该把 SSH 连接一起带走");
 
-    let stream = transport.open_subsystem("sftp").await.expect("应当能再开一条子系统");
+    let stream = transport
+        .open_subsystem("sftp")
+        .await
+        .expect("应当能再开一条子系统");
     let again = SftpClient::connect(stream).await.unwrap();
     assert_eq!(again.canonicalize("logs").await.unwrap(), "/home/app/logs");
 
     transport.close().await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn download_resumes_from_the_journal_offset() {
+    let server = started().await;
+    let (_transport, client) = sftp(&server).await;
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut fs = server.spec.fs.lock().unwrap();
+        fs.open("/home/app/resume-download.bin", true, true)
+            .unwrap();
+        fs.write_at("/home/app/resume-download.bin", 0, &payload)
+            .unwrap();
+    }
+
+    let dir = local_dir("resume-download");
+    let local = dir.join("resume-download.bin");
+    std::fs::write(&local, &payload[..1024]).unwrap();
+
+    let meta = client
+        .session()
+        .metadata("/home/app/resume-download.bin".to_string())
+        .await
+        .unwrap();
+    let source_size = payload.len() as u64;
+    let source_mtime = meta.mtime.map(i64::from).unwrap_or(-1);
+    let scope = "app@testsrv:22";
+    let journal = Arc::new(ResumeJournal::open(dir.join("journal.json")));
+    journal.record(
+        ResumeTarget {
+            scope,
+            kind: TransferKind::Download,
+            remote: "/home/app/resume-download.bin",
+            local: &local.display().to_string(),
+            source_size,
+            source_mtime,
+        },
+        1024,
+    );
+
+    let copier: Arc<dyn Copier> = Arc::new(
+        SftpCopier::new(client.session(), TransferKind::Download, 1024)
+            .with_resume(Arc::clone(&journal), scope.to_string()),
+    );
+    let plan = Plan {
+        kind: TransferKind::Download,
+        tasks: vec![Task {
+            remote: "/home/app/resume-download.bin".to_string(),
+            local: local.clone(),
+            size: source_size,
+        }],
+        local_dirs: vec![],
+        remote_dirs: vec![],
+        total_bytes: source_size,
+    };
+    let (batch, _events) = run(copier, plan).await;
+    let report = tokio::time::timeout(BUDGET, batch.joined())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!((report.completed, report.failed), (1, 0));
+    assert_eq!(
+        std::fs::read(&local).unwrap(),
+        payload,
+        "从 1024 续写后必须是完整内容"
+    );
+    assert_eq!(
+        journal.offset_for(
+            ResumeTarget {
+                scope,
+                kind: TransferKind::Download,
+                remote: "/home/app/resume-download.bin",
+                local: &local.display().to_string(),
+                source_size,
+                source_mtime,
+            },
+            source_size,
+        ),
+        0,
+        "搬完必须把日志条目清掉"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_resumes_from_the_journal_offset() {
+    let server = started().await;
+    let (_transport, client) = sftp(&server).await;
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 241) as u8).collect();
+    {
+        let mut fs = server.spec.fs.lock().unwrap();
+        fs.open("/home/app/resume-upload.bin", true, true).unwrap();
+        fs.write_at("/home/app/resume-upload.bin", 0, &payload[..1024])
+            .unwrap();
+    }
+
+    let dir = local_dir("resume-upload");
+    let local = dir.join("resume-upload.bin");
+    std::fs::write(&local, &payload).unwrap();
+    let modified = std::fs::metadata(&local)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let scope = "app@testsrv:22";
+    let journal = Arc::new(ResumeJournal::open(dir.join("journal.json")));
+    journal.record(
+        ResumeTarget {
+            scope,
+            kind: TransferKind::Upload,
+            remote: "/home/app/resume-upload.bin",
+            local: &local.display().to_string(),
+            source_size: payload.len() as u64,
+            source_mtime: modified,
+        },
+        1024,
+    );
+
+    let copier: Arc<dyn Copier> = Arc::new(
+        SftpCopier::new(client.session(), TransferKind::Upload, 1024)
+            .with_resume(Arc::clone(&journal), scope.to_string()),
+    );
+    let plan = Plan {
+        kind: TransferKind::Upload,
+        tasks: vec![Task {
+            remote: "/home/app/resume-upload.bin".to_string(),
+            local: local.clone(),
+            size: payload.len() as u64,
+        }],
+        local_dirs: vec![],
+        remote_dirs: vec![],
+        total_bytes: payload.len() as u64,
+    };
+    let (batch, _events) = run(copier, plan).await;
+    let report = tokio::time::timeout(BUDGET, batch.joined())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!((report.completed, report.failed), (1, 0));
+    {
+        let fs = server.spec.fs.lock().unwrap();
+        assert_eq!(
+            fs.read_file("/home/app/resume-upload.bin").unwrap(),
+            payload,
+            "从 1024 续写后远端必须是完整内容"
+        );
+    }
+    assert_eq!(
+        journal.offset_for(
+            ResumeTarget {
+                scope,
+                kind: TransferKind::Upload,
+                remote: "/home/app/resume-upload.bin",
+                local: &local.display().to_string(),
+                source_size: payload.len() as u64,
+                source_mtime: modified,
+            },
+            payload.len() as u64,
+        ),
+        0,
+        "搬完必须把日志条目清掉"
+    );
     server.shutdown().await;
 }

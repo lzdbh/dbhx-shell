@@ -25,14 +25,13 @@ pub mod state;
 #[cfg(test)]
 mod test_keys;
 
-pub use commands::{ping, ping_failure};
 pub use state::Core;
 
 use std::sync::Arc;
 
 use tauri::Manager;
-use tokio::sync::mpsc;
 use tauri_specta::{collect_commands, collect_events};
+use tokio::sync::mpsc;
 
 /// plugin 名，同时也是命令命名空间。builder 与 tauri plugin 必须用同一个值，
 /// 否则生成的 `invoke("plugin:xxx|...")` 与运行时注册的名字对不上。
@@ -44,8 +43,6 @@ const PLUGIN_NAME: &str = "dbhx";
 /// 下游配置的对照基准：`src-tauri/build.rs` 用它生成 ACL 权限，`bindings.ts` 用它
 /// 校验 invoke 名字的命名空间。下面的测试负责抓漂移。
 pub const COMMAND_NAMES: &[&str] = &[
-    "ping",
-    "ping_failure",
     "session_open_local",
     "session_open_remote",
     "session_write",
@@ -69,6 +66,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "vault_lock_status",
     "vault_lock",
     "vault_unlock",
+    "vault_export_offline",
+    "vault_import_offline",
     "vault_set_lock_pin",
     "vault_clear_lock_pin",
     "sftp_open_for_session",
@@ -123,8 +122,6 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         // 可能超过 2^53 的量（累计传输字节、纳秒时间戳）必须改走 string。
         .dangerously_cast_bigints_to_number()
         .commands(collect_commands![
-            commands::ping,
-            commands::ping_failure,
             commands::session::session_open_local,
             commands::session::session_open_remote,
             commands::session::session_write,
@@ -148,6 +145,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::vault::vault_lock_status,
             commands::vault::vault_lock,
             commands::vault::vault_unlock,
+            commands::vault::vault_export_offline,
+            commands::vault::vault_import_offline,
             commands::vault::vault_set_lock_pin,
             commands::vault::vault_clear_lock_pin,
             commands::sftp::sftp_open_for_session,
@@ -202,6 +201,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             events::SftpFollowed,
             events::TransferProgressEvent,
             events::TransferBatchEnded,
+            events::TransferConflict,
+            events::TunnelFailed,
             events::VaultChanged,
         ])
 }
@@ -223,7 +224,8 @@ pub fn plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
                 .app_data_dir()
                 .map_err(|e| format!("无法解析应用数据目录：{e}"))?;
             let (tx, rx) = mpsc::channel::<events::BusEvent>(state::BUS_QUEUE);
-            let core = state::Core::production(dir, tx).map_err(|e| format!("命令层装配失败：{}", e.message))?;
+            let core = state::Core::production(dir, tx)
+                .map_err(|e| format!("命令层装配失败：{}", e.message))?;
             app.manage(Arc::clone(&core));
 
             // 事件路由：总线只有一个读者。用 spawn 而不是 await，setup 必须马上返回。
@@ -266,7 +268,13 @@ mod codegen {
         contract
             .lines()
             .map(str::trim)
-            .filter(|l| !(l.starts_with("///") || l.starts_with("//!") || l.starts_with("/*") || l.starts_with('*') || l.starts_with("//")))
+            .filter(|l| {
+                !(l.starts_with("///")
+                    || l.starts_with("//!")
+                    || l.starts_with("/*")
+                    || l.starts_with('*')
+                    || l.starts_with("//"))
+            })
             .flat_map(|line| {
                 line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .map(str::to_owned)
@@ -297,7 +305,7 @@ mod codegen {
         let content = std::fs::read_to_string(&target)
             .unwrap_or_else(|e| panic!("cannot read back {}: {e}", target.display()));
 
-        for needle in ["ErrorCode", "Pong", "LiveEndpoint"] {
+        for needle in ["ErrorCode", "LiveEndpoint", "SessionInfo"] {
             assert!(content.contains(needle), "bindings.ts missing `{needle}`");
         }
         // plugin 命名空间必须进 invoke 名字，否则前端调用根本路由不到 handler；
@@ -322,6 +330,8 @@ mod codegen {
             "sftp-followed",
             "transfer-progress",
             "transfer-batch-ended",
+            "transfer-conflict",
+            "tunnel-failed",
             "vault-changed",
         ] {
             assert!(content.contains(event), "bindings.ts 缺事件 {event}");

@@ -12,12 +12,15 @@ pub mod vault;
 
 pub use error::{redacted, ErrorCode, IpcError};
 pub use session::{
-    AuthRef, ConnectSpec, Endpoint, LiveEndpoint, Protocol, Pong, PtySize, SessionId, SessionInfo,
+    AuthRef, ConnectSpec, Endpoint, LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo,
     SessionStatus, TerminalEncoding,
 };
+pub use sftp::{
+    ConflictPolicy, DirListing, FileEntry, FileKind, TransferKind, TransferProgress, TransferState,
+};
 pub use time::now_ms;
-pub use sftp::{DirListing, FileEntry, FileKind, TransferKind, TransferProgress, TransferState};
 pub use vault::{
-    AuthMode, GroupMode, HostId, HostInfo, HostKeyDecision, HostRecord, IdentityId, IdentityRecord, KnownHost,
-    KnownHostSource, OsType, ProviderKind, SecretId, SyncTarget,
+    AuthMode, GroupMode, HostId, HostInfo, HostKeyDecision, HostRecord, IdentityId, IdentityRecord,
+    KeyStoreKind, KnownHost, KnownHostSource, OsType, ProviderKind, SecretId, SyncTarget,
+    TunnelKind, TunnelSpec,
 };

@@ -9,13 +9,15 @@
 //!   应答方（`transport` 的 actor）若先退出，oneshot 的发送端被 drop，
 //!   我们这里收到 `Canceled` 并判定为拒绝——连接随之失败，这是期望行为而不是悬挂。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use dbhx_model::LiveEndpoint;
 
 use russh::client::{DisconnectReason, Handler, Session};
 use russh::keys::PublicKey;
-use russh::{ChannelId, keys::PublicKeyOrCertificate};
+use russh::{keys::PublicKeyOrCertificate, ChannelId};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::hostkey::ServerKey;
@@ -39,7 +41,10 @@ pub enum CloseReason {
     ClientRequested,
     /// 主机密钥校验未通过。必须与「网络断了」区分开，否则 UI 会给出错误的重试建议
     HostKeyRejected,
-    Server { reason_code: String, message: String },
+    Server {
+        reason_code: String,
+        message: String,
+    },
     /// russh 会话任务返回的错误文本
     Failed(String),
 }
@@ -73,6 +78,10 @@ pub(crate) struct ClientHandler {
     state: Arc<watch::Sender<SessionState>>,
     events: mpsc::UnboundedSender<SshEvent>,
     checks: mpsc::UnboundedSender<KeyCheck>,
+    /// 远端转发：服务器上绑定的端口 ⇒ 本机目标。收到 `forwarded-tcpip` 时按端口找目标。
+    forwards: Arc<Mutex<HashMap<u32, (String, u16)>>>,
+    /// 登录横幅。直接在 handler 里落值，避免「事件还在队列里，调用方已经读走了」的竞态。
+    banner: Arc<Mutex<Option<String>>>,
 }
 
 impl ClientHandler {
@@ -81,8 +90,17 @@ impl ClientHandler {
         state: Arc<watch::Sender<SessionState>>,
         events: mpsc::UnboundedSender<SshEvent>,
         checks: mpsc::UnboundedSender<KeyCheck>,
+        forwards: Arc<Mutex<HashMap<u32, (String, u16)>>>,
+        banner: Arc<Mutex<Option<String>>>,
     ) -> Self {
-        Self { endpoint, state, events, checks }
+        Self {
+            endpoint,
+            state,
+            events,
+            checks,
+            forwards,
+            banner,
+        }
     }
 
     fn set_state(&self, next: SessionState) {
@@ -98,7 +116,10 @@ impl ClientHandler {
     /// 密钥交换完成。已经认证过的连接在 rekey 后会再次走到这里，
     /// 绝不能把状态退回 `KeyExchanged`——上层正拿 `Authenticated` 当作开新通道的门禁。
     fn note_kex_done(&self) {
-        if matches!(*self.state.borrow(), SessionState::Handshaking | SessionState::KeyExchanged) {
+        if matches!(
+            *self.state.borrow(),
+            SessionState::Handshaking | SessionState::KeyExchanged
+        ) {
             self.set_state(SessionState::KeyExchanged);
         }
     }
@@ -114,11 +135,17 @@ impl Handler for ClientHandler {
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let is_cert = matches!(server_public_key, PublicKeyOrCertificate::Certificate(_));
-        let presented =
-            ServerKey::from_public_key(&server_public_key.public_key(), is_cert)?;
+        let presented = ServerKey::from_public_key(&server_public_key.public_key(), is_cert)?;
 
         let (tx, rx) = oneshot::channel();
-        if self.checks.send(KeyCheck { key: presented, reply: tx }).is_err() {
+        if self
+            .checks
+            .send(KeyCheck {
+                key: presented,
+                reply: tx,
+            })
+            .is_err()
+        {
             self.set_state(SessionState::Closed(CloseReason::HostKeyRejected));
             return Ok(false);
         }
@@ -139,6 +166,12 @@ impl Handler for ClientHandler {
         banner: &str,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        {
+            let mut slot = self.banner.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                *slot = Some(banner.to_string());
+            }
+        }
         let _ = self.events.send(SshEvent::AuthBanner(banner.to_string()));
         Ok(())
     }
@@ -181,6 +214,39 @@ impl Handler for ClientHandler {
         Ok(())
     }
 
+    /// 远端转发：服务器把一条进来的连接开成通道交给我们，转去本机目标。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let target = {
+            let guard = self.forwards.lock().unwrap_or_else(|p| p.into_inner());
+            guard.get(&connected_port).cloned()
+        };
+        let Some((host, port)) = target else {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        let Ok(mut local) = TcpStream::connect((host.as_str(), port)).await else {
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        reply.accept().await;
+        let mut stream = channel.into_stream();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
+        });
+        Ok(())
+    }
+
     async fn disconnected(
         &mut self,
         reason: DisconnectReason<Self::Error>,
@@ -201,4 +267,3 @@ impl Handler for ClientHandler {
         }
     }
 }
-

@@ -22,6 +22,17 @@ pub struct IdentityId(pub String);
 #[serde(transparent)]
 pub struct SecretId(pub String);
 
+/// 主密钥实际存在哪里。只用于设置页展示，不参与任何加解密判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStoreKind {
+    /// 应用目录下的 `master.key`（钥匙串不可用时的兜底）
+    #[default]
+    File,
+    /// 系统钥匙串：Windows 凭据管理器 / macOS Keychain / Linux Secret Service
+    SystemKeyring,
+}
+
 /// 认证方式。`Agent` 与 `KeyboardInteractive` 不需要 vault 里存任何凭据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +91,29 @@ pub enum OsType {
     Other,
 }
 
+/// 一台主机上配置的端口转发。随该主机的 SSH 连接自动启动/停止。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct TunnelSpec {
+    pub kind: TunnelKind,
+    /// 监听地址。本地/动态转发在本机，远端转发在服务器上。
+    pub bind_host: String,
+    pub bind_port: u16,
+    /// 本地转发的目标（服务器侧地址）；动态转发不用。
+    pub target_host: String,
+    pub target_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelKind {
+    /// 本机端口 → 远端固定目标
+    Local,
+    /// 本机端口做 SOCKS5 动态代理
+    Dynamic,
+    /// 远端端口 → 本机固定目标
+    Remote,
+}
+
 /// 一台主机。`endpoint` 是「拨号用什么」，`label` 是「人看什么」。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct HostRecord {
@@ -90,6 +124,13 @@ pub struct HostRecord {
     pub tags: Vec<String>,
     pub favorite: bool,
     pub protocol: crate::session::Protocol,
+    /// 跳板链，从离本机最近的一跳开始。**这里是完整的链**：每一跳自己的 `jump`
+    /// 不会再被递归展开，避免出现环和「以为多跳了其实没有」的歧义。
+    #[serde(default)]
+    pub jump: Vec<HostId>,
+    /// 端口转发。连接建立后自动启动，连接断开或应用退出时停止。
+    #[serde(default)]
+    pub tunnels: Vec<TunnelSpec>,
     /// `#[serde(default)]` 是给存量 vault 文件留的：加这个字段之前建的机器没有它，
     /// 缺省解析成 `Unknown`，而不是整条记录读不出来。
     #[serde(default)]
@@ -103,7 +144,7 @@ pub struct HostRecord {
     /// 0 表示不发 keepalive；秒数，远端掉线检测用
     pub keepalive_secs: u16,
     pub encoding: crate::session::TerminalEncoding,
-    /// epoch 毫秒。见 `Pong::server_time_ms` 的说明：按 number 导出是安全的
+    /// epoch 毫秒。值始终 < 2^53，按 number 导出是安全的
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -134,6 +175,12 @@ pub struct HostInfo {
     pub tags: Vec<String>,
     pub favorite: bool,
     pub protocol: crate::session::Protocol,
+    /// 跳板链（只读投影，供列表/表单展示）
+    #[serde(default)]
+    pub jump: Vec<HostId>,
+    /// 端口转发（只读投影）
+    #[serde(default)]
+    pub tunnels: Vec<TunnelSpec>,
     /// 列表图标用，见 `OsType`
     pub os: OsType,
     pub endpoint: crate::session::Endpoint,
@@ -170,6 +217,8 @@ impl HostInfo {
             tags: record.tags.clone(),
             favorite: record.favorite,
             protocol: record.protocol,
+            jump: record.jump.clone(),
+            tunnels: record.tunnels.clone(),
             os: record.os,
             endpoint: record.endpoint.clone(),
             auth_mode: record.auth_mode,
@@ -269,7 +318,11 @@ mod tests {
             favorite: true,
             protocol: Protocol::Ssh,
             os: OsType::Linux,
-            endpoint: Endpoint { host: "10.0.0.1".into(), port: Some(2222), username: "app".into() },
+            endpoint: Endpoint {
+                host: "10.0.0.1".into(),
+                port: Some(2222),
+                username: "app".into(),
+            },
             auth_mode: mode,
             identity_id: identity.map(|i| IdentityId(i.into())),
             password_secret_id: None,
@@ -277,12 +330,15 @@ mod tests {
             encoding: TerminalEncoding::Utf8,
             created_at_ms: 1,
             updated_at_ms: 2,
+            jump: vec![],
+            tunnels: vec![],
         }
     }
 
     #[test]
     fn host_projection_never_carries_secret_material() {
-        let json = serde_json::to_string(&HostInfo::from_record(&host(AuthMode::Password, None))).unwrap();
+        let json =
+            serde_json::to_string(&HostInfo::from_record(&host(AuthMode::Password, None))).unwrap();
         // 只允许出现 secret 的「引用」，不允许出现任何像是凭据的字段。
         // 按**字段名**判断而不是按整串文本 grep：`auth_mode: "password"` 是模式名，
         // 而 `password_secret_id` 才是引用，只有后者必须消失。
@@ -290,7 +346,9 @@ mod tests {
         let keys = key_paths(&value);
         assert!(keys.iter().any(|k| k.ends_with("host_id")), "{keys:?}");
         for forbidden in ["password", "passphrase", "private_key", "secret"] {
-            let hit = keys.iter().find(|k| k.rsplit('.').next().unwrap_or_default().contains(forbidden));
+            let hit = keys
+                .iter()
+                .find(|k| k.rsplit('.').next().unwrap_or_default().contains(forbidden));
             assert!(hit.is_none(), "HostInfo 泄露了字段 `{hit:?}`: {json}");
         }
     }
@@ -320,7 +378,11 @@ mod tests {
             match value {
                 serde_json::Value::Object(map) => {
                     for (key, child) in map {
-                        let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
                         out.push(path.clone());
                         walk(child, &path, out);
                     }
@@ -342,13 +404,22 @@ mod tests {
     fn provider_kind_json_name_is_frozen_because_it_is_stored_and_sent() {
         // 这个字符串同时出现在 vault 文档和 IPC 契约里：改拼法等于让老库里的
         // `sync_target` 悄悄读不出来，而报错长得像「没配过同步」。
-        assert_eq!(serde_json::to_string(&ProviderKind::GitHub).unwrap(), "\"github\"");
-        assert_eq!(serde_json::to_string(&ProviderKind::Gitee).unwrap(), "\"gitee\"");
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::GitHub).unwrap(),
+            "\"github\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Gitee).unwrap(),
+            "\"gitee\""
+        );
         assert_eq!(
             serde_json::from_value::<ProviderKind>(serde_json::json!("gitee")).unwrap(),
             ProviderKind::Gitee
         );
-        let target = SyncTarget { provider: ProviderKind::GitHub, id: "abc123".into() };
+        let target = SyncTarget {
+            provider: ProviderKind::GitHub,
+            id: "abc123".into(),
+        };
         assert_eq!(
             serde_json::from_str::<SyncTarget>(&serde_json::to_string(&target).unwrap()).unwrap(),
             target
@@ -360,7 +431,10 @@ mod tests {
         let info = HostInfo::from_record(&host(AuthMode::PublicKey, Some("k1")));
         assert_eq!(
             info.auth,
-            crate::session::AuthRef::Identity { host_id: "h1".into(), identity_id: "k1".into() }
+            crate::session::AuthRef::Identity {
+                host_id: "h1".into(),
+                identity_id: "k1".into()
+            }
         );
     }
 
@@ -373,12 +447,20 @@ mod tests {
             added_at_ms: 1,
             source: KnownHostSource::UserConfirmed,
         };
-        let other = KnownHost { base64_key: "BBBB".into(), ..stored.clone() };
+        let other = KnownHost {
+            base64_key: "BBBB".into(),
+            ..stored.clone()
+        };
         let changed = HostKeyDecision::Changed {
             stored: Box::new(stored.clone()),
             presented: Box::new(other),
         };
-        assert_ne!(changed, HostKeyDecision::Unknown { pending: Box::new(stored) });
+        assert_ne!(
+            changed,
+            HostKeyDecision::Unknown {
+                pending: Box::new(stored)
+            }
+        );
         let json = serde_json::to_string(&changed).unwrap();
         assert!(json.starts_with(r#"{"kind":"changed""#), "{json}");
     }

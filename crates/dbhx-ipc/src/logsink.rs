@@ -62,7 +62,11 @@ impl LogRegistry {
     pub async fn start(&self, session: SessionId, path: PathBuf) -> Result<(), IpcError> {
         let mut map = self.inner.lock().await;
         if map.contains_key(&session) {
-            return Err(IpcError::new(ErrorCode::InvalidInput, "这个会话已经在记录日志", false));
+            return Err(IpcError::new(
+                ErrorCode::InvalidInput,
+                "这个会话已经在记录日志",
+                false,
+            ));
         }
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(io_error)?;
@@ -73,7 +77,14 @@ impl LogRegistry {
             .open(&path)
             .await
             .map_err(io_error)?;
-        map.insert(session, LiveLog { file, path, bytes: 0 });
+        map.insert(
+            session,
+            LiveLog {
+                file,
+                path,
+                bytes: 0,
+            },
+        );
         Ok(())
     }
 
@@ -83,7 +94,9 @@ impl LogRegistry {
     /// 「会话输出没了」或「按停止之后还在写」。调用方要做的只有一件事——告诉前端灯该灭。
     pub async fn tee(&self, session: SessionId, bytes: &[u8]) -> Result<(), LogFailure> {
         let mut map = self.inner.lock().await;
-        let Some(log) = map.get_mut(&session) else { return Ok(()) };
+        let Some(log) = map.get_mut(&session) else {
+            return Ok(());
+        };
         match log.file.write_all(bytes).await {
             Ok(()) => {
                 log.bytes += bytes.len() as u64;
@@ -98,8 +111,15 @@ impl LogRegistry {
     /// 单独抽出来有两个理由：一是摘除这件事必须和失败**同时**发生，写在一起才不会
     /// 有人改了一半；二是「写到一半磁盘满了」这类失败在离线测试里造不出来（也不值得
     /// 为了造它放开工作区的 `unsafe` 禁令），所以能验的这一段被单独验。
-    fn abandon(map: &mut HashMap<SessionId, LiveLog>, session: SessionId, reason: String) -> LogFailure {
-        let summary = map.remove(&session).map(|log| summary_of(&log)).unwrap_or_default();
+    fn abandon(
+        map: &mut HashMap<SessionId, LiveLog>,
+        session: SessionId,
+        reason: String,
+    ) -> LogFailure {
+        let summary = map
+            .remove(&session)
+            .map(|log| summary_of(&log))
+            .unwrap_or_default();
         LogFailure { summary, reason }
     }
 
@@ -115,11 +135,19 @@ impl LogRegistry {
             Some(mut log) => {
                 if let Err(e) = log.file.flush().await {
                     let path = log.path.to_string_lossy().into_owned();
-                    return Err(IpcError::new(ErrorCode::Io, format!("写入 {path} 失败：{e}"), false));
+                    return Err(IpcError::new(
+                        ErrorCode::Io,
+                        format!("写入 {path} 失败：{e}"),
+                        false,
+                    ));
                 }
                 Ok(summary_of(&log))
             }
-            None => Err(IpcError::new(ErrorCode::NotFound, "这个会话没有正在记录的日志", false)),
+            None => Err(IpcError::new(
+                ErrorCode::NotFound,
+                "这个会话没有正在记录的日志",
+                false,
+            )),
         }
     }
 
@@ -129,7 +157,9 @@ impl LogRegistry {
     /// 再发一条只是多此一举（见 [`crate::events::SessionLogStopped`] 的说明）。
     /// 这里同样要 flush：没人可报错，但至少别让最后一段烂在缓冲里。
     pub async fn close_quietly(&self, session: SessionId) {
-        let Some(mut log) = self.inner.lock().await.remove(&session) else { return };
+        let Some(mut log) = self.inner.lock().await.remove(&session) else {
+            return;
+        };
         if let Err(e) = log.file.flush().await {
             tracing::warn!(path = %log.path.to_string_lossy(), error = %e, "会话结束，日志最后一段没写进去");
         }
@@ -140,7 +170,10 @@ impl LogRegistry {
 
 /// `tokio::fs::File` 落盘时自己会关掉，这里只把「给用户看的路径」凑齐。
 fn summary_of(log: &LiveLog) -> LogSummary {
-    LogSummary { path: log.path.to_string_lossy().into_owned(), bytes: log.bytes }
+    LogSummary {
+        path: log.path.to_string_lossy().into_owned(),
+        bytes: log.bytes,
+    }
 }
 
 fn io_error(e: std::io::Error) -> IpcError {
@@ -160,7 +193,11 @@ pub fn check_file_name(name: &str) -> Result<(), IpcError> {
         || name.contains('\\')
         || name.chars().any(|c| (c as u32) < 0x20 || c == ':');
     if bad {
-        return Err(IpcError::new(ErrorCode::InvalidInput, format!("日志文件名不合法：{name}"), false));
+        return Err(IpcError::new(
+            ErrorCode::InvalidInput,
+            format!("日志文件名不合法：{name}"),
+            false,
+        ));
     }
     Ok(())
 }
@@ -173,7 +210,11 @@ pub fn log_path(core_dir: &Path, dir: Option<&str>, name: &str) -> Result<PathBu
         Some(raw) => {
             let candidate = Path::new(raw);
             if !candidate.is_absolute() {
-                return Err(IpcError::new(ErrorCode::InvalidInput, "日志目录必须是绝对路径", false));
+                return Err(IpcError::new(
+                    ErrorCode::InvalidInput,
+                    "日志目录必须是绝对路径",
+                    false,
+                ));
             }
             candidate.to_path_buf()
         }
@@ -222,9 +263,15 @@ mod tests {
         registry.tee(sid(8), b"last\n").await.unwrap();
         registry.close_quietly(sid(8)).await;
         // 收尾之后再停就什么都没有了：表里确实不再有这条记录
-        assert_eq!(registry.stop(sid(8)).await.unwrap_err().code, ErrorCode::NotFound);
+        assert_eq!(
+            registry.stop(sid(8)).await.unwrap_err().code,
+            ErrorCode::NotFound
+        );
         // 已经落盘的内容不能被收尾动作吃掉
-        assert_eq!(std::fs::read_to_string(dir.join("end.log")).unwrap(), "last\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("end.log")).unwrap(),
+            "last\n"
+        );
         clean(&dir);
     }
 
@@ -236,7 +283,10 @@ mod tests {
         let again = registry.start(sid(2), dir.join("second.log")).await;
         assert!(again.is_err(), "静默换文件等于骗用户前半段还在同一个日志里");
         registry.tee(sid(2), b"x").await.unwrap();
-        assert_eq!(registry.stop(sid(2)).await.unwrap().path, dir.join("first.log").to_string_lossy());
+        assert_eq!(
+            registry.stop(sid(2)).await.unwrap().path,
+            dir.join("first.log").to_string_lossy()
+        );
         assert!(!dir.join("second.log").exists());
         clean(&dir);
     }
@@ -249,7 +299,10 @@ mod tests {
         registry.start(sid(3), dir.join("same.log")).await.unwrap();
         registry.tee(sid(3), "这一轮的\n".as_bytes()).await.unwrap();
         registry.stop(sid(3)).await.unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("same.log")).unwrap(), "上一轮的\n这一轮的\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("same.log")).unwrap(),
+            "上一轮的\n这一轮的\n"
+        );
         clean(&dir);
     }
 
@@ -265,9 +318,16 @@ mod tests {
             let mut map = registry.inner.lock().await;
             LogRegistry::abandon(&mut map, sid(4), "磁盘已满".to_string())
         };
-        assert!(failure.summary.path.ends_with("gone.log"), "{}", failure.summary.path);
+        assert!(
+            failure.summary.path.ends_with("gone.log"),
+            "{}",
+            failure.summary.path
+        );
         assert_eq!(failure.summary.bytes, 6, "已经写进去的字节要如实报出来");
-        assert_eq!(failure.message(), format!("写入 {} 失败：磁盘已满", failure.summary.path));
+        assert_eq!(
+            failure.message(),
+            format!("写入 {} 失败：磁盘已满", failure.summary.path)
+        );
 
         // 摘干净之后：下一条字节是空操作，也就不再占着「正在记录」这个状态
         registry.tee(sid(4), b"second\n").await.unwrap();
@@ -278,7 +338,16 @@ mod tests {
 
     #[test]
     fn file_names_with_any_path_escape_are_refused() {
-        for bad in ["", ".", "..", "a/b.log", "a\\b.log", "con:log", "a\u{7}b", &"x".repeat(121)] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b.log",
+            "a\\b.log",
+            "con:log",
+            "a\u{7}b",
+            &"x".repeat(121),
+        ] {
             assert!(check_file_name(bad).is_err(), "不该放过 {bad:?}");
         }
         assert!(check_file_name("dbhx-本机终端-20261014-2359.log").is_ok());
@@ -331,10 +400,14 @@ mod tests {
         let blocker = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .share_mode(0)
             .open(&path)
             .unwrap();
-        let err = LogRegistry::default().start(sid(9), path).await.unwrap_err();
+        let err = LogRegistry::default()
+            .start(sid(9), path)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Io);
         drop(blocker);
         clean(&dir);

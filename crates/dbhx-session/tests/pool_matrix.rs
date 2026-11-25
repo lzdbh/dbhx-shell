@@ -14,8 +14,8 @@ use dbhx_session::{
     SharedConnection, TransportKey, TransportPool,
 };
 use dbhx_ssh::{
-    wait_until_closed, CloseReason, Credential, Exec, SessionState, Shell, SshError,
-    SubsystemStream, TrustAll,
+    wait_until_closed, CloseReason, Credential, Exec, SessionState, SharedHostKeyVerifier, Shell,
+    SshError, SubsystemStream, TrustAll,
 };
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -54,6 +54,10 @@ impl PooledConnection for FakeConn {
         &self.endpoint
     }
 
+    fn auth_banner(&self) -> Option<String> {
+        None
+    }
+
     fn state(&self) -> SessionState {
         self.state.borrow().clone()
     }
@@ -66,10 +70,7 @@ impl PooledConnection for FakeConn {
         Box::pin(async { Err(SshError::Closed) })
     }
 
-    fn open_subsystem(
-        &self,
-        _name: String,
-    ) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
+    fn open_subsystem(&self, _name: String) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
         Box::pin(async { Err(SshError::Closed) })
     }
 
@@ -78,6 +79,24 @@ impl PooledConnection for FakeConn {
         _sudo_user: String,
         _password: Zeroizing<String>,
     ) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
+        Box::pin(async { Err(SshError::Closed) })
+    }
+
+    fn open_direct_tcpip(
+        &self,
+        _host: String,
+        _port: u16,
+    ) -> BoxFuture<'_, Result<SubsystemStream, SshError>> {
+        Box::pin(async { Err(SshError::Closed) })
+    }
+
+    fn remote_forward(
+        &self,
+        _bind_host: String,
+        _bind_port: u16,
+        _target_host: String,
+        _target_port: u16,
+    ) -> BoxFuture<'_, Result<u32, SshError>> {
         Box::pin(async { Err(SshError::Closed) })
     }
 
@@ -147,8 +166,9 @@ fn plans(calls: Arc<AtomicUsize>) -> PlanSource {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(DialPlan {
                 credential: Credential::Agent,
-                verifier: Box::new(TrustAll),
+                verifier: SharedHostKeyVerifier::new(Box::new(TrustAll)),
                 keepalive: None,
+                hops: Vec::new(),
             })
         })
     })
@@ -164,7 +184,13 @@ fn endpoint(host: &str) -> LiveEndpoint {
 
 fn key(host: &str) -> TransportKey {
     let id = HostId(format!("h-{host}"));
-    TransportKey::new(id.clone(), endpoint(host), AuthRef::Host { host_id: id.0 }, 30)
+    TransportKey::new(
+        id.clone(),
+        endpoint(host),
+        AuthRef::Host { host_id: id.0 },
+        30,
+        Vec::new(),
+    )
 }
 
 struct Harness {
@@ -178,7 +204,11 @@ impl Harness {
         let factory = Arc::new(FakeFactory::default());
         let plan_calls = Arc::new(AtomicUsize::new(0));
         let pool = TransportPool::new(factory.dialer(), plans(Arc::clone(&plan_calls)), options);
-        Self { pool, factory, plan_calls }
+        Self {
+            pool,
+            factory,
+            plan_calls,
+        }
     }
 
     fn dial_count(&self) -> usize {
@@ -190,7 +220,10 @@ impl Harness {
     }
 
     async fn acquire(&self, host: &str) -> Lease {
-        self.pool.acquire(key(host), LeaseKind::Shell).await.expect("拨号应当成功")
+        self.pool
+            .acquire(key(host), LeaseKind::Shell)
+            .await
+            .expect("拨号应当成功")
     }
 }
 
@@ -212,7 +245,7 @@ async fn five_concurrent_acquires_of_one_host_dial_once() {
         h.pool.acquire(key("db1"), LeaseKind::Shell),
         h.pool.acquire(key("db1"), LeaseKind::Sftp),
     );
-    let leases = vec![
+    let leases = [
         a.expect("五个请求都该成功"),
         b.expect("五个请求都该成功"),
         c.expect("五个请求都该成功"),
@@ -223,7 +256,10 @@ async fn five_concurrent_acquires_of_one_host_dial_once() {
     assert_eq!(h.dial_count(), 1, "五次认证就是两次 OTP 弹窗的根源");
     assert_eq!(h.plan_count(), 1, "凭据来源也只该被问一次");
     for pair in leases.windows(2) {
-        assert!(pair[0].shares_transport_with(&pair[1]), "复用必须是同一条 transport");
+        assert!(
+            pair[0].shares_transport_with(&pair[1]),
+            "复用必须是同一条 transport"
+        );
     }
     assert_eq!(h.pool.idle_count(), 0);
 }
@@ -243,18 +279,23 @@ async fn reuse_never_touches_the_credential_source() {
 #[tokio::test(start_paused = true)]
 async fn different_hosts_are_not_serialized_behind_one_dial() {
     let h = Harness::new(PoolOptions::default());
-    h.factory.slow.lock().unwrap().insert("slow".into(), Duration::from_secs(30));
+    h.factory
+        .slow
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Duration::from_secs(30));
 
     let started = tokio::time::Instant::now();
     // 两个请求并发发出：若池用了全局锁，fast 必须等满 30 秒
-    let (slow, (fast_at, fast)) = tokio::join!(
-        h.acquire("slow"),
-        async {
-            let lease = h.acquire("fast").await;
-            (started.elapsed(), lease)
-        }
+    let (slow, (fast_at, fast)) = tokio::join!(h.acquire("slow"), async {
+        let lease = h.acquire("fast").await;
+        (started.elapsed(), lease)
+    });
+    assert_eq!(
+        fast_at,
+        Duration::ZERO,
+        "另一台主机的请求不该等慢主机的 30 秒"
     );
-    assert_eq!(fast_at, Duration::ZERO, "另一台主机的请求不该等慢主机的 30 秒");
     assert_eq!(fast.endpoint().host, "fast");
     assert_eq!(slow.endpoint().host, "slow");
 }
@@ -263,8 +304,15 @@ async fn different_hosts_are_not_serialized_behind_one_dial() {
 async fn failed_dial_is_not_parked_and_the_next_caller_retries() {
     let h = Harness::new(PoolOptions::default());
     h.factory.fail_times.store(1, Ordering::SeqCst);
-    let err = h.pool.acquire(key("db1"), LeaseKind::Shell).await.unwrap_err();
-    assert!(matches!(err, dbhx_session::SessionError::Ssh(SshError::AuthFailed)));
+    let err = h
+        .pool
+        .acquire(key("db1"), LeaseKind::Shell)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        dbhx_session::SessionError::Ssh(SshError::AuthFailed)
+    ));
     assert_eq!(h.pool.live_count(), 0, "失败的拨号不能留在池里");
 
     let lease = h.acquire("db1").await;
@@ -275,11 +323,18 @@ async fn failed_dial_is_not_parked_and_the_next_caller_retries() {
 #[tokio::test(start_paused = true)]
 async fn parked_connection_is_dropped_when_ttl_expires() {
     let ttl = Duration::from_secs(60);
-    let h = Harness::new(PoolOptions { idle_ttl: ttl, max_idle: 8 });
+    let h = Harness::new(PoolOptions {
+        idle_ttl: ttl,
+        max_idle: 8,
+    });
     let lease = h.acquire("db1").await;
     assert_eq!(h.pool.idle_count(), 0);
     drop(lease);
-    assert_eq!(h.pool.idle_count(), 1, "最后一个 lease 释放 ⇒ 进入 idle park");
+    assert_eq!(
+        h.pool.idle_count(),
+        1,
+        "最后一个 lease 释放 ⇒ 进入 idle park"
+    );
 
     settle().await;
     assert_eq!(h.pool.live_count(), 0, "TTL 到点必须真的断开");
@@ -288,7 +343,10 @@ async fn parked_connection_is_dropped_when_ttl_expires() {
 
 #[tokio::test(start_paused = true)]
 async fn zero_ttl_parks_until_exit() {
-    let h = Harness::new(PoolOptions { idle_ttl: Duration::ZERO, max_idle: 8 });
+    let h = Harness::new(PoolOptions {
+        idle_ttl: Duration::ZERO,
+        max_idle: 8,
+    });
     drop(h.acquire("db1").await);
 
     settle().await;
@@ -298,12 +356,19 @@ async fn zero_ttl_parks_until_exit() {
 
 #[tokio::test(start_paused = true)]
 async fn an_active_lease_is_never_evicted_by_ttl() {
-    let h = Harness::new(PoolOptions { idle_ttl: Duration::from_secs(60), max_idle: 8 });
+    let h = Harness::new(PoolOptions {
+        idle_ttl: Duration::from_secs(60),
+        max_idle: 8,
+    });
     let lease = h.acquire("db1").await;
 
     settle().await;
     assert_eq!(h.pool.live_count(), 1);
-    assert_eq!(h.factory.last().close_count(), 0, "用户正在用的连接不能被超时收走");
+    assert_eq!(
+        h.factory.last().close_count(),
+        0,
+        "用户正在用的连接不能被超时收走"
+    );
 
     drop(lease);
     settle().await;
@@ -312,7 +377,10 @@ async fn an_active_lease_is_never_evicted_by_ttl() {
 
 #[tokio::test(start_paused = true)]
 async fn idle_cap_evicts_the_oldest_parked_connection() {
-    let h = Harness::new(PoolOptions { idle_ttl: Duration::from_secs(3600), max_idle: 1 });
+    let h = Harness::new(PoolOptions {
+        idle_ttl: Duration::from_secs(3600),
+        max_idle: 1,
+    });
     drop(h.acquire("db1").await);
     // 让两条连接的空闲时刻有先后（暂停的时钟里同一时刻无法比新旧）
     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -321,7 +389,11 @@ async fn idle_cap_evicts_the_oldest_parked_connection() {
 
     let third = h.acquire("db3").await;
     assert_eq!(h.dial_count(), 3);
-    assert_eq!(h.pool.live_count(), 2, "超出 max_idle 的最早空闲连接被提前淘汰");
+    assert_eq!(
+        h.pool.live_count(),
+        2,
+        "超出 max_idle 的最早空闲连接被提前淘汰"
+    );
     assert_eq!(h.factory.conn(0).close_count(), 1, "淘汰的是 db1");
     assert_eq!(h.factory.conn(1).close_count(), 0, "较新的 db2 留下");
     assert_eq!(third.endpoint().host, "db3");
@@ -351,7 +423,9 @@ async fn shutdown_closes_everything_including_held_leases() {
 
     h.pool.shutdown().await;
     assert_eq!(h.pool.live_count(), 0);
-    let closes: usize = (0..h.factory.dial_count()).map(|i| h.factory.conn(i).close_count()).sum();
+    let closes: usize = (0..h.factory.dial_count())
+        .map(|i| h.factory.conn(i).close_count())
+        .sum();
     assert_eq!(closes, 2);
 
     // 持有中的 lease 之后 drop 既不能 panic，也不该把谁重新请回池里

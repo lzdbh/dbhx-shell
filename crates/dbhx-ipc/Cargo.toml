@@ -11,6 +11,7 @@ dbhx-model.workspace = true
 dbhx-pty.workspace = true
 dbhx-session.workspace = true
 dbhx-sftp.workspace = true
+dbhx-forward.workspace = true
 dbhx-ssh.workspace = true
 dbhx-sync.workspace = true
 dbhx-vault.workspace = true

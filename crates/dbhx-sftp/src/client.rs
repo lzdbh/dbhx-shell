@@ -35,7 +35,10 @@ pub struct SftpOptions {
 
 impl Default for SftpOptions {
     fn default() -> Self {
-        Self { max_inflight_ops: 64, request_timeout_secs: 30 }
+        Self {
+            max_inflight_ops: 64,
+            request_timeout_secs: 30,
+        }
     }
 }
 
@@ -56,7 +59,10 @@ impl SftpClient {
         Self::with_options(stream, SftpOptions::default()).await
     }
 
-    pub async fn with_options(stream: SubsystemStream, options: SftpOptions) -> Result<Self, SftpError> {
+    pub async fn with_options(
+        stream: SubsystemStream,
+        options: SftpOptions,
+    ) -> Result<Self, SftpError> {
         let config = Config {
             max_concurrent_reads: options.max_inflight_ops,
             max_concurrent_writes: options.max_inflight_ops,
@@ -66,7 +72,9 @@ impl SftpClient {
             .await
             .map_err(|e| SftpError::classify(e, "sftp"))?;
         session.set_timeout(options.request_timeout_secs);
-        Ok(Self { session: Arc::new(session) })
+        Ok(Self {
+            session: Arc::new(session),
+        })
     }
 
     /// 交给传输引擎用。引擎只碰文件，不碰目录语义。
@@ -93,7 +101,10 @@ impl SftpClient {
         let canonical = self.canonicalize(target).await?;
         let mut entries = self.read_dir(&canonical).await?;
         sort_entries(&mut entries);
-        Ok(DirListing { path: canonical, entries })
+        Ok(DirListing {
+            path: canonical,
+            entries,
+        })
     }
 
     /// 列举目录，不排序、不解析路径。给「按名字直接取一项」之类的调用方留的窄口子。
@@ -105,7 +116,9 @@ impl SftpClient {
             .map_err(|e| SftpError::classify(e, canonical.to_string()))?;
         // `ReadDir` 已经跳过 `.` 和 `..`，这里不重复过滤：
         // 它内部是把整个目录收进内存再返回迭代器，所以我们拿到的是一份完整快照。
-        Ok(read.map(|entry| to_entry(entry.file_name(), entry.path(), &entry.metadata())).collect())
+        Ok(read
+            .map(|entry| to_entry(entry.file_name(), entry.path(), &entry.metadata()))
+            .collect())
     }
 
     /// 取单个条目的元数据。跟随符号链接。
@@ -115,7 +128,11 @@ impl SftpClient {
             .metadata(target.to_string())
             .await
             .map_err(|e| SftpError::classify(e, target.to_string()))?;
-        Ok(to_entry(path::basename(target).unwrap_or(target).to_string(), target.to_string(), &attrs))
+        Ok(to_entry(
+            path::basename(target).unwrap_or(target).to_string(),
+            target.to_string(),
+            &attrs,
+        ))
     }
 
     /// 取符号链接本身的元数据（不解引用）。
@@ -125,7 +142,11 @@ impl SftpClient {
             .symlink_metadata(target.to_string())
             .await
             .map_err(|e| SftpError::classify(e, target.to_string()))?;
-        Ok(to_entry(path::basename(target).unwrap_or(target).to_string(), target.to_string(), &attrs))
+        Ok(to_entry(
+            path::basename(target).unwrap_or(target).to_string(),
+            target.to_string(),
+            &attrs,
+        ))
     }
 
     /// 是否存在。服务端明确回答「没有」时返回 `false`，其它错误照常上抛——
@@ -195,8 +216,10 @@ impl SftpClient {
             .await
             .map_err(|e| SftpError::classify(e, target.to_string()))?;
         let kept = current.permissions.unwrap_or(0) & !0o7777;
-        let mut attrs = FileAttributes::default();
-        attrs.permissions = Some(kept | (mode & 0o7777));
+        let attrs = FileAttributes {
+            permissions: Some(kept | (mode & 0o7777)),
+            ..Default::default()
+        };
         self.session
             .set_metadata(target.to_string(), attrs)
             .await
@@ -331,24 +354,44 @@ mod tests {
     #[test]
     fn mode_bits_map_to_the_four_kinds() {
         // 0o040000 DIR、0o010000 REG、0o012000 LNK，其余算 Other
-        let dir = to_entry("logs".into(), "/logs".into(), &attrs(Some(0o040755), Some(4096), None));
+        let dir = to_entry(
+            "logs".into(),
+            "/logs".into(),
+            &attrs(Some(0o040755), Some(4096), None),
+        );
         assert_eq!(dir.kind, FileKind::Dir);
         assert_eq!(dir.mode, Some(0o755), "setuid 之外的模式位不该进 UI 字段");
 
-        let file = to_entry("a.bin".into(), "/a.bin".into(), &attrs(Some(0o0100644), Some(7), None));
+        let file = to_entry(
+            "a.bin".into(),
+            "/a.bin".into(),
+            &attrs(Some(0o0100644), Some(7), None),
+        );
         assert_eq!(file.kind, FileKind::File);
         assert_eq!(file.mode, Some(0o644));
 
-        let link = to_entry("current".into(), "/current".into(), &attrs(Some(0o0120777), Some(11), None));
+        let link = to_entry(
+            "current".into(),
+            "/current".into(),
+            &attrs(Some(0o0120777), Some(11), None),
+        );
         assert_eq!(link.kind, FileKind::Symlink);
 
-        let fifo = to_entry("x".into(), "/x".into(), &attrs(Some(0o0010666), Some(0), None));
+        let fifo = to_entry(
+            "x".into(),
+            "/x".into(),
+            &attrs(Some(0o0010666), Some(0), None),
+        );
         assert_eq!(fifo.kind, FileKind::Other);
     }
 
     #[test]
     fn missing_attributes_stay_missing() {
-        let e = to_entry("mystery".into(), "/mystery".into(), &attrs(None, None, None));
+        let e = to_entry(
+            "mystery".into(),
+            "/mystery".into(),
+            &attrs(None, None, None),
+        );
         assert_eq!(e.kind, FileKind::Other, "没给 mode 就不能假装它是文件");
         assert_eq!(e.mode, None);
         assert_eq!(e.mtime_ms, None, "缺 mtime 绝不能变成 1970");
@@ -357,7 +400,11 @@ mod tests {
 
     #[test]
     fn mtime_seconds_become_milliseconds() {
-        let e = to_entry("a".into(), "/a".into(), &attrs(Some(0o0100644), Some(1), Some(1_700_000_000)));
+        let e = to_entry(
+            "a".into(),
+            "/a".into(),
+            &attrs(Some(0o0100644), Some(1), Some(1_700_000_000)),
+        );
         assert_eq!(e.mtime_ms, Some(1_700_000_000_000));
     }
 
@@ -388,7 +435,10 @@ mod tests {
     fn case_only_difference_is_still_stable() {
         let mut entries = vec![entry("LOG", FileKind::File), entry("log", FileKind::File)];
         sort_entries(&mut entries);
-        assert_eq!(entries[0].name, "LOG", "大小写不敏感比较后必须再比一次原名，否则刷新会换序");
+        assert_eq!(
+            entries[0].name, "LOG",
+            "大小写不敏感比较后必须再比一次原名，否则刷新会换序"
+        );
     }
 
     #[test]
@@ -401,6 +451,14 @@ mod tests {
         ];
         sort_entries(&mut entries);
         let kinds: Vec<FileKind> = entries.iter().map(|e| e.kind).collect();
-        assert_eq!(kinds, [FileKind::Dir, FileKind::Symlink, FileKind::File, FileKind::Other]);
+        assert_eq!(
+            kinds,
+            [
+                FileKind::Dir,
+                FileKind::Symlink,
+                FileKind::File,
+                FileKind::Other
+            ]
+        );
     }
 }

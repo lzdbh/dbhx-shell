@@ -234,6 +234,6 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
           else
-            gh release create "$TAG" --draft=false --generate-notes "${files[@]}"
+            gh release create "$TAG" --draft=false --notes-from-tag "${files[@]}"
           fi
           gh release view "$TAG"

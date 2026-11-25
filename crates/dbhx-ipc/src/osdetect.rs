@@ -39,7 +39,9 @@ pub fn parse_probe_output(stdout: &str) -> Option<OsType> {
 /// 抓 os-release 的 `ID=` 行。只认行首的 `ID=`：`ID_LIKE=` 与 `VERSION_ID=` 都不能误伤。
 fn os_release_id(text: &str) -> Option<String> {
     for line in text.lines() {
-        let Some(value) = line.trim().strip_prefix("ID=") else { continue };
+        let Some(value) = line.trim().strip_prefix("ID=") else {
+            continue;
+        };
         // 老发行版（CentOS 7 那一代）给值加引号
         let value = value.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
         if !value.is_empty() {
@@ -111,7 +113,9 @@ async fn detect_and_store(
     host_id: HostId,
     key: TransportKey,
 ) {
-    let Some(detected) = probe(&pool, &key).await else { return };
+    let Some(detected) = probe(&pool, &key).await else {
+        return;
+    };
     persist(&vault, &bus, &host_id, detected);
 }
 
@@ -146,7 +150,12 @@ async fn probe(pool: &Arc<TransportPool>, key: &TransportKey) -> Option<OsType> 
 /// 写回 vault。**判据是「当前记录仍是未知」**：探测在后台跑，这零点几秒里用户完全
 /// 可能已经手选过系统，那是更高的意志；记录被删掉同理。只有真的写成了才发变更事件，
 /// 否则前端会为一次没发生的修改白刷一遍。
-fn persist(vault: &Arc<Mutex<Vault>>, bus: &mpsc::Sender<BusEvent>, host_id: &HostId, detected: OsType) {
+fn persist(
+    vault: &Arc<Mutex<Vault>>,
+    bus: &mpsc::Sender<BusEvent>,
+    host_id: &HostId,
+    detected: OsType,
+) {
     let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
     let Some(mut record) = vault.host(host_id).cloned() else {
         tracing::debug!(host = %host_id.0, "系统探测：记录已不在，放弃写回");
@@ -164,7 +173,10 @@ fn persist(vault: &Arc<Mutex<Vault>>, bus: &mpsc::Sender<BusEvent>, host_id: &Ho
         return;
     }
     // 与命令层同构：计数不是秘密，前端收到就重取主机列表，图标跟着换
-    let changed = VaultChanged { hosts: vault.hosts().len() as u32, secrets: vault.secret_count() as u32 };
+    let changed = VaultChanged {
+        hosts: vault.hosts().len() as u32,
+        secrets: vault.secret_count() as u32,
+    };
     let _ = bus.try_send(BusEvent::VaultChanged(changed));
     tracing::info!(host = %host_id.0, ?detected, "系统探测：已按远端实际系统落库");
 }
@@ -196,7 +208,10 @@ mod tests {
         assert_eq!(parse_probe_output("ID=\"almalinux\"\n"), Some(OsType::Alma));
         assert_eq!(parse_probe_output("ID=alma\n"), Some(OsType::Alma));
         assert_eq!(parse_probe_output("ID=\"rhel\"\n"), Some(OsType::Rhel));
-        assert_eq!(parse_probe_output("ID=\"opensuse-leap\"\n"), Some(OsType::Opensuse));
+        assert_eq!(
+            parse_probe_output("ID=\"opensuse-leap\"\n"),
+            Some(OsType::Opensuse)
+        );
         assert_eq!(parse_probe_output("ID=\"sles\"\n"), Some(OsType::Opensuse));
         assert_eq!(parse_probe_output("ID=uos\n"), Some(OsType::Deepin));
         assert_eq!(parse_probe_output("ID=freebsd\n"), Some(OsType::Freebsd));
@@ -205,7 +220,8 @@ mod tests {
     #[test]
     fn version_id_and_id_like_do_not_shadow_the_id_line() {
         // 只认行首 `ID=`：`ID_LIKE` 在前、`VERSION_ID` 在后，都不能先被抓住
-        let text = "ID_LIKE=\"rhel fedora\"\nVERSION_ID=\"9\"\nNAME=\"CentOS Stream\"\nID=\"centos\"\n";
+        let text =
+            "ID_LIKE=\"rhel fedora\"\nVERSION_ID=\"9\"\nNAME=\"CentOS Stream\"\nID=\"centos\"\n";
         assert_eq!(parse_probe_output(text), Some(OsType::Centos));
         // 反过来：只有 ID_LIKE 没有 ID 时，不该拿 ID_LIKE 的值冒充
         assert_eq!(parse_probe_output("ID_LIKE=debian\n"), None);
@@ -227,13 +243,19 @@ mod tests {
 
     #[test]
     fn a_windows_ver_banner_is_recognized() {
-        assert_eq!(parse_probe_output("Microsoft Windows [Version 10.0.22631.4460]\r\n"), Some(OsType::Windows));
+        assert_eq!(
+            parse_probe_output("Microsoft Windows [Version 10.0.22631.4460]\r\n"),
+            Some(OsType::Windows)
+        );
     }
 
     #[test]
     fn garbage_yields_nothing_and_is_never_guessed() {
         assert_eq!(parse_probe_output(""), None);
-        assert_eq!(parse_probe_output("cat: /etc/os-release: No such file or directory\n"), None);
+        assert_eq!(
+            parse_probe_output("cat: /etc/os-release: No such file or directory\n"),
+            None
+        );
         // 报错行里恰好带个系统名也不该被当答案：整行必须就是系统名
         assert_eq!(parse_probe_output("bash: Linux: command not found\n"), None);
     }
@@ -247,7 +269,11 @@ mod tests {
             favorite: false,
             protocol: Protocol::Ssh,
             os,
-            endpoint: Endpoint { host: "10.0.0.9".into(), port: None, username: "app".into() },
+            endpoint: Endpoint {
+                host: "10.0.0.9".into(),
+                port: None,
+                username: "app".into(),
+            },
             auth_mode: AuthMode::Password,
             identity_id: None,
             password_secret_id: None,
@@ -255,12 +281,16 @@ mod tests {
             encoding: TerminalEncoding::Utf8,
             created_at_ms: 7,
             updated_at_ms: 8,
+            jump: vec![],
+            tunnels: vec![],
         }
     }
 
     /// 每个用例一份全新目录。vault 打开即落文件，用例之间不能共用一个目录。
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("dbhx-ipc-osdetect").join(format!("{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join("dbhx-ipc-osdetect")
+            .join(format!("{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -269,35 +299,44 @@ mod tests {
     #[test]
     fn an_unknown_record_adopts_the_detected_os_and_announces_it() {
         let dir = scratch("adopt");
-        let mut vault = Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
+        let mut vault =
+            Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
         let host_id = vault.upsert_host(record(OsType::Unknown));
         let vault = Arc::new(Mutex::new(vault));
         let (bus, mut rx) = mpsc::channel(4);
 
         persist(&vault, &bus, &host_id, OsType::Ubuntu);
 
-        assert_eq!(vault.lock().unwrap().host(&host_id).map(|r| r.os), Some(OsType::Ubuntu));
+        assert_eq!(
+            vault.lock().unwrap().host(&host_id).map(|r| r.os),
+            Some(OsType::Ubuntu)
+        );
         assert!(
             matches!(rx.try_recv(), Ok(BusEvent::VaultChanged(c)) if c.hosts == 1 && c.secrets == 0),
             "落库成功必须发一次变更事件，前端才知道要换图标"
         );
         // 关掉第一份再重开：证明 flush 真的落盘了，而不是只在内存里改了改
         drop(vault);
-        let reopened = Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
+        let reopened =
+            Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
         assert_eq!(reopened.host(&host_id).map(|r| r.os), Some(OsType::Ubuntu));
     }
 
     #[test]
     fn a_manual_choice_is_never_overwritten_and_nothing_is_announced() {
         let dir = scratch("manual");
-        let mut vault = Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
+        let mut vault =
+            Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
         let host_id = vault.upsert_host(record(OsType::Centos));
         let vault = Arc::new(Mutex::new(vault));
         let (bus, mut rx) = mpsc::channel(4);
 
         // 探测在后台跑，这零点几秒里用户手选了 CentOS：手选赢，探测结果丢
         persist(&vault, &bus, &host_id, OsType::Ubuntu);
-        assert_eq!(vault.lock().unwrap().host(&host_id).map(|r| r.os), Some(OsType::Centos));
+        assert_eq!(
+            vault.lock().unwrap().host(&host_id).map(|r| r.os),
+            Some(OsType::Centos)
+        );
         assert!(rx.try_recv().is_err(), "没写成的探测不该发变更事件");
 
         // 记录在探测期间被删除：同样安静收场

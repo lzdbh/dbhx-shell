@@ -144,6 +144,26 @@ pub fn breadcrumb(path: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// 按最后一个 `.` 拆成 `(stem, ext)`。隐藏文件（`.bashrc`）整段都算 stem；
+/// 尾部点（`name.`）也算没有扩展名。
+pub fn split_extension(name: &str) -> (String, Option<String>) {
+    match name.rfind('.') {
+        Some(idx) if idx > 0 && idx + 1 < name.len() => {
+            (name[..idx].to_string(), Some(name[idx + 1..].to_string()))
+        }
+        _ => (name.to_string(), None),
+    }
+}
+
+/// 在扩展名之前插 ` (n)`，用于冲突重命名。
+pub fn with_suffix(name: &str, n: u32) -> String {
+    let (stem, ext) = split_extension(name);
+    match ext {
+        Some(ext) => format!("{stem} ({n}).{ext}"),
+        None => format!("{stem} ({n})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,9 +199,26 @@ mod tests {
         assert_eq!(join("/var", "log"), "/var/log");
         assert_eq!(join("/var/", "log"), "/var/log");
         assert_eq!(join("/var", ""), "/var");
-        assert_eq!(join("/var", "/etc/passwd"), "/etc/passwd", "绝对名字直接覆盖 base");
+        assert_eq!(
+            join("/var", "/etc/passwd"),
+            "/etc/passwd",
+            "绝对名字直接覆盖 base"
+        );
         assert_eq!(join("", "a"), "a");
         assert_eq!(join("/", "/"), "/");
+    }
+
+    #[test]
+    fn suffix_sits_before_the_extension_and_keeps_hidden_files_whole() {
+        assert_eq!(
+            split_extension("app.log"),
+            ("app".to_string(), Some("log".to_string()))
+        );
+        assert_eq!(split_extension(".bashrc"), (".bashrc".to_string(), None));
+        assert_eq!(split_extension("name."), ("name.".to_string(), None));
+        assert_eq!(with_suffix("app.log", 2), "app (2).log");
+        assert_eq!(with_suffix("README", 1), "README (1)");
+        assert_eq!(with_suffix(".bashrc", 1), ".bashrc (1)");
     }
 
     #[test]
@@ -189,7 +226,11 @@ mod tests {
         assert_eq!(parent("/").as_deref(), None);
         assert_eq!(parent("/etc").as_deref(), Some("/"));
         assert_eq!(parent("/var/log/app").as_deref(), Some("/var/log"));
-        assert_eq!(parent("/var/log/").as_deref(), Some("/var"), "尾斜杠只是写法差异");
+        assert_eq!(
+            parent("/var/log/").as_deref(),
+            Some("/var"),
+            "尾斜杠只是写法差异"
+        );
         assert_eq!(parent(".").as_deref(), None);
         assert_eq!(parent("a").as_deref(), Some("."));
         assert_eq!(parent("a/b").as_deref(), Some("a"));
@@ -225,14 +266,21 @@ mod tests {
             ]
         );
         assert!(breadcrumb("/").is_empty());
-        assert!(breadcrumb("relative/path").is_empty(), "相对路径没有可点的面包屑");
+        assert!(
+            breadcrumb("relative/path").is_empty(),
+            "相对路径没有可点的面包屑"
+        );
     }
 
     #[test]
     fn tilde_only_gets_slashed_never_expanded() {
         assert_eq!(expand_tilde("~"), "~/");
         assert_eq!(expand_tilde("~/logs"), "~/logs");
-        assert_eq!(expand_tilde("~deploy"), "~deploy", "带用户名的形式交服务端判断");
+        assert_eq!(
+            expand_tilde("~deploy"),
+            "~deploy",
+            "带用户名的形式交服务端判断"
+        );
         assert_eq!(expand_tilde("/etc"), "/etc");
     }
 

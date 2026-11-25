@@ -18,12 +18,16 @@ use dbhx_session::{
 /// 永不成功的池：`open_remote` 在这里就必须失败，且失败得有辨识度。
 fn failing_pool() -> Arc<TransportPool> {
     // 闭包返回值必须标注成 BoxFuture，否则推导不出 `dyn Future` 那层间接
-    let dialer: Dialer = Box::new(|_key, _plan| -> BoxFuture<'static, Result<SharedConnection, SessionError>> {
-        Box::pin(async { Err(SessionError::Closed) })
-    });
-    let plans: PlanSource = Box::new(|_key| -> BoxFuture<'static, Result<DialPlan, SessionError>> {
-        Box::pin(async { Err(SessionError::Closed) })
-    });
+    let dialer: Dialer = Box::new(
+        |_key, _plan| -> BoxFuture<'static, Result<SharedConnection, SessionError>> {
+            Box::pin(async { Err(SessionError::Closed) })
+        },
+    );
+    let plans: PlanSource = Box::new(
+        |_key| -> BoxFuture<'static, Result<DialPlan, SessionError>> {
+            Box::pin(async { Err(SessionError::Closed) })
+        },
+    );
     Arc::new(TransportPool::new(dialer, plans, Default::default()))
 }
 
@@ -38,7 +42,9 @@ fn pty() -> PtySize {
 /// 一条会立刻退出并把标记打到 stdout 的命令。
 fn echo_spec(marker: &str) -> LocalSpec {
     #[cfg(windows)]
-    let spec = LocalSpec::default().program("cmd.exe").args(&["/C", &format!("echo {marker}")]);
+    let spec = LocalSpec::default()
+        .program("cmd.exe")
+        .args(&["/C", &format!("echo {marker}")]);
     #[cfg(not(windows))]
     let spec = LocalSpec::default().program("/bin/echo").args(&[marker]);
     spec.pty(pty())
@@ -54,7 +60,8 @@ fn shell_spec() -> LocalSpec {
 }
 
 fn open_local(m: &SessionManager, label: &str, spec: &LocalSpec) -> SessionRecord {
-    m.open_local(spec, label.into(), TerminalEncoding::Utf8).expect("本地终端应能起")
+    m.open_local(spec, label.into(), TerminalEncoding::Utf8)
+        .expect("本地终端应能起")
 }
 
 /// 从事件流里读到包含 `needle` 的输出为止；超时即失败，不留悬挂测试。
@@ -96,7 +103,11 @@ async fn ids_start_at_one_and_are_unique() {
     assert_eq!(second.id, SessionId(2));
     assert_eq!(m.count(), 2);
     assert_eq!(m.list().len(), 2);
-    assert_eq!(m.list()[0].label, "a", "列表按 id 稳定排序，前端 tab 顺序才不会飘");
+    assert_eq!(
+        m.list()[0].label,
+        "a",
+        "列表按 id 稳定排序，前端 tab 顺序才不会飘"
+    );
 
     m.close(first.id).await.unwrap();
     m.close(second.id).await.unwrap();
@@ -122,7 +133,11 @@ async fn output_reaches_the_hub_and_the_entry_is_reaped_after_exit() {
 
     // 子进程退出 ⇒ Ended ⇒ 转发任务摘条目
     let info = drain_until_ended(&mut rx).await;
-    assert_eq!(info.map(|i| i.exit_status), Some(Some(0)), "echo 正常退出，退出码必须带出来");
+    assert_eq!(
+        info.map(|i| i.exit_status),
+        Some(Some(0)),
+        "echo 正常退出，退出码必须带出来"
+    );
     for _ in 0..100 {
         if m.count() == 0 {
             return;
@@ -152,16 +167,26 @@ async fn closing_a_local_tab_ends_the_stream_and_frees_the_slot() {
     }
     assert_eq!(m.count(), 0, "关闭 tab 后标签页必须从注册表消失");
     // 已经没了的会话再操作只能报错，不能 panic
-    assert!(matches!(m.write(record.id, b"x").await, Err(SessionError::NoSuchSession(_))));
+    assert!(matches!(
+        m.write(record.id, b"x").await,
+        Err(SessionError::NoSuchSession(_))
+    ));
 }
 
 #[tokio::test]
 async fn resize_is_recorded_on_the_session() {
     let m = manager();
     let record = open_local(&m, "size", &shell_spec());
-    let big = PtySize { rows: 50, cols: 200 };
+    let big = PtySize {
+        rows: 50,
+        cols: 200,
+    };
     m.resize(record.id, &big).await.unwrap();
-    assert_eq!(m.record(record.id).unwrap().pty, big, "前端重开面板时要拿到最新行列");
+    assert_eq!(
+        m.record(record.id).unwrap().pty,
+        big,
+        "前端重开面板时要拿到最新行列"
+    );
     m.close(record.id).await.unwrap();
 }
 
@@ -169,9 +194,18 @@ async fn resize_is_recorded_on_the_session() {
 async fn unknown_session_is_an_error_on_every_verb() {
     let m = manager();
     let ghost = SessionId(999);
-    assert!(matches!(m.write(ghost, b"x").await, Err(SessionError::NoSuchSession(999))));
-    assert!(matches!(m.resize(ghost, &pty()).await, Err(SessionError::NoSuchSession(_))));
-    assert!(matches!(m.close(ghost).await, Err(SessionError::NoSuchSession(_))));
+    assert!(matches!(
+        m.write(ghost, b"x").await,
+        Err(SessionError::NoSuchSession(999))
+    ));
+    assert!(matches!(
+        m.resize(ghost, &pty()).await,
+        Err(SessionError::NoSuchSession(_))
+    ));
+    assert!(matches!(
+        m.close(ghost).await,
+        Err(SessionError::NoSuchSession(_))
+    ));
     assert!(m.record(ghost).is_none());
 
     let ipc: dbhx_model::IpcError = SessionError::NoSuchSession(999).into();
@@ -184,12 +218,28 @@ async fn remote_open_failure_leaves_no_session_and_no_id_burn() {
     let m = manager();
     let key = TransportKey::new(
         HostId("h1".into()),
-        LiveEndpoint { host: "nope".into(), port: 22, username: "root".into() },
+        LiveEndpoint {
+            host: "nope".into(),
+            port: 22,
+            username: "root".into(),
+        },
         AuthRef::Agent,
         0,
+        Vec::new(),
     );
-    let err = m.open_remote(key, "xterm".into(), pty(), TerminalEncoding::Utf8, "nope".into()).await;
-    assert!(matches!(err, Err(SessionError::Closed)), "假池的失败原因必须原样传出去");
+    let err = m
+        .open_remote(
+            key,
+            "xterm".into(),
+            pty(),
+            TerminalEncoding::Utf8,
+            "nope".into(),
+        )
+        .await;
+    assert!(
+        matches!(err, Err(SessionError::Closed)),
+        "假池的失败原因必须原样传出去"
+    );
     assert_eq!(m.count(), 0, "失败的会话不能占着表");
     // id 已经分配过，下一个会话不会复用旧 id——复用会让前端把两个 tab 认成一个
     let record = open_local(&m, "after", &shell_spec());
@@ -205,10 +255,12 @@ async fn dropping_the_manager_closes_the_event_stream_without_stranding_tasks() 
     let mut rx = m.take_events().unwrap();
     open_local(&m, "orphan", &shell_spec());
     drop(m);
-    match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
-        Err(_elapsed) => panic!("注册表都没了，事件流还在挂着"),
-        // 收到 None（发送端随 Inner 一起 drop）或最后一条事件都算结束
-        Ok(_) => {}
+    // 收到 None（发送端随 Inner 一起 drop）或最后一条事件都算结束
+    if tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .is_err()
+    {
+        panic!("注册表都没了，事件流还在挂着");
     }
     // 这里不能有 panic：转发任务在 Weak 落空后只是记一条日志
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -229,18 +281,43 @@ async fn a_telnet_session_is_labeled_telnet_not_ssh() {
 
     let m = manager();
     let record = m
-        .open_telnet("127.0.0.1".into(), port, pty(), TerminalEncoding::Utf8, "tn".into(), HostId("telnet-host".into()))
+        .open_telnet(
+            "127.0.0.1".into(),
+            port,
+            pty(),
+            TerminalEncoding::Utf8,
+            "tn".into(),
+            HostId("telnet-host".into()),
+        )
         .await
         .expect("telnet 应能连上");
 
     // 核心回归：带 live_endpoint 的会话不等于 SSH——telnet 必须如实标注
     assert_eq!(record.info().protocol, dbhx_model::Protocol::Telnet);
     assert!(record.is_remote(), "telnet 有远端地址，算远端会话");
-    assert!(m.transport_key(record.id).is_none(), "telnet 不进 transport 池，面板也就无从复用一条 SSH 连接");
+    assert!(
+        m.transport_key(record.id).is_none(),
+        "telnet 不进 transport 池，面板也就无从复用一条 SSH 连接"
+    );
 
     m.write(record.id, b"ls\r").await.unwrap();
-    m.resize(record.id, &PtySize { rows: 40, cols: 120 }).await.unwrap();
-    assert_eq!(m.record(record.id).unwrap().pty, PtySize { rows: 40, cols: 120 }, "改尺寸要写回条目");
+    m.resize(
+        record.id,
+        &PtySize {
+            rows: 40,
+            cols: 120,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        m.record(record.id).unwrap().pty,
+        PtySize {
+            rows: 40,
+            cols: 120
+        },
+        "改尺寸要写回条目"
+    );
 
     m.close(record.id).await.unwrap();
     // 关闭后条目会随转发任务摘除；给它一点收敛时间，最多到注册表空为止

@@ -12,7 +12,7 @@ import {
 } from '@ant-design/icons-vue'
 
 import { formatTime } from '@/lib/format'
-import { clipboardApi, localApi } from '@/lib/ipc/client'
+import { clipboardApi, localApi, vaultApi } from '@/lib/ipc/client'
 import type { ProviderKind } from '@/lib/ipc/bindings'
 import { lastSyncAgo, summarize } from '@/lib/syncSummary'
 import { useHostkeysStore } from '@/stores/hostkeys'
@@ -29,6 +29,58 @@ const hostkeys = useHostkeysStore()
 const lock = useLockStore()
 const sync = useSyncStore()
 const [messageApi, holder] = message.useMessage()
+
+/** 离线备份：口令只在导出/导入这一瞬间存在，完成后立刻清空。 */
+const backupPass = ref('')
+const backupBusy = ref(false)
+
+async function exportBackup(): Promise<void> {
+  if (!settings.backupPath.trim()) {
+    messageApi.warning('请填写备份文件的绝对路径')
+    return
+  }
+  if (backupPass.value.length < 16) {
+    messageApi.warning('备份口令至少 16 位')
+    return
+  }
+  backupBusy.value = true
+  try {
+    await vaultApi.exportOffline(settings.backupPath.trim(), backupPass.value)
+    messageApi.success('已导出离线备份')
+  } catch (e) {
+    messageApi.error(e instanceof Error ? e.message : '导出失败')
+  } finally {
+    backupBusy.value = false
+    backupPass.value = ''
+  }
+}
+
+async function importBackup(): Promise<void> {
+  if (!settings.backupPath.trim()) {
+    messageApi.warning('请填写备份文件的绝对路径')
+    return
+  }
+  if (backupPass.value.length < 16) {
+    messageApi.warning('备份口令至少 16 位')
+    return
+  }
+  backupBusy.value = true
+  try {
+    const report = await vaultApi.importOffline(settings.backupPath.trim(), backupPass.value)
+    void hosts.refresh()
+    const extra = [
+      report.conflicts.length ? `冲突副本 ${report.conflicts.length} 条` : '',
+      report.missing_credentials.length ? `缺口令 ${report.missing_credentials.length} 台` : '',
+      report.missing_identities.length ? `缺身份 ${report.missing_identities.length} 台` : '',
+    ].filter(Boolean).join('，')
+    messageApi.success(`已导入 ${report.hosts} 台主机、${report.identities} 把身份${extra ? `（${extra}）` : ''}`)
+  } catch (e) {
+    messageApi.error(e instanceof Error ? e.message : '导入失败')
+  } finally {
+    backupBusy.value = false
+    backupPass.value = ''
+  }
+}
 
 /** 同步目的地两选一。值必须是后端契约里的小写串，写错了会被当成非法枚举拒掉。 */
 const PROVIDERS: { value: ProviderKind, label: string }[] = [
@@ -458,6 +510,28 @@ function splitPattern(pattern: string): { host: string, port: number } {
           对所有标签页和分屏生效
         </p>
         <div class="card">
+          <div class="card-body">
+            <div class="row">
+              <div class="row-main">
+                <div class="row-label">
+                  TERM 类型
+                </div>
+                <div class="row-hint">
+                  默认 xterm-256color；远端没装对应 terminfo 时，颜色和全屏程序可能异常
+                </div>
+              </div>
+              <div class="row-ctl">
+                <a-input
+                  v-model:value="settings.term"
+                  size="small"
+                  class="ctl-mid"
+                  placeholder="xterm-256color"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
           <div class="card-head">
             关键字高亮
             <div class="head-ctl">
@@ -606,6 +680,22 @@ function splitPattern(pattern: string): { host: string, port: number } {
             <div class="row">
               <div class="row-main">
                 <div class="row-label">
+                  主密钥
+                </div>
+                <div class="row-hint">
+                  钥匙串不可用时退回应用目录下的 master.key
+                </div>
+              </div>
+              <div class="row-ctl">
+                <span class="state">
+                  <i class="dot" :class="{ ok: lock.keyStore === 'system_keyring' }" />
+                  {{ lock.keyStore === 'system_keyring' ? '系统钥匙串' : '本地文件' }}
+                </span>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-label">
                   自动锁定
                 </div>
                 <div class="row-hint">
@@ -672,6 +762,67 @@ function splitPattern(pattern: string): { host: string, port: number } {
                   </a-button>
                 </a-popconfirm>
               </div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            离线备份
+          </div>
+          <div class="card-body">
+            <p class="row-hint" style="margin-bottom: 8px">
+              整个库（含私钥）用你设定的口令加密成一个文件，可以带到另一台机器恢复
+            </p>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-label">
+                  备份文件
+                </div>
+                <div class="row-hint">
+                  绝对路径；导入时同 id 以备份为准，被覆盖的本地内容会另存副本
+                </div>
+              </div>
+              <div class="row-ctl">
+                <a-input
+                  v-model:value="settings.backupPath"
+                  size="small"
+                  class="ctl-wide"
+                  placeholder="D:\dbhx-backup.dbhx"
+                />
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-label">
+                  备份口令
+                </div>
+                <div class="row-hint">
+                  至少 16 位；不保存，导出/导入后即清空
+                </div>
+              </div>
+              <div class="row-ctl">
+                <a-input-password
+                  v-model:value="backupPass"
+                  size="small"
+                  class="ctl-mid"
+                  autocomplete="new-password"
+                />
+              </div>
+            </div>
+            <div class="edit-actions">
+              <a-button size="small" :loading="backupBusy" @click="void exportBackup()">
+                导出
+              </a-button>
+              <a-popconfirm
+                title="导入会以备份为准覆盖同 id 的记录，确定吗？"
+                ok-text="导入"
+                cancel-text="取消"
+                @confirm="void importBackup()"
+              >
+                <a-button size="small" danger :loading="backupBusy">
+                  导入
+                </a-button>
+              </a-popconfirm>
             </div>
           </div>
         </div>

@@ -116,14 +116,18 @@ pub async fn sync_once(
     include_private_keys: bool,
 ) -> Result<SyncReport, SyncError> {
     if !vault.has_sync_str() || !vault.has_provider_token() {
-        return Ok(SyncReport::of(SyncOutcome::NotConfigured, vault, &MergePlan::default()));
+        return Ok(SyncReport::of(
+            SyncOutcome::NotConfigured,
+            vault,
+            &MergePlan::default(),
+        ));
     }
     // 这两行是明文凭据在本进程里唯一的露面处，出函数作用域就没了：
     // 同步串拿去派生（`normalize` 幂等，为的是容下老代码存进去的带空白串），
     // 令牌交给 `SyncClient` 攥着 —— 它自己也进不了 `Debug`。
     let sync_str = vault.with_sync_str(|p| Ok(envelope::normalize(&String::from_utf8_lossy(p))))?;
-    let token =
-        vault.with_provider_token(|p| Ok(Zeroizing::new(String::from_utf8_lossy(p).into_owned())))?;
+    let token = vault
+        .with_provider_token(|p| Ok(Zeroizing::new(String::from_utf8_lossy(p).into_owned())))?;
     // 这一家同时是 vault 里那份配置的**槽位号**：同步串、令牌、坐标、基线四样都从
     // 同一个槽取，所以不会出现「设置里选 Gitee、坐标却是 GitHub 的片段」这种组合。
     let provider = vault.sync_provider();
@@ -144,7 +148,11 @@ pub async fn sync_once(
     let cloud = match client.fetch(transport).await {
         Ok(c) => c,
         Err(ProviderError::Missing) => {
-            return Ok(SyncReport::of(SyncOutcome::RecreateRequired, vault, &MergePlan::default()))
+            return Ok(SyncReport::of(
+                SyncOutcome::RecreateRequired,
+                vault,
+                &MergePlan::default(),
+            ))
         }
         Err(e) => return Err(e.into()),
     };
@@ -261,7 +269,9 @@ mod tests {
     use crate::wire::{Method, Response, WireError};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use dbhx_model::{AuthMode, Endpoint, HostId, HostRecord, OsType, Protocol, ProviderKind, TerminalEncoding};
+    use dbhx_model::{
+        AuthMode, Endpoint, HostId, HostRecord, OsType, Protocol, ProviderKind, TerminalEncoding,
+    };
     use dbhx_vault::{KeySource, MasterKey};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -271,10 +281,12 @@ mod tests {
 
     /// 按脚本回应的假传输。记下来的只有方法、地址和请求体，**刻意不存令牌** ——
     /// 测试代码自己复制一份令牌，就成了「凭据落在更多地方」的反面样板。
+    type Sent = Arc<Mutex<Vec<(Method, String, Option<serde_json::Value>)>>>;
+
     #[derive(Default)]
     struct Fake {
         queued: Arc<Mutex<VecDeque<Result<Response, WireError>>>>,
-        sent: Arc<Mutex<Vec<(Method, String, Option<serde_json::Value>)>>>,
+        sent: Sent,
     }
 
     impl Fake {
@@ -283,7 +295,10 @@ mod tests {
         }
 
         fn ok(&self, json: serde_json::Value) {
-            self.queued.lock().unwrap().push_back(Ok(Response { status: 200, json }));
+            self.queued
+                .lock()
+                .unwrap()
+                .push_back(Ok(Response { status: 200, json }));
         }
 
         fn fail(&self, err: WireError) {
@@ -293,7 +308,12 @@ mod tests {
         /// 最后一次请求体里那个文件的内容 —— 拿来把「我们真的推了什么」喂回下一次 GET。
         fn last_content(&self) -> String {
             let sent = self.sent.lock().unwrap();
-            let body = sent.last().expect("没有发过任何请求").2.clone().expect("请求体为空");
+            let body = sent
+                .last()
+                .expect("没有发过任何请求")
+                .2
+                .clone()
+                .expect("请求体为空");
             body["files"][SYNC_FILE_NAME]["content"]
                 .as_str()
                 .expect("创建/更新的请求体里没有那个文件")
@@ -301,7 +321,12 @@ mod tests {
         }
 
         fn methods(&self) -> Vec<Method> {
-            self.sent.lock().unwrap().iter().map(|(m, _, _)| *m).collect()
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(m, _, _)| *m)
+                .collect()
         }
 
         /// 最后一次请求打到了哪个地址。选错家的同步在方法与次数上都和选对家一模一样，
@@ -322,7 +347,10 @@ mod tests {
     }
 
     impl Transport for Fake {
-        fn send(&self, req: crate::wire::Request) -> crate::wire::BoxFuture<Result<Response, WireError>> {
+        fn send(
+            &self,
+            req: crate::wire::Request,
+        ) -> crate::wire::BoxFuture<Result<Response, WireError>> {
             self.sent
                 .lock()
                 .unwrap()
@@ -359,12 +387,17 @@ mod tests {
             encoding: TerminalEncoding::Utf8,
             created_at_ms: 0,
             updated_at_ms: 0,
+            jump: vec![],
+            tunnels: vec![],
         }
     }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("dbhx-sync-{tag}-{}-{}", std::process::id(), new_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "dbhx-sync-{tag}-{}-{}",
+            std::process::id(),
+            new_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -444,11 +477,18 @@ mod tests {
         fake.ok(serde_json::json!({ "id": "deadbeef" }));
         let report = sync_once(&mut v, &fake, false).await.unwrap();
         assert_eq!(report.outcome, SyncOutcome::Created);
-        assert_eq!(fake.methods(), vec![Method::Post], "云上还没有，只该创建一次");
+        assert_eq!(
+            fake.methods(),
+            vec![Method::Post],
+            "云上还没有，只该创建一次"
+        );
         let target = v.sync_target().expect("新建的片段坐标必须记下来");
         assert_eq!(target.id, "deadbeef");
         assert_eq!(target.provider, ProviderKind::GitHub);
-        assert!(v.sync_base().unwrap().is_some(), "推成功了就该有基线，否则下次还是整库定胜负");
+        assert!(
+            v.sync_base().unwrap().is_some(),
+            "推成功了就该有基线，否则下次还是整库定胜负"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -490,24 +530,51 @@ mod tests {
         let fake = Fake::new();
         fake.ok(serde_json::json!({ "id": "deadbeef" }));
         sync_once(&mut v, &fake, false).await.unwrap();
-        assert!(v.sync_base().unwrap().is_some(), "没有基线就说明这个用例没测到关键分支");
+        assert!(
+            v.sync_base().unwrap().is_some(),
+            "没有基线就说明这个用例没测到关键分支"
+        );
 
         v.set_sync_provider(ProviderKind::Gitee);
-        assert!(v.sync_target().is_none(), "GitHub 那个片段 id 拼到 gitee.com 上根本读不开");
-        assert!(v.sync_base().unwrap().is_none(), "新那家的槽位是空的，不该带着 github 的基线去同步");
+        assert!(
+            v.sync_target().is_none(),
+            "GitHub 那个片段 id 拼到 gitee.com 上根本读不开"
+        );
+        assert!(
+            v.sync_base().unwrap().is_none(),
+            "新那家的槽位是空的，不该带着 github 的基线去同步"
+        );
         arm_current_provider(&mut v);
 
         let fake = Fake::new();
         fake.ok(serde_json::json!({ "id": "3d0rmjto24pfie6bawxsu73" }));
         let report = sync_once(&mut v, &fake, false).await.unwrap();
-        assert_eq!(report.outcome, SyncOutcome::Created, "换家之后第一次同步该在新那家建一份");
-        assert_eq!(fake.methods(), vec![Method::Post], "换家只该建新的，不该去动老那家");
+        assert_eq!(
+            report.outcome,
+            SyncOutcome::Created,
+            "换家之后第一次同步该在新那家建一份"
+        );
+        assert_eq!(
+            fake.methods(),
+            vec![Method::Post],
+            "换家只该建新的，不该去动老那家"
+        );
         assert_eq!(fake.last_url(), "https://gitee.com/api/v5/gists");
 
         v.set_sync_provider(ProviderKind::GitHub);
-        assert_eq!(v.sync_target().map(|t| t.id).as_deref(), Some("deadbeef"), "切回 github 却找不到原来那个片段");
-        assert!(v.sync_base().unwrap().is_some(), "切回 github 基线却没了，下一次会白推一整份上去");
-        assert_eq!(v.sync_target().map(|t| t.provider), Some(ProviderKind::GitHub));
+        assert_eq!(
+            v.sync_target().map(|t| t.id).as_deref(),
+            Some("deadbeef"),
+            "切回 github 却找不到原来那个片段"
+        );
+        assert!(
+            v.sync_base().unwrap().is_some(),
+            "切回 github 基线却没了，下一次会白推一整份上去"
+        );
+        assert_eq!(
+            v.sync_target().map(|t| t.provider),
+            Some(ProviderKind::GitHub)
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -520,7 +587,10 @@ mod tests {
         assert_eq!(report.outcome, SyncOutcome::Nothing);
         assert_eq!(fake.count(), 0, "空列表不值得在云上开一个片段");
         assert!(v.sync_target().is_none());
-        assert!(v.sync_base().unwrap().is_none(), "云上根本没有片段时谈不上「与云端一致」");
+        assert!(
+            v.sync_base().unwrap().is_none(),
+            "云上根本没有片段时谈不上「与云端一致」"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -532,13 +602,24 @@ mod tests {
     async fn a_pull_without_a_push_still_refreshes_the_baseline() {
         let dir = temp_dir("baseline-refresh");
         let mut v = configured_vault(&dir);
-        v.set_sync_target(Some(SyncTarget { provider: ProviderKind::GitHub, id: "abc123".into() }));
+        v.set_sync_target(Some(SyncTarget {
+            provider: ProviderKind::GitHub,
+            id: "abc123".into(),
+        }));
         let fake = Fake::new();
         fake.ok(gist_json(&URL_SAFE_NO_PAD.encode(other_devices_blob())));
         sync_once(&mut v, &fake, false).await.unwrap();
         let base = v.sync_base().unwrap().expect("只读这一次也该有基线");
-        assert_eq!(base.hosts.len(), 1, "基线该是合并完的本地，不是同步前那份空的");
-        assert_eq!(base.device_id, v.device_id(), "基线是本机的快照，不是云端那份的复制");
+        assert_eq!(
+            base.hosts.len(),
+            1,
+            "基线该是合并完的本地，不是同步前那份空的"
+        );
+        assert_eq!(
+            base.device_id,
+            v.device_id(),
+            "基线是本机的快照，不是云端那份的复制"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -559,8 +640,16 @@ mod tests {
         second.ok(gist_json(&content));
         let report = sync_once(&mut v, &second, false).await.unwrap();
         assert_eq!(report.outcome, SyncOutcome::Nothing);
-        assert_eq!(second.methods(), vec![Method::Get], "内容没变就不该再写云上");
-        assert_eq!(v.sync_target().unwrap().id, "deadbeef", "不能因为又推了一次就换片段");
+        assert_eq!(
+            second.methods(),
+            vec![Method::Get],
+            "内容没变就不该再写云上"
+        );
+        assert_eq!(
+            v.sync_target().unwrap().id,
+            "deadbeef",
+            "不能因为又推了一次就换片段"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -572,7 +661,10 @@ mod tests {
     async fn a_new_device_pulls_the_cloud_list_without_pushing_the_union_back() {
         let dir = temp_dir("new-device");
         let mut v = configured_vault(&dir);
-        v.set_sync_target(Some(SyncTarget { provider: ProviderKind::GitHub, id: "abc123".into() }));
+        v.set_sync_target(Some(SyncTarget {
+            provider: ProviderKind::GitHub,
+            id: "abc123".into(),
+        }));
         let fake = Fake::new();
         fake.ok(gist_json(&URL_SAFE_NO_PAD.encode(other_devices_blob())));
         let report = sync_once(&mut v, &fake, false).await.unwrap();
@@ -595,13 +687,20 @@ mod tests {
     async fn a_gist_deleted_on_the_web_asks_the_user_to_recreate_and_changes_nothing() {
         let dir = temp_dir("gist-gone");
         let mut v = vault_with_host(&dir, "本机的一台");
-        v.set_sync_target(Some(SyncTarget { provider: ProviderKind::GitHub, id: "deadbeef".into() }));
+        v.set_sync_target(Some(SyncTarget {
+            provider: ProviderKind::GitHub,
+            id: "deadbeef".into(),
+        }));
         let fake = Fake::new();
         fake.fail(WireError::NotFound);
         let report = sync_once(&mut v, &fake, false).await.unwrap();
         assert_eq!(report.outcome, SyncOutcome::RecreateRequired);
         assert_eq!(fake.methods(), vec![Method::Get]);
-        assert_eq!(v.sync_target().unwrap().id, "deadbeef", "没经用户点头不许把坐标抹掉");
+        assert_eq!(
+            v.sync_target().unwrap().id,
+            "deadbeef",
+            "没经用户点头不许把坐标抹掉"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -616,20 +715,33 @@ mod tests {
         v.set_provider_token(FAKE_TOKEN).unwrap();
         let hid = v.upsert_host(host("本机自己建的一台"));
         v.set_host_password(&hid, b"pw").unwrap();
-        v.set_sync_target(Some(SyncTarget { provider: ProviderKind::GitHub, id: "abc123".into() }));
+        v.set_sync_target(Some(SyncTarget {
+            provider: ProviderKind::GitHub,
+            id: "abc123".into(),
+        }));
 
         let fake = Fake::new();
         // 云上那份是 B 推的：合并完本地有两台，于是必须回推 —— 而这次回推被拒了。
         fake.ok(gist_json(&URL_SAFE_NO_PAD.encode(other_devices_blob())));
         fake.fail(WireError::Unauthorized);
         let err = sync_once(&mut v, &fake, false).await.unwrap_err();
-        assert!(matches!(err, SyncError::Cloud(ProviderError::Wire(WireError::Unauthorized))));
+        assert!(matches!(
+            err,
+            SyncError::Cloud(ProviderError::Wire(WireError::Unauthorized))
+        ));
         assert_eq!(fake.methods(), vec![Method::Get, Method::Patch]);
 
         drop(v);
         let reopened = Vault::open(&dir, KeySource::File(key_path)).unwrap();
-        assert_eq!(reopened.hosts().len(), 2, "取回来的那台不能因为推送失败就丢了");
-        assert!(reopened.sync_base().unwrap().is_none(), "推失败还更新基线，下次会把该推的当成已一致");
+        assert_eq!(
+            reopened.hosts().len(),
+            2,
+            "取回来的那台不能因为推送失败就丢了"
+        );
+        assert!(
+            reopened.sync_base().unwrap().is_none(),
+            "推失败还更新基线，下次会把该推的当成已一致"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -660,42 +772,72 @@ mod tests {
             v.set_sync_provider(provider);
         }
 
-        for (label, pw) in [("生产库", "pw-prod".as_bytes()), ("测试库", "pw-test".as_bytes())] {
+        for (label, pw) in [
+            ("生产库", "pw-prod".as_bytes()),
+            ("测试库", "pw-test".as_bytes()),
+        ] {
             let hid = a.upsert_host(host(label));
             a.set_host_password(&hid, pw).unwrap();
         }
-        let report = sync_once(&mut a, &transport, false).await.expect("A 首同步失败");
+        let report = sync_once(&mut a, &transport, false)
+            .await
+            .expect("A 首同步失败");
         assert_eq!(report.outcome, SyncOutcome::Created);
         let target = a.sync_target().expect("没记下新建的片段坐标");
-        assert_eq!(target.provider, provider, "编排层把新建的片段记到了另一家名下");
+        assert_eq!(
+            target.provider, provider,
+            "编排层把新建的片段记到了另一家名下"
+        );
         b.set_sync_target(Some(target.clone()));
 
-        let report = sync_once(&mut b, &transport, false).await.expect("B 拉取失败");
-        assert_eq!(report.outcome, SyncOutcome::Pulled, "新设备只该读，不该白写一遍");
+        let report = sync_once(&mut b, &transport, false)
+            .await
+            .expect("B 拉取失败");
+        assert_eq!(
+            report.outcome,
+            SyncOutcome::Pulled,
+            "新设备只该读，不该白写一遍"
+        );
         assert_eq!(b.hosts().len(), 2, "云上两台都要落到 B");
         let mut got = Vec::new();
         for h in b.hosts() {
-            let sid = h.password_secret_id.clone().expect("口令密文该跟着主机一起过来");
+            let sid = h
+                .password_secret_id
+                .clone()
+                .expect("口令密文该跟着主机一起过来");
             let plain = b.with_secret(&sid, |p| Ok(p.to_vec())).unwrap();
             got.push((h.label.clone(), String::from_utf8(plain).unwrap()));
         }
         got.sort();
         assert_eq!(
             got,
-            vec![("测试库".to_string(), "pw-test".to_string()), ("生产库".to_string(), "pw-prod".to_string())],
+            vec![
+                ("测试库".to_string(), "pw-test".to_string()),
+                ("生产库".to_string(), "pw-prod".to_string())
+            ],
             "B 用另一把主密钥转封之后，口令读出来变了"
         );
 
         // A 再加一台：先拉后推，B 那边跟着取回，再点一次就只剩一次 GET
         let extra = a.upsert_host(host("临时的另一台"));
         a.set_host_password(&extra, b"pw-extra").unwrap();
-        let report = sync_once(&mut a, &transport, false).await.expect("A 回推失败");
+        let report = sync_once(&mut a, &transport, false)
+            .await
+            .expect("A 回推失败");
         assert_eq!(report.outcome, SyncOutcome::Pushed);
-        let report = sync_once(&mut b, &transport, false).await.expect("B 二次拉取失败");
+        let report = sync_once(&mut b, &transport, false)
+            .await
+            .expect("B 二次拉取失败");
         assert_eq!(report.outcome, SyncOutcome::Pulled);
         assert_eq!(b.hosts().len(), 3, "A 后加的那台该跟着过来");
-        let report = sync_once(&mut b, &transport, false).await.expect("B 第三次拉取失败");
-        assert_eq!(report.outcome, SyncOutcome::Nothing, "两边已经一致，不该再写云上");
+        let report = sync_once(&mut b, &transport, false)
+            .await
+            .expect("B 第三次拉取失败");
+        assert_eq!(
+            report.outcome,
+            SyncOutcome::Nothing,
+            "两边已经一致，不该再写云上"
+        );
 
         let cleanup = SyncClient::from_target(&target, token.clone());
         cleanup

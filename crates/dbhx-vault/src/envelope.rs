@@ -53,7 +53,13 @@ pub fn is_usable(sync_str: &str) -> bool {
 
 /// 由同步串与盐派生密钥。派生用的是 `MasterKey`，所以后面可以直接复用
 /// `crypto::seal/open`，不必为同步另写一套 AES——少一条代码路径就少一处能写错的地方。
-fn derive(sync_str: &str, salt: &[u8], mem_kib: u32, turns: u32, parallelism: u32) -> Result<MasterKey, VaultError> {
+fn derive(
+    sync_str: &str,
+    salt: &[u8],
+    mem_kib: u32,
+    turns: u32,
+    parallelism: u32,
+) -> Result<MasterKey, VaultError> {
     let params = Params::new(mem_kib, turns, parallelism, Some(KDF_OUT_LEN as usize))
         .map_err(|e| VaultError::Malformed(format!("argon2 params: {e}")))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -78,7 +84,11 @@ pub fn sync_key(sync_str: &str, salt: &[u8; SALT_LEN]) -> Result<MasterKey, Vaul
 }
 
 /// 用已派生的密钥与**派生它时那份盐**封一份明文。
-pub fn seal_with(key: &MasterKey, salt: &[u8; SALT_LEN], plaintext: &[u8]) -> Result<Vec<u8>, VaultError> {
+pub fn seal_with(
+    key: &MasterKey,
+    salt: &[u8; SALT_LEN],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, VaultError> {
     let sealed = crate::crypto::seal(key, plaintext)?;
     let mut out = Vec::with_capacity(HEADER_LEN + sealed.len());
     out.extend_from_slice(MAGIC);
@@ -153,7 +163,10 @@ pub fn generate_sync_str() -> String {
     let mut raw = [0u8; 24];
     rand::rng().fill_bytes(&mut raw);
     let b64 = crate::store::base64_encode(&raw);
-    b64.replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
+    b64.replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
 }
 
 #[cfg(test)]
@@ -168,7 +181,11 @@ mod tests {
     fn generated_string_is_32_url_safe_chars_and_distinct_each_call() {
         let a = sync_str();
         let b = sync_str();
-        assert_eq!(a.chars().count(), 32, "24 字节 base64url 去掉填充应正好 32 字符");
+        assert_eq!(
+            a.chars().count(),
+            32,
+            "24 字节 base64url 去掉填充应正好 32 字符"
+        );
         assert_ne!(a, b);
         assert!(
             a.chars()
@@ -184,9 +201,7 @@ mod tests {
         let plain = r#"{"hosts":[{"label":"生产库-SECRET-MARKER"}]}"#.as_bytes();
         let blob = seal_blob(&s, plain).unwrap();
         assert!(
-            !blob
-                .windows(12)
-                .any(|w| w == b"SECRET-MARKE"),
+            !blob.windows(12).any(|w| w == b"SECRET-MARKE"),
             "明文标记出现在信封里"
         );
         assert_eq!(open_blob(&s, &blob).unwrap(), plain.to_vec());
@@ -208,7 +223,10 @@ mod tests {
     fn wrong_string_fails_as_crypto_and_not_as_garbage() {
         let blob = seal_blob(&sync_str(), b"secret").unwrap();
         // 错串既不能解密文，也不能被当成「格式坏」——两者都归到解不开这一类
-        assert!(matches!(open_blob(&sync_str(), &blob), Err(VaultError::Crypto)));
+        assert!(matches!(
+            open_blob(&sync_str(), &blob),
+            Err(VaultError::Crypto)
+        ));
     }
 
     #[test]
@@ -238,18 +256,29 @@ mod tests {
         // 否则攻击者只要替换云端文件就能把 KDF 强度降到可爆破。
         let mut downgraded = seal_blob(&s, b"payload").unwrap();
         downgraded[9..13].copy_from_slice(&8u32.to_le_bytes());
-        assert!(matches!(open_blob(&s, &downgraded), Err(VaultError::Malformed(_))));
+        assert!(matches!(
+            open_blob(&s, &downgraded),
+            Err(VaultError::Malformed(_))
+        ));
 
         // 未来版本同理：宁可让用户升级应用，也不「尽力解解看」
         let mut newer = seal_blob(&s, b"payload").unwrap();
         newer[8] = VERSION + 1;
-        assert!(matches!(open_blob(&s, &newer), Err(VaultError::Malformed(_))));
+        assert!(matches!(
+            open_blob(&s, &newer),
+            Err(VaultError::Malformed(_))
+        ));
     }
 
     #[test]
     fn truncated_or_foreign_blobs_are_malformed_not_panics() {
         let s = sync_str();
-        for bad in [vec![], b"short".to_vec(), vec![0u8; HEADER_LEN], b"not a sync blob at all, but long enough to pass the length check".to_vec()] {
+        for bad in [
+            vec![],
+            b"short".to_vec(),
+            vec![0u8; HEADER_LEN],
+            b"not a sync blob at all, but long enough to pass the length check".to_vec(),
+        ] {
             assert!(
                 matches!(open_blob(&s, &bad), Err(VaultError::Malformed(_))),
                 "输入 {bad:?} 没有走 Malformed 分支"
@@ -272,7 +301,11 @@ mod tests {
     fn derive_stays_within_the_budget_the_ui_assumes() {
         // debug 与 release 差一个数量级，用同一条阈值等于要么形同虚设要么天天红。
         // CI 跑 debug，所以 release 那条是给本地 `cargo test --release` 用的。
-        let budget_ms: u128 = if cfg!(debug_assertions) { 15_000 } else { 2_000 };
+        let budget_ms: u128 = if cfg!(debug_assertions) {
+            15_000
+        } else {
+            2_000
+        };
         let started = std::time::Instant::now();
         let s = sync_str();
         let blob = seal_blob(&s, b"payload").unwrap();

@@ -13,7 +13,7 @@
 //! 3. [`BusEvent`] 只是内部总线的一种形状，路由任务把它摊平回 `app.emit`。
 //!    队列只有一个消费者（路由任务），所以事件顺序与产生顺序一致，终端输出不会错位。
 
-use dbhx_model::{DirListing, KnownHost, LiveEndpoint, SessionId, TransferProgress};
+use dbhx_model::{DirListing, KnownHost, LiveEndpoint, SessionId, TransferKind, TransferProgress};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri_specta::Event;
@@ -138,6 +138,24 @@ pub struct VaultChanged {
     pub secrets: u32,
 }
 
+/// 一批传输里发现同名文件，等用户决定整批怎么处理。
+///
+/// 只带前几个路径（`samples`）用于展示；`count` 是完整数量。回答走 `request_reply`。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct TransferConflict {
+    pub request: u32,
+    pub transfer_kind: TransferKind,
+    pub count: usize,
+    pub samples: Vec<String>,
+}
+
+/// 端口转发没能启动（端口被占、钥匙串/通道不可用等）。纯通知，前端弹一条错误。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct TunnelFailed {
+    pub host_id: String,
+    pub message: String,
+}
+
 /// 内部总线的事件。路由任务负责摊平成上面的具体类型再 `emit`。
 #[derive(Debug, Clone)]
 pub enum BusEvent {
@@ -152,6 +170,8 @@ pub enum BusEvent {
     SftpFollowed(SftpFollowed),
     TransferProgress(TransferProgressEvent),
     TransferBatchEnded(TransferBatchEnded),
+    TransferConflict(TransferConflict),
+    TunnelFailed(TunnelFailed),
     VaultChanged(VaultChanged),
 }
 
@@ -171,6 +191,8 @@ impl BusEvent {
             Self::SftpFollowed(_) => SftpFollowed::NAME,
             Self::TransferProgress(_) => TransferProgressEvent::NAME,
             Self::TransferBatchEnded(_) => TransferBatchEnded::NAME,
+            Self::TransferConflict(_) => TransferConflict::NAME,
+            Self::TunnelFailed(_) => TunnelFailed::NAME,
             Self::VaultChanged(_) => VaultChanged::NAME,
         }
     }
@@ -189,6 +211,8 @@ impl BusEvent {
             Self::SftpFollowed(e) => e.emit(app),
             Self::TransferProgress(e) => e.emit(app),
             Self::TransferBatchEnded(e) => e.emit(app),
+            Self::TransferConflict(e) => e.emit(app),
+            Self::TunnelFailed(e) => e.emit(app),
             Self::VaultChanged(e) => e.emit(app),
         };
         if let Err(e) = result {
@@ -248,24 +272,54 @@ mod tests {
     fn every_bus_variant_names_itself() {
         // 路由任务靠 name() 决定 emit 到哪，漏一个分支就是悄悄丢事件
         let cases = [
-            BusEvent::TermData(TermData { session: SessionId(1), data: Vec::<u8>::new().into() }),
-            BusEvent::SessionCwd(SessionCwd { session: SessionId(1), path: "/tmp".into() }),
-            BusEvent::SessionEnded(SessionEnded { session: SessionId(1), exit_status: Some(0), signal: None }),
-            BusEvent::PassphraseRequest(PassphraseRequest { request: 1, identity_label: "k".into() }),
-            BusEvent::SftpCwdChanged(SftpCwdChanged { connection: 1, path: "/tmp".into() }),
-            BusEvent::SftpFollowed(SftpFollowed { connection: 1, listing: None, hold: Some(FollowHold::Busy) }),
-            BusEvent::VaultChanged(VaultChanged { hosts: 1, secrets: 0 }),
+            BusEvent::TermData(TermData {
+                session: SessionId(1),
+                data: Vec::<u8>::new().into(),
+            }),
+            BusEvent::SessionCwd(SessionCwd {
+                session: SessionId(1),
+                path: "/tmp".into(),
+            }),
+            BusEvent::SessionEnded(SessionEnded {
+                session: SessionId(1),
+                exit_status: Some(0),
+                signal: None,
+            }),
+            BusEvent::PassphraseRequest(PassphraseRequest {
+                request: 1,
+                identity_label: "k".into(),
+            }),
+            BusEvent::SftpCwdChanged(SftpCwdChanged {
+                connection: 1,
+                path: "/tmp".into(),
+            }),
+            BusEvent::SftpFollowed(SftpFollowed {
+                connection: 1,
+                listing: None,
+                hold: Some(FollowHold::Busy),
+            }),
+            BusEvent::VaultChanged(VaultChanged {
+                hosts: 1,
+                secrets: 0,
+            }),
         ];
         for case in cases {
             let name = case.name();
             assert!(name.starts_with(|c: char| c.is_ascii_lowercase()), "{name}");
-            assert!(name.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b.is_ascii_digit()), "{name}");
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'-' || b.is_ascii_digit()),
+                "{name}"
+            );
         }
     }
 
     #[test]
     fn term_data_serializes_bytes_as_base64_string() {
-        let e = BusEvent::TermData(TermData { session: SessionId(3), data: vec![0x1b, 0x5b, 0x41].into() });
+        let e = BusEvent::TermData(TermData {
+            session: SessionId(3),
+            data: vec![0x1b, 0x5b, 0x41].into(),
+        });
         let payload = serde_json::to_string(&match &e {
             BusEvent::TermData(d) => d,
             _ => unreachable!(),
@@ -289,16 +343,19 @@ mod tests {
             Hold::StaleGeneration,
             Hold::WeakerSource,
         ] {
-            assert_eq!(hold_of(hold), match hold {
-                Hold::NothingReported => Some(FollowHold::NothingReported),
-                Hold::UserLocked => Some(FollowHold::UserLocked),
-                Hold::Busy => Some(FollowHold::Busy),
-                Hold::Editing => Some(FollowHold::Editing),
-                Hold::Unreachable => Some(FollowHold::Unreachable),
-                Hold::AlreadyShown => Some(FollowHold::AlreadyShown),
-                Hold::StaleGeneration => Some(FollowHold::StaleGeneration),
-                Hold::WeakerSource => Some(FollowHold::WeakerSource),
-            });
+            assert_eq!(
+                hold_of(hold),
+                match hold {
+                    Hold::NothingReported => Some(FollowHold::NothingReported),
+                    Hold::UserLocked => Some(FollowHold::UserLocked),
+                    Hold::Busy => Some(FollowHold::Busy),
+                    Hold::Editing => Some(FollowHold::Editing),
+                    Hold::Unreachable => Some(FollowHold::Unreachable),
+                    Hold::AlreadyShown => Some(FollowHold::AlreadyShown),
+                    Hold::StaleGeneration => Some(FollowHold::StaleGeneration),
+                    Hold::WeakerSource => Some(FollowHold::WeakerSource),
+                }
+            );
         }
     }
 
@@ -306,18 +363,28 @@ mod tests {
     fn followed_event_carries_either_a_listing_or_a_reason() {
         let navigated = SftpFollowed {
             connection: 7,
-            listing: Some(DirListing { path: "/var/log".into(), entries: vec![] }),
+            listing: Some(DirListing {
+                path: "/var/log".into(),
+                entries: vec![],
+            }),
             hold: None,
         };
         let json = serde_json::to_string(&navigated).unwrap();
         assert!(json.contains("\"listing\""), "{json}");
-        let held = SftpFollowed { connection: 7, listing: None, hold: Some(FollowHold::Busy) };
+        let held = SftpFollowed {
+            connection: 7,
+            listing: None,
+            hold: Some(FollowHold::Busy),
+        };
         assert!(serde_json::to_string(&held).unwrap().contains("\"busy\""));
     }
 
     #[test]
     fn passphrase_request_names_the_identity_not_the_key() {
-        let e = PassphraseRequest { request: 1, identity_label: "运维跳板".into() };
+        let e = PassphraseRequest {
+            request: 1,
+            identity_label: "运维跳板".into(),
+        };
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains("BEGIN"), "{json}");
         assert!(json.contains("运维跳板"), "{json}");

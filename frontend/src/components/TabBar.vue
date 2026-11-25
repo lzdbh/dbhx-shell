@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 
 import { CloseCircleOutlined, CloseOutlined, ControlOutlined, FolderOpenOutlined, ForwardOutlined, PlusOutlined, PushpinFilled, PushpinOutlined, SyncOutlined, VideoCameraOutlined } from '@ant-design/icons-vue'
@@ -16,6 +16,22 @@ const sessions = useSessionsStore()
 const layout = useLayoutStore()
 const quick = useQuickStore()
 const [messageApi, holder] = message.useMessage()
+
+/** 拖动标签重排。拖拽期间用本地变量记住起点，drop 时交给 store。 */
+const dragFrom = ref<number | null>(null)
+function onTabDragStart(index: number, event: DragEvent): void {
+  dragFrom.value = index
+  event.dataTransfer?.setData('text/plain', String(index))
+}
+function onTabDragOver(event: DragEvent): void {
+  event.preventDefault()
+}
+function onTabDrop(index: number, event: DragEvent): void {
+  event.preventDefault()
+  const raw = dragFrom.value ?? Number(event.dataTransfer?.getData('text/plain'))
+  dragFrom.value = null
+  if (Number.isInteger(raw)) sessions.moveTab(raw, index)
+}
 
 /** 当前 tab。模板里不能把 `number | null` 收窄，所以在脚本里算好。 */
 const activeTab = computed(() => (sessions.activeId === null ? undefined : sessions.tab(sessions.activeId)))
@@ -142,10 +158,14 @@ watch(() => sessions.logNotice, (text) => {
     <holder />
     <div class="tabs" @contextmenu.self.prevent="openTrackMenu({ x: $event.clientX, y: $event.clientY })">
       <div
-        v-for="tab in sessions.tabs"
+        v-for="(tab, index) in sessions.tabs"
         :key="tab.id"
         class="tab"
         :class="{ active: tab.id === sessions.activeId }"
+        draggable="true"
+        @dragstart="onTabDragStart(index, $event)"
+        @dragover="onTabDragOver"
+        @drop="onTabDrop(index, $event)"
         @click="sessions.activate(tab.id)"
         @contextmenu.prevent.stop="openTabMenu({ x: $event.clientX, y: $event.clientY }, tab)"
       >

@@ -83,12 +83,12 @@ impl From<SshError> for IpcError {
             SshError::InteractiveAuthRequired => {
                 IpcError::new(ErrorCode::AuthFailed, "服务器要求交互式认证", false)
             }
-            SshError::KeyLoad(r) => {
-                IpcError::new(ErrorCode::PermissionDenied, r, false)
-            }
-            SshError::RequestRefused { request } => {
-                IpcError::new(ErrorCode::ChannelClosed, format!("服务器拒绝 {request}"), true)
-            }
+            SshError::KeyLoad(r) => IpcError::new(ErrorCode::PermissionDenied, r, false),
+            SshError::RequestRefused { request } => IpcError::new(
+                ErrorCode::ChannelClosed,
+                format!("服务器拒绝 {request}"),
+                true,
+            ),
             SshError::InvalidInput(r) => IpcError::new(ErrorCode::InvalidInput, r, false),
             // 提权失败的原因已经在本层翻成中文，重试同一条命令不会改变远端 sudoers，
             // 所以 retryable=false：UI 只该给用户「换个用户/口令再试」的入口。
@@ -126,7 +126,8 @@ mod tests {
     fn elevate_denied_keeps_the_reason_and_offers_no_retry() {
         // 「远端 sudo 不允许」是这句话本身，不能被翻成一句通用的权限错误——
         // 用户需要知道该去改 sudoers 而不是再点一次。
-        let e: IpcError = SshError::ElevateDenied("远端 sudo 不允许当前用户使用 sudo，提权失败".into()).into();
+        let e: IpcError =
+            SshError::ElevateDenied("远端 sudo 不允许当前用户使用 sudo，提权失败".into()).into();
         assert_eq!(e.code, ErrorCode::PermissionDenied);
         assert!(e.message.contains("sudo"), "{}", e.message);
         assert!(!e.retryable, "重试同一条 sudo 命令不会改变远端 sudoers");

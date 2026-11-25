@@ -37,6 +37,8 @@ pub enum LeaseKind {
     Sftp,
     /// 连上后借道跑一条 exec 的系统探测（见 `dbhx-ipc` 的 `osdetect`）。几毫秒就还。
     Probe,
+    /// 端口转发。只要隧道还在跑，这条 lease 就不还——连接因此不会被 idle park 回收。
+    Tunnel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +53,10 @@ pub struct PoolOptions {
 
 impl Default for PoolOptions {
     fn default() -> Self {
-        Self { idle_ttl: Duration::from_secs(5 * 60), max_idle: 128 }
+        Self {
+            idle_ttl: Duration::from_secs(5 * 60),
+            max_idle: 128,
+        }
     }
 }
 
@@ -89,7 +94,9 @@ pub struct TransportPool {
 
 impl TransportPool {
     pub fn new(dialer: Dialer, plans: PlanSource, options: PoolOptions) -> Self {
-        Self { inner: Arc::new(Inner::new(dialer, plans, options)) }
+        Self {
+            inner: Arc::new(Inner::new(dialer, plans, options)),
+        }
     }
 
     pub async fn acquire(&self, key: TransportKey, kind: LeaseKind) -> Result<Lease, SessionError> {
@@ -140,14 +147,22 @@ impl Inner {
     /// `std::sync::Mutex` 中毒时继续用而不是 panic：`Lease::drop` 里 panic 会把退出流程
     /// 带崩，而池的状态最差只是「某条连接多活一会儿」，不会把秘密写到错的地方。
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<TransportKey, Entry>> {
-        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<TransportKey, Weak<Slot>>> {
-        self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    async fn acquire(self: Arc<Self>, key: TransportKey, kind: LeaseKind) -> Result<Lease, SessionError> {
+    async fn acquire(
+        self: Arc<Self>,
+        key: TransportKey,
+        kind: LeaseKind,
+    ) -> Result<Lease, SessionError> {
         if let Some(lease) = self.try_reuse(&key, kind) {
             return Ok(lease);
         }
@@ -181,7 +196,12 @@ impl Inner {
             return None;
         }
         entry.hold();
-        Some(Lease { pool: Arc::clone(self), key: key.clone(), kind, conn: Arc::clone(&entry.conn) })
+        Some(Lease {
+            pool: Arc::clone(self),
+            key: key.clone(),
+            kind,
+            conn: Arc::clone(&entry.conn),
+        })
     }
 
     async fn insert_and_lease(
@@ -192,7 +212,14 @@ impl Inner {
     ) -> Lease {
         {
             let mut map = self.entries();
-            map.insert(key.clone(), Entry { conn: Arc::clone(&conn), leases: 1, idle_since: None });
+            map.insert(
+                key.clone(),
+                Entry {
+                    conn: Arc::clone(&conn),
+                    leases: 1,
+                    idle_since: None,
+                },
+            );
         }
         self.supervise(key.clone(), Arc::clone(&conn));
         // 超预算时挤掉最旧的空闲连接。刚插入的这条 leases=1，不会被自己挤掉。
@@ -200,7 +227,12 @@ impl Inner {
         for dead in evicted {
             dead.close().await;
         }
-        Lease { pool: Arc::clone(self), key, kind, conn }
+        Lease {
+            pool: Arc::clone(self),
+            key,
+            kind,
+            conn,
+        }
     }
 
     /// 每条连接一个 supervisor 任务：远端断开 ⇒ 摘除条目。
@@ -229,7 +261,9 @@ impl Inner {
 
     fn remove_if_same(&self, key: &TransportKey, conn: &SharedConnection) -> bool {
         let mut map = self.entries();
-        let same = map.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.conn, conn));
+        let same = map
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.conn, conn));
         same && map.remove(key).is_some()
     }
 
@@ -277,7 +311,11 @@ impl Inner {
         if self.options.idle_ttl.is_zero() {
             return;
         }
-        if self.sweep_armed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if self
+            .sweep_armed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
         let weak = Arc::downgrade(self);
@@ -419,7 +457,11 @@ impl Drop for Lease {
 impl std::fmt::Debug for Lease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 只打身份键与状态：连接对象本身可能带可回溯到凭据的信息
-        f.debug_struct("Lease").field("key", &self.key).field("kind", &self.kind).field("state", &self.state()).finish()
+        f.debug_struct("Lease")
+            .field("key", &self.key)
+            .field("kind", &self.kind)
+            .field("state", &self.state())
+            .finish()
     }
 }
 

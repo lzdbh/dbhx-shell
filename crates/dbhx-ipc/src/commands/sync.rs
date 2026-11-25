@@ -124,7 +124,10 @@ pub fn set_fragment_impl(core: &Core, id: Option<String>) -> Result<(), IpcError
                 false,
             ));
         }
-        Some(id) => Some(SyncTarget { provider: vault.sync_provider(), id: id.to_string() }),
+        Some(id) => Some(SyncTarget {
+            provider: vault.sync_provider(),
+            id: id.to_string(),
+        }),
     };
     // 坐标一变，基线由 vault 一起作废；这里不留「只改 id」的旁路
     vault.set_sync_target(next);
@@ -163,7 +166,13 @@ pub async fn sync_recreate_impl(core: Arc<Core>) -> Result<SyncReport, IpcError>
 
 /// 把一次同步搬到自己的线程上跑完。生产路径走 `HttpTransport`，测试注入假云端 ——
 /// 两边跑的是同一个函数，不存在「测的是一条路、上线是另一条」。
-async fn run_sync(core: Arc<Core>, transport: impl Transport + Send + 'static) -> Result<SyncReport, IpcError> {
+// 同步期间其它碰库命令本来就该排队（见 README）；这里刻意在专用单线程运行时里
+// 跨 await 持有 std Mutex。换成 tokio::sync::Mutex 会改变排队语义。
+#[allow(clippy::await_holding_lock)]
+async fn run_sync(
+    core: Arc<Core>,
+    transport: impl Transport + 'static,
+) -> Result<SyncReport, IpcError> {
     let vault = Arc::clone(&core.vault);
     let (tx, rx) = std::sync::mpsc::channel();
     // 必须是 std 线程而不是 `spawn_blocking`：tokio 的阻塞线程仍然带着运行时上下文，
@@ -176,7 +185,13 @@ async fn run_sync(core: Arc<Core>, transport: impl Transport + Send + 'static) -
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| IpcError::new(ErrorCode::Internal, format!("同步用不起来异步运行时：{e}"), true))
+                .map_err(|e| {
+                    IpcError::new(
+                        ErrorCode::Internal,
+                        format!("同步用不起来异步运行时：{e}"),
+                        true,
+                    )
+                })
                 .and_then(|rt| {
                     rt.block_on(async {
                         let mut guard = vault.lock().unwrap_or_else(|p| p.into_inner());
@@ -189,7 +204,11 @@ async fn run_sync(core: Arc<Core>, transport: impl Transport + Send + 'static) -
             let _ = tx.send(result);
         });
     if started.is_err() {
-        return Err(IpcError::new(ErrorCode::Internal, "起不了同步线程，请稍后再试", true));
+        return Err(IpcError::new(
+            ErrorCode::Internal,
+            "起不了同步线程，请稍后再试",
+            true,
+        ));
     }
 
     // 等结果这一步交给阻塞线程池：worker 线程不该在这儿干等十几秒
@@ -299,7 +318,10 @@ mod tests {
 
     impl Fake {
         fn ok(&self, json: serde_json::Value) {
-            self.queued.lock().unwrap().push_back(Ok(Response { status: 200, json }));
+            self.queued
+                .lock()
+                .unwrap()
+                .push_back(Ok(Response { status: 200, json }));
         }
 
         fn fail(&self, err: WireError) {
@@ -312,8 +334,14 @@ mod tests {
     }
 
     impl Transport for Fake {
-        fn send(&self, req: dbhx_sync::Request) -> dbhx_sync::BoxFuture<Result<Response, WireError>> {
-            self.sent.lock().unwrap().push((req.method, req.url.clone()));
+        fn send(
+            &self,
+            req: dbhx_sync::Request,
+        ) -> dbhx_sync::BoxFuture<Result<Response, WireError>> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((req.method, req.url.clone()));
             let next = self.queued.lock().unwrap().pop_front();
             Box::pin(async move { next.expect("假云端的脚本用完了") })
         }
@@ -333,11 +361,17 @@ mod tests {
             favorite: false,
             protocol: Protocol::Ssh,
             os: OsType::Unknown,
-            endpoint: Endpoint { host: "10.0.0.1".into(), port: None, username: "app".into() },
+            endpoint: Endpoint {
+                host: "10.0.0.1".into(),
+                port: None,
+                username: "app".into(),
+            },
             auth_mode: AuthMode::Password,
             identity_id: None,
             keepalive_secs: 0,
             encoding: TerminalEncoding::Utf8,
+            jump: vec![],
+            tunnels: vec![],
         };
         let id = crate::commands::vault::upsert_host_impl(core, draft).unwrap();
         crate::commands::vault::set_password_impl(core, id, Zeroizing::new("pw".into())).unwrap();
@@ -370,14 +404,17 @@ mod tests {
         let (core, _rx) = tests_harness("sync-short", crate::state::fake_dialer());
         let err = set_str_impl(&core, Some(Zeroizing::new("  太短  ".into()))).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
-        assert!(!status_impl(&core).has_sync_str, "校验失败不能留下一条半截配置");
+        assert!(
+            !status_impl(&core).has_sync_str,
+            "校验失败不能留下一条半截配置"
+        );
     }
 
     #[tokio::test]
     async fn whitespace_from_pasting_is_normalized_away() {
         let (core, _rx) = tests_harness("sync-paste", crate::state::fake_dialer());
         // 从网页上复制常多带一个换行；归一化必须在录入这一次做掉
-        set_str_impl(&core, Some(Zeroizing::new(format!("{SYNC_STR}\r\n").into()))).unwrap();
+        set_str_impl(&core, Some(Zeroizing::new(format!("{SYNC_STR}\r\n")))).unwrap();
         let stored = core
             .vault
             .lock()
@@ -401,13 +438,25 @@ mod tests {
     #[tokio::test]
     async fn a_pasted_url_is_refused_before_it_reaches_the_vault() {
         let (core, _rx) = tests_harness("sync-bad-id", crate::state::fake_dialer());
-        for bad in ["https://gist.github.com/abc", "abc def", "../../evil", "abc?token=1"] {
+        for bad in [
+            "https://gist.github.com/abc",
+            "abc def",
+            "../../evil",
+            "abc?token=1",
+        ] {
             let err = set_fragment_impl(&core, Some(bad.into())).unwrap_err();
-            assert_eq!(err.code, ErrorCode::InvalidInput, "{bad} 本该被挡在录入这一步");
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "{bad} 本该被挡在录入这一步"
+            );
         }
         assert!(status_impl(&core).fragment_id.is_none());
         set_fragment_impl(&core, Some("3d0rmjto24pfie6bawxsu73".into())).unwrap();
-        assert_eq!(status_impl(&core).fragment_id.as_deref(), Some("3d0rmjto24pfie6bawxsu73"));
+        assert_eq!(
+            status_impl(&core).fragment_id.as_deref(),
+            Some("3d0rmjto24pfie6bawxsu73")
+        );
     }
 
     /// 两家各存各的一份：切到另一家看到的是一个空槽，切回来四样都还在。
@@ -426,10 +475,17 @@ mod tests {
         assert_eq!(github.provider, ProviderKind::GitHub);
         assert!(!github.has_sync_str, "gitee 那把串不该出现在 github 的槽里");
         assert!(!github.has_token);
-        assert!(github.fragment_id.is_none(), "gitee 的 id 拼到 github.com 上根本读不开");
+        assert!(
+            github.fragment_id.is_none(),
+            "gitee 的 id 拼到 github.com 上根本读不开"
+        );
 
         // 在另一家重新配一遍，切回去时两边不能互相污染
-        set_str_impl(&core, Some(Zeroizing::new("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".into()))).unwrap();
+        set_str_impl(
+            &core,
+            Some(Zeroizing::new("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".into())),
+        )
+        .unwrap();
         set_token_impl(&core, Some(Zeroizing::new(TOKEN.into()))).unwrap();
         set_provider_impl(&core, ProviderKind::Gitee).unwrap();
         let back = status_impl(&core);
@@ -445,12 +501,18 @@ mod tests {
             .with_sync_str(|p| Ok(String::from_utf8(p.to_vec())))
             .unwrap()
             .unwrap();
-        assert_eq!(revealed, SYNC_STR, "切回 gitee 拿到的却是 github 那把串，说明槽位没分开");
+        assert_eq!(
+            revealed, SYNC_STR,
+            "切回 gitee 拿到的却是 github 那把串，说明槽位没分开"
+        );
 
         // 换过的另一家也不该被这次切换动过
         set_provider_impl(&core, ProviderKind::GitHub).unwrap();
         let status = status_impl(&core);
-        assert!(status.has_sync_str && status.has_token, "github 那份得自己留着");
+        assert!(
+            status.has_sync_str && status.has_token,
+            "github 那份得自己留着"
+        );
         assert!(status.fragment_id.is_none());
     }
 
@@ -465,9 +527,13 @@ mod tests {
         let dir = core.dir().to_path_buf();
         drop(core);
         let reopened =
-            dbhx_vault::Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
+            dbhx_vault::Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key")))
+                .unwrap();
         assert_eq!(reopened.sync_provider(), ProviderKind::Gitee);
-        assert_eq!(reopened.sync_target().map(|t| t.id).as_deref(), Some("3d0rmjto24pfie6bawxsu73"));
+        assert_eq!(
+            reopened.sync_target().map(|t| t.id).as_deref(),
+            Some("3d0rmjto24pfie6bawxsu73")
+        );
         assert!(reopened.has_sync_str());
     }
 
@@ -479,8 +545,12 @@ mod tests {
         let dir = core.dir().to_path_buf();
         drop(core);
         let reopened =
-            dbhx_vault::Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key"))).unwrap();
-        assert!(reopened.sync_private_keys(), "勾了却没落盘，下次推的仍然是少一块的包");
+            dbhx_vault::Vault::open(&dir, dbhx_vault::KeySource::File(dir.join("master.key")))
+                .unwrap();
+        assert!(
+            reopened.sync_private_keys(),
+            "勾了却没落盘，下次推的仍然是少一块的包"
+        );
     }
 
     /// 没配齐时点「立即同步」：不碰网络，也不改本机。
@@ -512,7 +582,11 @@ mod tests {
         assert_eq!(fake.methods(), vec![Method::Post], "还没有坐标时不该先 GET");
 
         let status = status_impl(&core);
-        assert_eq!(status.fragment_id.as_deref(), Some("newlymadeid"), "新建的 id 必须让面板看得见");
+        assert_eq!(
+            status.fragment_id.as_deref(),
+            Some("newlymadeid"),
+            "新建的 id 必须让面板看得见"
+        );
         let mut got_change = false;
         while let Ok(event) = rx.try_recv() {
             if matches!(event, BusEvent::VaultChanged(_)) {
@@ -554,7 +628,11 @@ mod tests {
         assert_eq!(err.code, ErrorCode::AuthFailed);
         assert!(!err.retryable, "令牌错重试一百次还是错");
         assert!(err.message.contains("令牌"), "{:?}", err.message);
-        assert!(!err.message.contains(SYNC_STR), "错误文案带出了同步串: {:?}", err.message);
+        assert!(
+            !err.message.contains(SYNC_STR),
+            "错误文案带出了同步串: {:?}",
+            err.message
+        );
     }
 
     /// 「串和令牌都配好了，可本机一条主机也没有」—— 第一次点不该在云上占一个片段。
@@ -565,7 +643,11 @@ mod tests {
         let fake = Fake::default();
         let report = run_sync(Arc::clone(&core), fake.clone()).await.unwrap();
         assert_eq!(report.outcome, SyncOutcome::Nothing);
-        assert!(fake.methods().is_empty(), "空库不该往云上建东西: {:?}", fake.methods());
+        assert!(
+            fake.methods().is_empty(),
+            "空库不该往云上建东西: {:?}",
+            fake.methods()
+        );
     }
 
     #[test]

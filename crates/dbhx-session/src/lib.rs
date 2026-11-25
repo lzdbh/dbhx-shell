@@ -28,11 +28,11 @@ pub mod plan;
 pub mod pool;
 pub mod shell;
 
-pub use conn::{BoxFuture, Dialer, PooledConnection, SharedConnection, SshConnection, ssh_dialer};
+pub use conn::{ssh_dialer, BoxFuture, Dialer, PooledConnection, SharedConnection, SshConnection};
 pub use cwd::CwdTracker;
 pub use error::SessionError;
-pub use key::TransportKey;
+pub use key::{JumpKey, TransportKey};
 pub use manager::{SessionEvent, SessionManager, SessionRecord};
-pub use plan::{DialPlan, PlanSource};
+pub use plan::{DialPlan, HopPlan, PlanSource};
 pub use pool::{Lease, LeaseKind, PoolOptions, TransportPool};
 pub use shell::{ExitInfo, ShellEvent, ShellSession};

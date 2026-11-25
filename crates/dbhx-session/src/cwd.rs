@@ -211,16 +211,26 @@ mod tests {
     #[test]
     fn standard_uri_form_yields_the_path() {
         let mut t = CwdTracker::new();
-        assert_eq!(t.feed(osc("7;file://db1/var/log").as_bytes()).as_deref(), Some("/var/log"));
+        assert_eq!(
+            t.feed(osc("7;file://db1/var/log").as_bytes()).as_deref(),
+            Some("/var/log")
+        );
         assert_eq!(t.current(), Some("/var/log"));
     }
 
     #[test]
     fn host_component_is_dropped_and_missing_host_is_fine() {
         let mut t = CwdTracker::new();
-        assert_eq!(t.feed(osc("7;file://anywhere/home/app").as_bytes()).as_deref(), Some("/home/app"));
+        assert_eq!(
+            t.feed(osc("7;file://anywhere/home/app").as_bytes())
+                .as_deref(),
+            Some("/home/app")
+        );
         let mut bare = CwdTracker::new();
-        assert_eq!(bare.feed(osc("7;file:///srv/data").as_bytes()).as_deref(), Some("/srv/data"));
+        assert_eq!(
+            bare.feed(osc("7;file:///srv/data").as_bytes()).as_deref(),
+            Some("/srv/data")
+        );
     }
 
     #[test]
@@ -234,7 +244,10 @@ mod tests {
         // Windows 上的 openssh 打的是 `file://H/C:/Users`：去掉 host 段之后剩下的就是
         // `/C:/Users`，与 SFTP 侧 `realpath` 给回的形态一致，所以原样保留、不做「去斜杠」翻译。
         let mut t = CwdTracker::new();
-        assert_eq!(t.feed(osc("7;file://H/C:/Users/app").as_bytes()).as_deref(), Some("/C:/Users/app"));
+        assert_eq!(
+            t.feed(osc("7;file://H/C:/Users/app").as_bytes()).as_deref(),
+            Some("/C:/Users/app")
+        );
         // 没有 host 段的写法会落在 `C:` 之前，无法与绝对路径区分，丢弃
         let mut weird = CwdTracker::new();
         assert_eq!(weird.feed(osc("7;file://C:/Users").as_bytes()), None);
@@ -243,7 +256,10 @@ mod tests {
     #[test]
     fn bare_path_form_is_accepted() {
         let mut t = CwdTracker::new();
-        assert_eq!(t.feed(osc("7;/tmp/x").as_bytes()).as_deref(), Some("/tmp/x"));
+        assert_eq!(
+            t.feed(osc("7;/tmp/x").as_bytes()).as_deref(),
+            Some("/tmp/x")
+        );
     }
 
     #[test]
@@ -260,7 +276,11 @@ mod tests {
                 (Some(p), None) | (None, Some(p)) => Some(p),
                 (None, None) => None,
             };
-            assert_eq!(reported.as_deref(), Some("/etc/ssh"), "在偏移 {cut} 处劈开后丢了目录");
+            assert_eq!(
+                reported.as_deref(),
+                Some("/etc/ssh"),
+                "在偏移 {cut} 处劈开后丢了目录"
+            );
         }
     }
 
@@ -284,7 +304,11 @@ mod tests {
         ];
         for case in cases {
             let mut t = CwdTracker::new();
-            assert_eq!(t.feed(osc(case).as_bytes()), None, "{case:?} 不该被当成目录");
+            assert_eq!(
+                t.feed(osc(case).as_bytes()),
+                None,
+                "{case:?} 不该被当成目录"
+            );
         }
     }
 
@@ -292,22 +316,36 @@ mod tests {
     fn root_dir_is_reported_once_and_not_stripped_to_empty() {
         let mut t = CwdTracker::new();
         assert_eq!(t.feed(osc("7;file://h/").as_bytes()).as_deref(), Some("/"));
-        assert_eq!(t.feed(osc("7;file://h/").as_bytes()), None, "同一目录不重复上报");
-        assert_eq!(t.feed(osc("7;file://h/var").as_bytes()).as_deref(), Some("/var"));
+        assert_eq!(
+            t.feed(osc("7;file://h/").as_bytes()),
+            None,
+            "同一目录不重复上报"
+        );
+        assert_eq!(
+            t.feed(osc("7;file://h/var").as_bytes()).as_deref(),
+            Some("/var")
+        );
     }
 
     #[test]
     fn percent_escapes_are_decoded() {
         let mut t = CwdTracker::new();
         assert_eq!(
-            t.feed(osc("7;file://h/home/my%20user/logs").as_bytes()).as_deref(),
+            t.feed(osc("7;file://h/home/my%20user/logs").as_bytes())
+                .as_deref(),
             Some("/home/my user/logs")
         );
         let mut odd = CwdTracker::new();
         // 非法转义按字面留着：`100%` 这样的目录名不能被丢掉
-        assert_eq!(odd.feed(osc("7;file://h/a/100%zz").as_bytes()).as_deref(), Some("/a/100%zz"));
+        assert_eq!(
+            odd.feed(osc("7;file://h/a/100%zz").as_bytes()).as_deref(),
+            Some("/a/100%zz")
+        );
         let mut tail = CwdTracker::new();
-        assert_eq!(tail.feed(osc("7;file://h/a%").as_bytes()).as_deref(), Some("/a%"));
+        assert_eq!(
+            tail.feed(osc("7;file://h/a%").as_bytes()).as_deref(),
+            Some("/a%")
+        );
     }
 
     #[test]
@@ -317,7 +355,10 @@ mod tests {
         assert_eq!(t.feed(junk.as_bytes()), None);
         assert_eq!(t.payload.len(), 0, "超限后必须清空缓冲，不能留着继续涨");
         // 丢弃后必须能重新同步
-        assert_eq!(t.feed(osc("7;file://h/y").as_bytes()).as_deref(), Some("/y"));
+        assert_eq!(
+            t.feed(osc("7;file://h/y").as_bytes()).as_deref(),
+            Some("/y")
+        );
     }
 
     #[test]
@@ -325,6 +366,9 @@ mod tests {
         let mut t = CwdTracker::new();
         // CSI 噪声 + 一个 OSC 负载里出现裸 ESC 的坏序列，之后的正常序列仍要生效
         assert_eq!(t.feed(b"\x1b[31m\x1b]7;file://h/bad\x1bA"), None);
-        assert_eq!(t.feed(osc("7;file://h/good").as_bytes()).as_deref(), Some("/good"));
+        assert_eq!(
+            t.feed(osc("7;file://h/good").as_bytes()).as_deref(),
+            Some("/good")
+        );
     }
 }

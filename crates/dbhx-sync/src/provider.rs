@@ -85,7 +85,9 @@ impl From<ProviderError> for IpcError {
             ProviderError::TooLarge { .. } | ProviderError::Truncated => {
                 IpcError::new(ErrorCode::QuotaExceeded, e.to_string(), false)
             }
-            ProviderError::UnexpectedShape => IpcError::new(ErrorCode::Internal, e.to_string(), false),
+            ProviderError::UnexpectedShape => {
+                IpcError::new(ErrorCode::Internal, e.to_string(), false)
+            }
         }
     }
 }
@@ -113,7 +115,11 @@ impl std::fmt::Debug for SyncClient {
 
 impl SyncClient {
     pub fn new(provider: ProviderKind, id: Option<String>, token: Zeroizing<String>) -> Self {
-        Self { provider, id: id.filter(|i| !i.trim().is_empty()), token }
+        Self {
+            provider,
+            id: id.filter(|i| !i.trim().is_empty()),
+            token,
+        }
     }
 
     /// 从已存的目标建客户端。令牌按参数进来、不留存：它的生命周期该由调用层
@@ -128,12 +134,18 @@ impl SyncClient {
 
     /// 当前指向的目标。`None` = 还没建过片段，第一次 `push` 成功后才有值。
     pub fn target(&self) -> Option<SyncTarget> {
-        self.id.clone().map(|id| SyncTarget { provider: self.provider, id })
+        self.id.clone().map(|id| SyncTarget {
+            provider: self.provider,
+            id,
+        })
     }
 
     /// 读云端那一份。`Ok(None)` 表示「云上还没有我们能认的东西」，不是失败：
     /// 第一次同步、以及用户在网页上把那个文件删了，都落在这一档。
-    pub async fn fetch(&self, transport: &dyn Transport) -> Result<Option<CloudBlob>, ProviderError> {
+    pub async fn fetch(
+        &self,
+        transport: &dyn Transport,
+    ) -> Result<Option<CloudBlob>, ProviderError> {
         let id = match &self.id {
             None => return Ok(None),
             Some(id) => id.clone(),
@@ -145,24 +157,44 @@ impl SyncClient {
 
     /// 把一份信封写上云端。没有 id 就创建，有就原地更新 —— 调用方不需要知道这个分岔，
     /// 只要把返回的新 `SyncTarget` 存下来（创建那条路径的 id 是刚拿到的）。
-    pub async fn push(&self, transport: &dyn Transport, blob: &[u8]) -> Result<SyncTarget, ProviderError> {
+    pub async fn push(
+        &self,
+        transport: &dyn Transport,
+        blob: &[u8],
+    ) -> Result<SyncTarget, ProviderError> {
         if blob.len() > MAX_BLOB_BYTES {
-            return Err(ProviderError::TooLarge { used: blob.len(), cap: MAX_BLOB_BYTES });
+            return Err(ProviderError::TooLarge {
+                used: blob.len(),
+                cap: MAX_BLOB_BYTES,
+            });
         }
         let content = encode(blob);
         let req = match &self.id {
-            None => self.request(Method::Post, None, Some(create_body(self.provider, &content)))?,
-            Some(id) => self.request(Method::Patch, Some(id), Some(update_body(self.provider, &content)))?,
+            None => self.request(
+                Method::Post,
+                None,
+                Some(create_body(self.provider, &content)),
+            )?,
+            Some(id) => self.request(
+                Method::Patch,
+                Some(id),
+                Some(update_body(self.provider, &content)),
+            )?,
         };
         let resp = transport.send(req).await.map_err(gone_as_missing)?;
         let id = parse_id(self.provider, &resp.json)?;
-        Ok(SyncTarget { provider: self.provider, id })
+        Ok(SyncTarget {
+            provider: self.provider,
+            id,
+        })
     }
 
     /// 删掉云端那一份。`sync_off` 里用：用户关掉同步后，云上不该继续留着一份密文。
     /// 已经不存在了就算删成功——用户要的结果达成了，不必为一个 404 报错。
     pub async fn delete(&self, transport: &dyn Transport) -> Result<(), ProviderError> {
-        let Some(id) = self.id.clone() else { return Ok(()) };
+        let Some(id) = self.id.clone() else {
+            return Ok(());
+        };
         let req = self.request(Method::Delete, Some(&id), None)?;
         match transport.send(req).await {
             Ok(_) => Ok(()),
@@ -171,7 +203,12 @@ impl SyncClient {
         }
     }
 
-    fn request(&self, method: Method, id: Option<&str>, body: Option<serde_json::Value>) -> Result<Request, ProviderError> {
+    fn request(
+        &self,
+        method: Method,
+        id: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> Result<Request, ProviderError> {
         Ok(Request {
             method,
             url: self.url_for(id)?,
@@ -205,7 +242,9 @@ impl SyncClient {
 fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
 /// 白名单的对外入口：设置面板在用户粘完就当场拒掉明显不合法的串，
@@ -242,7 +281,9 @@ fn decode(text: &str) -> Result<Vec<u8>, ProviderError> {
         // 长度 % 4 == 1 不可能是合法 base64，直接算「不是我们写出去的文件」
         _ => return Err(ProviderError::UnexpectedShape),
     };
-    STANDARD.decode(&padded).map_err(|_| ProviderError::UnexpectedShape)
+    STANDARD
+        .decode(&padded)
+        .map_err(|_| ProviderError::UnexpectedShape)
 }
 
 /// 创建时的请求体。两家都要 `files` 是「文件名 → 内容」的对象。
@@ -290,7 +331,10 @@ fn parse_id(provider: ProviderKind, json: &serde_json::Value) -> Result<String, 
 ///
 /// 「文件不在」与「文件被截断」都必须与「读到了」分清楚：前者是正常的第一次同步，
 /// 后者如果当成空数据处理，用户会得到一份悄悄少了一半的主机列表还毫不知情。
-fn parse_cloud(provider: ProviderKind, json: &serde_json::Value) -> Result<Option<CloudBlob>, ProviderError> {
+fn parse_cloud(
+    provider: ProviderKind,
+    json: &serde_json::Value,
+) -> Result<Option<CloudBlob>, ProviderError> {
     // 2xx 但响应体是空的：这不是「云上还没有」，而是接口没按预期回东西
     if json.is_null() {
         return Err(ProviderError::UnexpectedShape);
@@ -298,7 +342,9 @@ fn parse_cloud(provider: ProviderKind, json: &serde_json::Value) -> Result<Optio
     // 两家的 `files` 都是「文件名 → 文件对象」的哈希，文件对象里都带 `content`
     // 与 `truncated`（实测字段清单：size, raw_url, type, truncated, content）。
     let file = match provider {
-        ProviderKind::GitHub | ProviderKind::Gitee => json.get("files").and_then(|f| f.get(SYNC_FILE_NAME)),
+        ProviderKind::GitHub | ProviderKind::Gitee => {
+            json.get("files").and_then(|f| f.get(SYNC_FILE_NAME))
+        }
     };
     let Some(file) = file else { return Ok(None) };
     if file.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
@@ -307,16 +353,25 @@ fn parse_cloud(provider: ProviderKind, json: &serde_json::Value) -> Result<Optio
     // Gitee 在整个片段对象上也带一个 `truncated`。它的确切语义没测出来（不知道是
     // 「某个文件截断」还是「整个响应截断」），而这两种都可能让我们在只拿到半份
     // 密文时毫不知情 —— 宁可在这里硬失败，也不能拿一份残缺的信封去解出半个列表。
-    if provider == ProviderKind::Gitee && json.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
+    if provider == ProviderKind::Gitee
+        && json.get("truncated").and_then(|t| t.as_bool()) == Some(true)
+    {
         return Err(ProviderError::Truncated);
     }
-    let content = file.get("content").and_then(|c| c.as_str()).ok_or(ProviderError::UnexpectedShape)?;
+    let content = file
+        .get("content")
+        .and_then(|c| c.as_str())
+        .ok_or(ProviderError::UnexpectedShape)?;
     let updated_at = match provider {
-        ProviderKind::GitHub | ProviderKind::Gitee => {
-            json.get("updated_at").and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
+        ProviderKind::GitHub | ProviderKind::Gitee => json
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     };
-    Ok(Some(CloudBlob { bytes: decode(content)?, updated_at }))
+    Ok(Some(CloudBlob {
+        bytes: decode(content)?,
+        updated_at,
+    }))
 }
 
 /// 带上 id 去读却收到 404，含义是「这个片段没了」，不是「云上还没有」。
@@ -359,7 +414,10 @@ mod tests {
         }
 
         fn ok(&self, json: serde_json::Value) {
-            self.queued.lock().unwrap().push_back(Ok(Response { status: 200, json }));
+            self.queued
+                .lock()
+                .unwrap()
+                .push_back(Ok(Response { status: 200, json }));
         }
 
         fn status(&self, err: WireError) {
@@ -455,12 +513,28 @@ mod tests {
 
         let sent = fake.take();
         assert_eq!(sent.method, Method::Patch);
-        assert_eq!(sent.url, "https://gitee.com/api/v5/gists/3d0rmjto24pfie6bawxsu73");
-        assert!(!sent.url.contains("ghp_"), "令牌出现在 URL 里: {}", sent.url);
+        assert_eq!(
+            sent.url,
+            "https://gitee.com/api/v5/gists/3d0rmjto24pfie6bawxsu73"
+        );
+        assert!(
+            !sent.url.contains("ghp_"),
+            "令牌出现在 URL 里: {}",
+            sent.url
+        );
         let body = sent.body.unwrap();
-        assert_eq!(decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(), b"payload");
-        assert!(body.get("filename").is_none(), "平铺的 filename 会静默不生效，绝不能发出去");
-        assert!(body.get("content").is_none(), "同上：平铺的 content 是那种「回 200 但没写」的写法");
+        assert_eq!(
+            decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(),
+            b"payload"
+        );
+        assert!(
+            body.get("filename").is_none(),
+            "平铺的 filename 会静默不生效，绝不能发出去"
+        );
+        assert!(
+            body.get("content").is_none(),
+            "同上：平铺的 content 是那种「回 200 但没写」的写法"
+        );
         // 更新不该重写标题：Gitee 的 description 同样会被原样改掉
         assert!(body.get("description").is_none());
         assert!(body.get("public").is_none());
@@ -477,11 +551,18 @@ mod tests {
         let sent = fake.take();
         assert_eq!(sent.method, Method::Post);
         assert_eq!(sent.url, "https://gitee.com/api/v5/gists");
-        assert!(!sent.url.contains("access_token"), "令牌不能靠 query: {}", sent.url);
+        assert!(
+            !sent.url.contains("access_token"),
+            "令牌不能靠 query: {}",
+            sent.url
+        );
         let body = sent.body.unwrap();
         assert_eq!(body["public"], serde_json::json!(false));
         assert_eq!(body["description"], serde_json::json!(GIST_DESCRIPTION));
-        assert_eq!(decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(), vec![1, 2, 0xff, 0xfe]);
+        assert_eq!(
+            decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(),
+            vec![1, 2, 0xff, 0xfe]
+        );
     }
 
     #[tokio::test]
@@ -489,7 +570,11 @@ mod tests {
         let blob: Vec<u8> = (0..512u32).map(|i| (i * 251) as u8).collect();
         let fake = Fake::new();
         fake.ok(gitee_json(&encode(&blob)));
-        let got = gitee(Some("3d0rmjto24pfie6bawxsu73")).fetch(&fake).await.unwrap().expect("该读到内容");
+        let got = gitee(Some("3d0rmjto24pfie6bawxsu73"))
+            .fetch(&fake)
+            .await
+            .unwrap()
+            .expect("该读到内容");
         assert_eq!(got.bytes, blob);
         assert_eq!(got.updated_at.as_deref(), Some("2026-10-16T10:00:00+08:00"));
         assert_eq!(fake.take().method, Method::Get);
@@ -510,7 +595,10 @@ mod tests {
             let fake = Fake::new();
             fake.ok(json);
             let err = gitee(Some("x")).fetch(&fake).await.unwrap_err();
-            assert!(matches!(err, ProviderError::Truncated), "{level} 这一档放过了: {err:?}");
+            assert!(
+                matches!(err, ProviderError::Truncated),
+                "{level} 这一档放过了: {err:?}"
+            );
         }
         // GitHub 没有顶层那个字段，缺字段不能被当成「截断了」
         let fake = Fake::new();
@@ -533,7 +621,11 @@ mod tests {
             let c = SyncClient::new(kind, Some("abc".into()), token());
             let _ = c.fetch(&fake).await;
             let sent = fake.take();
-            assert!(sent.url.contains(host) && sent.url.ends_with(path), "{kind:?} 发去了 {}", sent.url);
+            assert!(
+                sent.url.contains(host) && sent.url.ends_with(path),
+                "{kind:?} 发去了 {}",
+                sent.url
+            );
         }
     }
 
@@ -544,7 +636,10 @@ mod tests {
         for bad in ["..%2f", "a/b", "x?access_token=1", "evil.com/api/v5/gists"] {
             let fake = Fake::new();
             let c = gitee(Some(bad));
-            assert!(matches!(c.fetch(&fake).await.unwrap_err(), ProviderError::BadId), "放过了 {bad:?}");
+            assert!(
+                matches!(c.fetch(&fake).await.unwrap_err(), ProviderError::BadId),
+                "放过了 {bad:?}"
+            );
             assert_eq!(fake.count(), 0);
         }
     }
@@ -568,15 +663,25 @@ mod tests {
         let sent = fake.take();
         assert_eq!(sent.method, Method::Post);
         assert_eq!(sent.url, "https://api.github.com/gists");
-        assert!(!sent.url.contains("ghp_"), "令牌出现在 URL 里: {}", sent.url);
+        assert!(
+            !sent.url.contains("ghp_"),
+            "令牌出现在 URL 里: {}",
+            sent.url
+        );
         assert!(sent.has_token, "令牌没交给传输层");
 
         let body = sent.body.expect("创建必须带请求体");
         assert_eq!(body["public"], serde_json::json!(false));
         assert_eq!(body["description"], serde_json::json!(GIST_DESCRIPTION));
         // 任意字节都得先变成合法的 JSON 字符串；这里钉的是「不是原文」
-        assert_ne!(body["files"][SYNC_FILE_NAME]["content"], serde_json::json!("\x01\x02"));
-        assert_eq!(decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(), vec![1, 2, 0xff, 0xfe]);
+        assert_ne!(
+            body["files"][SYNC_FILE_NAME]["content"],
+            serde_json::json!("\x01\x02")
+        );
+        assert_eq!(
+            decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(),
+            vec![1, 2, 0xff, 0xfe]
+        );
     }
 
     #[tokio::test]
@@ -594,7 +699,10 @@ mod tests {
         // 更新不该重写标题：多余字段会被 GitHub 真的改掉
         assert!(body.get("description").is_none());
         assert!(body.get("public").is_none());
-        assert_eq!(decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(), b"payload");
+        assert_eq!(
+            decode(body["files"][SYNC_FILE_NAME]["content"].as_str().unwrap()).unwrap(),
+            b"payload"
+        );
     }
 
     #[tokio::test]
@@ -672,24 +780,45 @@ mod tests {
     #[tokio::test]
     async fn a_response_missing_expected_fields_is_shaped_as_api_change_not_bad_key() {
         let fake = Fake::new();
-        fake.ok(serde_json::json!({ "id": "x", "files": { SYNC_FILE_NAME: { "truncated": false } } }));
+        fake.ok(
+            serde_json::json!({ "id": "x", "files": { SYNC_FILE_NAME: { "truncated": false } } }),
+        );
         let c = SyncClient::new(ProviderKind::GitHub, Some("x".into()), token());
-        assert!(matches!(c.fetch(&fake).await.unwrap_err(), ProviderError::UnexpectedShape));
+        assert!(matches!(
+            c.fetch(&fake).await.unwrap_err(),
+            ProviderError::UnexpectedShape
+        ));
 
         let fake2 = Fake::new();
         fake2.ok(serde_json::json!({ "files": {} }));
-        assert!(matches!(client().push(&fake2, b"x").await.unwrap_err(), ProviderError::UnexpectedShape));
+        assert!(matches!(
+            client().push(&fake2, b"x").await.unwrap_err(),
+            ProviderError::UnexpectedShape
+        ));
     }
 
     #[tokio::test]
     async fn a_pasted_id_that_could_point_elsewhere_is_rejected() {
         // id 会拼进地址，而 header 里的令牌跟着地址走：白名单不是洁癖
         let long = "0123456789".repeat(13);
-        for bad in ["../../evil", "@evil.com", "a b", "x?y=1", "x#f", long.as_str()] {
+        for bad in [
+            "../../evil",
+            "@evil.com",
+            "a b",
+            "x?y=1",
+            "x#f",
+            long.as_str(),
+        ] {
             let c = SyncClient::new(ProviderKind::GitHub, Some(bad.to_string()), token());
             let fake = Fake::new();
-            assert!(matches!(c.fetch(&fake).await.unwrap_err(), ProviderError::BadId), "放过了 {bad:?}");
-            assert!(matches!(c.push(&fake, b"x").await.unwrap_err(), ProviderError::BadId), "推送放过了 {bad:?}");
+            assert!(
+                matches!(c.fetch(&fake).await.unwrap_err(), ProviderError::BadId),
+                "放过了 {bad:?}"
+            );
+            assert!(
+                matches!(c.push(&fake, b"x").await.unwrap_err(), ProviderError::BadId),
+                "推送放过了 {bad:?}"
+            );
             assert_eq!(fake.count(), 0, "{bad:?} 该在发请求前就被拦下");
         }
         // 空白 id 是「还没配」而不是「配了个坏值」：走 fetch 的 Ok(None)，不发请求
@@ -719,8 +848,14 @@ mod tests {
     fn client_debug_never_prints_the_token() {
         let c = SyncClient::new(ProviderKind::GitHub, Some("deadbeef".into()), token());
         let rendered = format!("{c:?}");
-        assert!(rendered.contains("deadbeef"), "id 不是秘密，排障要看: {rendered}");
-        assert!(!rendered.contains("ghp_AAAAAA"), "Debug 泄露了令牌: {rendered}");
+        assert!(
+            rendered.contains("deadbeef"),
+            "id 不是秘密，排障要看: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ghp_AAAAAA"),
+            "Debug 泄露了令牌: {rendered}"
+        );
         assert!(rendered.contains("redacted"));
     }
 
@@ -736,21 +871,35 @@ mod tests {
         let token = crate::token_from_file();
 
         // 一段真信封形状的字节：含非 UTF-8，用来证明 base64 那一层不是多余的
-        let probe: Vec<u8> = b"DBHXSYN1".iter().copied().chain((0u8..64).map(|i| i.wrapping_mul(37))).collect();
+        let probe: Vec<u8> = b"DBHXSYN1"
+            .iter()
+            .copied()
+            .chain((0u8..64).map(|i| i.wrapping_mul(37)))
+            .collect();
         let transport = crate::wire::HttpTransport::new();
         let fresh = SyncClient::new(ProviderKind::GitHub, None, token.clone());
         let target = fresh.push(&transport, &probe).await.expect("创建片段失败");
 
         let with_id = SyncClient::from_target(&target, token.clone());
-        let read_back = with_id.fetch(&transport).await.expect("读回失败").expect("刚写完就读不到，说明写入没生效");
+        let read_back = with_id
+            .fetch(&transport)
+            .await
+            .expect("读回失败")
+            .expect("刚写完就读不到，说明写入没生效");
         assert_eq!(read_back.bytes, probe, "读回来的内容与写进去的不一致");
 
         // 再推一次：必须原地更新，云上不能多出第二份
         let again = with_id.push(&transport, &probe).await.expect("更新失败");
         assert_eq!(again.id, target.id, "更新变成了新建");
 
-        with_id.delete(&transport).await.expect("清理失败：请手动删除标题含 dbhx-shell 的片段");
-        assert!(with_id.fetch(&transport).await.is_err(), "删完还在，说明没真删");
+        with_id
+            .delete(&transport)
+            .await
+            .expect("清理失败：请手动删除标题含 dbhx-shell 的片段");
+        assert!(
+            with_id.fetch(&transport).await.is_err(),
+            "删完还在，说明没真删"
+        );
     }
 
     /// Gitee 这一条必须**换一段长度不同的内容**再读一次：状态码 200 在这一家
@@ -762,9 +911,17 @@ mod tests {
     #[ignore = "需要真实令牌，手动跑"]
     async fn talks_to_the_real_gitee_api_and_leaves_nothing_behind() {
         let token = crate::token_from_file();
-        let first: Vec<u8> = b"DBHXSYN1".iter().copied().chain((0u8..64).map(|i| i.wrapping_mul(37))).collect();
+        let first: Vec<u8> = b"DBHXSYN1"
+            .iter()
+            .copied()
+            .chain((0u8..64).map(|i| i.wrapping_mul(37)))
+            .collect();
         // 长度不同才分辨得出读回来的是新那份还是老那份
-        let second: Vec<u8> = b"DBHXSYN2".iter().copied().chain((0u8..200).map(|i| i.wrapping_mul(131))).collect();
+        let second: Vec<u8> = b"DBHXSYN2"
+            .iter()
+            .copied()
+            .chain((0u8..200).map(|i| i.wrapping_mul(131)))
+            .collect();
         let transport = crate::wire::HttpTransport::new();
         let fresh = SyncClient::new(ProviderKind::Gitee, None, token.clone());
         let target = fresh.push(&transport, &first).await.expect("创建片段失败");
@@ -779,7 +936,10 @@ mod tests {
             if read_back.bytes != first {
                 return Err("创建后读回来的内容与写进去的不一致".to_string());
             }
-            let again = with_id.push(&transport, &second).await.map_err(|e| e.to_string())?;
+            let again = with_id
+                .push(&transport, &second)
+                .await
+                .map_err(|e| e.to_string())?;
             if again.id != target.id {
                 return Err(format!("更新变成了新建：{} 变成了 {}", target.id, again.id));
             }
@@ -790,7 +950,9 @@ mod tests {
                 .ok_or_else(|| "更新后读不到".to_string())?;
             // 这一句是整个用例的意义所在
             if updated.bytes != second {
-                return Err("更新回 200 却没真改掉云端那份 —— 请求体的字段形状不对就是这个表现".to_string());
+                return Err(
+                    "更新回 200 却没真改掉云端那份 —— 请求体的字段形状不对就是这个表现".to_string(),
+                );
             }
             Ok::<(), String>(())
         }
@@ -803,6 +965,9 @@ mod tests {
             panic!("{msg}（片段 id {}，清理 {:?}）", target.id, cleanup);
         }
         cleanup.expect("清理失败：请手动删除标题含 dbhx-shell 的那个片段");
-        assert!(matches!(gone, Err(ProviderError::Missing)), "删完还在，说明没真删");
+        assert!(
+            matches!(gone, Err(ProviderError::Missing)),
+            "删完还在，说明没真删"
+        );
     }
 }

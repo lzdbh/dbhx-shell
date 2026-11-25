@@ -75,7 +75,14 @@ impl PtyExit {
 
     fn from_status(status: portable_pty::ExitStatus) -> Self {
         let signal = status.signal().map(str::to_owned);
-        Self { code: if signal.is_some() { None } else { Some(status.exit_code()) }, signal }
+        Self {
+            code: if signal.is_some() {
+                None
+            } else {
+                Some(status.exit_code())
+            },
+            signal,
+        }
     }
 }
 
@@ -107,10 +114,15 @@ impl LocalSession {
             .openpty(size)
             .map_err(|e| log_other("openpty", e, PtyError::Open))?;
         let master = pair.master;
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| log_other("spawn", e, PtyError::Spawn { program: program_of(spec) }))?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| {
+            log_other(
+                "spawn",
+                e,
+                PtyError::Spawn {
+                    program: program_of(spec),
+                },
+            )
+        })?;
 
         let reader = master
             .try_clone_reader()
@@ -129,7 +141,14 @@ impl LocalSession {
         spawn_writer(writer, stdin_rx, alive.clone());
         spawn_owner(master, child, killer, cmd_rx, events_tx, alive.clone());
 
-        Ok(Self { handle: LocalHandle { stdin_tx, cmd_tx, alive }, events_rx })
+        Ok(Self {
+            handle: LocalHandle {
+                stdin_tx,
+                cmd_tx,
+                alive,
+            },
+            events_rx,
+        })
     }
 
     /// 送按键/粘贴的原始字节。不做任何换行翻译——xterm.js 发什么就转什么。
@@ -188,7 +207,9 @@ impl LocalHandle {
     }
 
     pub fn resize(&self, pty: &PtySize) -> Result<(), PtyError> {
-        self.cmd_tx.send(OwnerCmd::Resize(to_wire_size(pty))).map_err(|_| PtyError::Closed)
+        self.cmd_tx
+            .send(OwnerCmd::Resize(to_wire_size(pty)))
+            .map_err(|_| PtyError::Closed)
     }
 
     pub fn kill(&self) {
@@ -202,7 +223,9 @@ impl LocalHandle {
 }
 
 fn program_of(spec: &LocalSpec) -> String {
-    spec.program.clone().unwrap_or_else(|| "<默认 shell>".to_string())
+    spec.program
+        .clone()
+        .unwrap_or_else(|| "<默认 shell>".to_string())
 }
 
 /// portable-pty 的失败原文（OS 报错、ConPTY 细节）只留在日志里，对外只给分类。
@@ -233,7 +256,10 @@ const DSR_QUERY_LEN_MINUS_1: usize = DSR_QUERY.len() - 1;
 
 impl DsrScanner {
     fn new() -> Self {
-        Self { tail: [0; DSR_QUERY_LEN_MINUS_1], len: 0 }
+        Self {
+            tail: [0; DSR_QUERY_LEN_MINUS_1],
+            len: 0,
+        }
     }
 
     fn feed(&mut self, chunk: &[u8]) -> bool {
@@ -289,7 +315,11 @@ fn spawn_reader(
     });
 }
 
-fn spawn_writer(mut writer: Box<dyn Write + Send>, stdin_rx: Receiver<Vec<u8>>, alive: Arc<AtomicBool>) {
+fn spawn_writer(
+    mut writer: Box<dyn Write + Send>,
+    stdin_rx: Receiver<Vec<u8>>,
+    alive: Arc<AtomicBool>,
+) {
     tokio::task::spawn_blocking(move || {
         loop {
             match stdin_rx.recv_timeout(IDLE_POLL) {
@@ -428,7 +458,9 @@ fn wait_within(child: &mut (dyn Child + Send + Sync), budget: Duration) -> Waite
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn force_kill(child: &mut (dyn Child + Send + Sync)) {
-    let Some(pid) = child.process_id() else { return };
+    let Some(pid) = child.process_id() else {
+        return;
+    };
     // SAFETY: kill(2) 只要一个合法的 pid；pid 来自我们自己持有的子进程，
     // 进程表里没有这个 pid 时它返回 ESRCH，不会误伤别的内存。
     let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
@@ -459,7 +491,9 @@ mod tests {
     /// 一定会退出、且把标记打到终端上的命令。
     #[cfg(windows)]
     fn echo_spec(marker: &str) -> LocalSpec {
-        LocalSpec::default().program("cmd.exe").args(&["/C", &format!("echo {marker}")])
+        LocalSpec::default()
+            .program("cmd.exe")
+            .args(&["/C", &format!("echo {marker}")])
     }
 
     #[cfg(not(windows))]
@@ -483,12 +517,18 @@ mod tests {
     /// 语言变化，所以只断言数字。
     #[cfg(windows)]
     fn size_probe_spec(pty: PtySize) -> LocalSpec {
-        LocalSpec::default().program("cmd.exe").args(&["/C", "mode"]).pty(pty)
+        LocalSpec::default()
+            .program("cmd.exe")
+            .args(&["/C", "mode"])
+            .pty(pty)
     }
 
     #[cfg(not(windows))]
     fn size_probe_spec(pty: PtySize) -> LocalSpec {
-        LocalSpec::default().program("/bin/sh").args(&["-c", "stty size"]).pty(pty)
+        LocalSpec::default()
+            .program("/bin/sh")
+            .args(&["-c", "stty size"])
+            .pty(pty)
     }
 
     #[cfg(windows)]
@@ -520,16 +560,31 @@ mod tests {
     async fn output_comes_back_as_bytes_and_the_exit_is_reported() {
         let mut session = LocalSession::spawn(&echo_spec("dbhx-pty-marker")).unwrap();
         let (text, exit) = drain(&mut session).await;
-        assert!(text.contains("dbhx-pty-marker"), "没有从 pty 读回标记，实际输出: {text:?}");
-        assert_eq!(exit, Some(PtyExit { code: Some(0), signal: None }));
+        assert!(
+            text.contains("dbhx-pty-marker"),
+            "没有从 pty 读回标记，实际输出: {text:?}"
+        );
+        assert_eq!(
+            exit,
+            Some(PtyExit {
+                code: Some(0),
+                signal: None
+            })
+        );
     }
 
     #[tokio::test]
     async fn the_pty_is_created_at_the_requested_size() {
-        let pty = PtySize { rows: 40, cols: 120 };
+        let pty = PtySize {
+            rows: 40,
+            cols: 120,
+        };
         let mut session = LocalSession::spawn(&size_probe_spec(pty.clone())).unwrap();
         let (text, _) = drain(&mut session).await;
-        assert!(size_reported(&text, &pty), "进程看到的尺寸不是 {pty:?}，输出: {text:?}");
+        assert!(
+            size_reported(&text, &pty),
+            "进程看到的尺寸不是 {pty:?}，输出: {text:?}"
+        );
     }
 
     #[tokio::test]
@@ -560,7 +615,10 @@ mod tests {
         let mut session = LocalSession::spawn(&shell_spec()).unwrap();
         session.kill();
         let (_, exit) = drain(&mut session).await;
-        assert!(exit.is_some(), "kill 之后必须给出退出事件，否则 UI 不知道标签页可以回收");
+        assert!(
+            exit.is_some(),
+            "kill 之后必须给出退出事件，否则 UI 不知道标签页可以回收"
+        );
     }
 
     /// 对 SIGHUP 免疫的子进程也必须收尾。portable-pty 在 Unix 上的 killer 只发一发
@@ -570,13 +628,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_child_that_ignores_sighup_is_force_reaped() {
-        let spec = LocalSpec::default().program("/bin/sh").args(&["-c", "trap '' HUP; read -r line"]);
+        let spec = LocalSpec::default()
+            .program("/bin/sh")
+            .args(&["-c", "trap '' HUP; read -r line"]);
         let mut session = LocalSession::spawn(&spec).unwrap();
         session.kill();
         let (_, exit) = drain(&mut session).await;
         let exit = exit.expect("强杀之后仍要给出退出事件");
         // 只断「被信号打死」：信号名走的是 strsignal，随系统语言变，不该拿来断言。
-        assert!(exit.signal.is_some() && exit.code.is_none(), "不是信号终止：{exit:?}");
+        assert!(
+            exit.signal.is_some() && exit.code.is_none(),
+            "不是信号终止：{exit:?}"
+        );
     }
 
     #[tokio::test]
@@ -584,7 +647,10 @@ mod tests {
         let mut session = LocalSession::spawn(&echo_spec("dbhx-done")).unwrap();
         drain(&mut session).await;
         assert!(matches!(session.write(b"x"), Err(PtyError::Closed)));
-        assert!(matches!(session.resize(&PtySize::default()), Err(PtyError::Closed)));
+        assert!(matches!(
+            session.resize(&PtySize::default()),
+            Err(PtyError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -625,6 +691,9 @@ mod tests {
 
         let mut again = DsrScanner::new();
         assert!(again.feed(b"\x1b[6n"));
-        assert!(!again.feed(b"\x1b[?25h"), "答过的查询不能被尾巴重新拼出来再答一次");
+        assert!(
+            !again.feed(b"\x1b[?25h"),
+            "答过的查询不能被尾巴重新拼出来再答一次"
+        );
     }
 }

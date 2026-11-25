@@ -1,3 +1,5 @@
+import { message } from 'ant-design-vue'
+
 import { events } from './bindings'
 import { writeTerminal } from '../terminal/registry'
 import { useFilesStore } from '../../stores/files'
@@ -57,6 +59,12 @@ export async function startEventBridge(): Promise<() => void> {
     }),
     events.transferBatchEnded.listen(({ payload }) => {
       transfers.onBatchEnded(payload)
+    }),
+    events.transferConflict.listen(({ payload }) => {
+      hostkeys.onTransferConflict(payload)
+    }),
+    events.tunnelFailed.listen(({ payload }) => {
+      message.error(`端口转发没能启动：${payload.message}`)
     }),
     // vault 的变更可能来自别的窗口或后端导入，计数本身就要显示在侧栏，直接重取
     events.vaultChanged.listen(() => {

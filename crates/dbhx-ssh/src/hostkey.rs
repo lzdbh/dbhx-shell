@@ -7,7 +7,7 @@
 //! 这样用户拿 `ssh-keygen -lf` 核对时看到的字符串是同一个。
 
 use dbhx_model::{KnownHost, KnownHostSource};
-use russh::keys::{HashAlg, PublicKey, ssh_key::Error as SshKeyError};
+use russh::keys::{ssh_key::Error as SshKeyError, HashAlg, PublicKey};
 
 /// 服务器在 `check_server_key` 里递过来的密钥，已经拆成纯数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,10 +69,10 @@ pub fn pattern_of(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh::keys::PrivateKey;
     use crate::fixtures::{
         ENC_ED25519, ENC_ED25519_B64, KNOWN_HOSTS_LINE, PLAIN_ED25519, PLAIN_ED25519_B64,
     };
+    use russh::keys::PrivateKey;
 
     fn projected(pem: &str) -> ServerKey {
         let key = PrivateKey::from_openssh(pem).unwrap();
@@ -104,7 +104,10 @@ mod tests {
         let k = projected(PLAIN_ED25519);
         let rec = k.to_known_host("db1.example.com", 22, KnownHostSource::UserConfirmed);
         let line = format!("{} {} {}", rec.pattern, rec.algorithm, rec.base64_key);
-        assert_eq!(line, KNOWN_HOSTS_LINE, "生成的行必须与 ssh-keygen -H 之外的普通行同形");
+        assert_eq!(
+            line, KNOWN_HOSTS_LINE,
+            "生成的行必须与 ssh-keygen -H 之外的普通行同形"
+        );
     }
 
     #[test]

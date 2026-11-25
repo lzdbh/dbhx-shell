@@ -72,11 +72,9 @@ impl From<SessionError> for IpcError {
                 format!("会话 {id} 已不存在，标签页可能已经关闭"),
                 false,
             ),
-            SessionError::Locked => IpcError::new(
-                ErrorCode::Locked,
-                "应用已锁定，解锁后才能连接",
-                false,
-            ),
+            SessionError::Locked => {
+                IpcError::new(ErrorCode::Locked, "应用已锁定，解锁后才能连接", false)
+            }
             SessionError::Internal(_) => IpcError::internal("会话层内部错误"),
         }
     }

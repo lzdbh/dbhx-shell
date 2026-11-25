@@ -72,7 +72,10 @@ mod tests {
 
     #[test]
     fn missing_program_is_not_found() {
-        let e: IpcError = PtyError::Spawn { program: "nvim".into() }.into();
+        let e: IpcError = PtyError::Spawn {
+            program: "nvim".into(),
+        }
+        .into();
         assert_eq!(e.code, ErrorCode::NotFound);
         assert!(e.message.contains("nvim"), "{}", e.message);
     }

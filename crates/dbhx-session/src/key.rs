@@ -4,9 +4,15 @@ use std::time::Duration;
 
 use dbhx_model::{AuthRef, HostId, LiveEndpoint};
 
+/// 跳板链上的一跳。端点进哈希：同一台主机经不同跳板连过去不是同一条连接。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JumpKey {
+    pub host_id: HostId,
+    pub endpoint: LiveEndpoint,
+}
+
 /// 参考实现用 10 元组（含跳板链指纹、代理指纹、协议、sudo 等）。M1 只有 SSH + vault
-/// 凭据，所以只保留真正会改变「连到哪、以谁的身份、按什么算法偏好」的四个量。
-/// 将来加跳板机时在这里补 `jump_fingerprint`，不要另起一套键。
+/// 凭据，所以只保留真正会改变「连到哪、以谁的身份、按什么算法偏好」的量。
 ///
 /// 刻意 `Hash` 里没有明文：`auth` 只是引用，凭据本身连这个结构体都进不来。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -20,24 +26,42 @@ pub struct TransportKey {
     pub auth: AuthRef,
     /// keepalive 会进 `russh::client::Config`，两套设置不该共用一条连接。
     pub keepalive: Option<Duration>,
+    /// 跳板链。同一目标经不同跳板连过去，是同一条 SSH 连接也不能复用。
+    pub jumps: Vec<JumpKey>,
 }
 
 impl TransportKey {
-    pub fn new(host_id: HostId, endpoint: LiveEndpoint, auth: AuthRef, keepalive_secs: u16) -> Self {
+    pub fn new(
+        host_id: HostId,
+        endpoint: LiveEndpoint,
+        auth: AuthRef,
+        keepalive_secs: u16,
+        jumps: Vec<JumpKey>,
+    ) -> Self {
         Self {
             host_id,
             endpoint,
             auth,
-            keepalive: if keepalive_secs == 0 { None } else { Some(Duration::from_secs(keepalive_secs as u64)) },
+            keepalive: if keepalive_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(keepalive_secs as u64))
+            },
+            jumps,
         }
     }
 
     /// 日志与错误文案用。带用户名是有意的——运维要靠它认出是哪台机器；
     /// 这个串**不允许**跨 IPC 给前端（前端自己有 label）。
     pub fn describe(&self) -> String {
+        let via = if self.jumps.is_empty() {
+            String::new()
+        } else {
+            format!(" via {} hop(s)", self.jumps.len())
+        };
         format!(
-            "{}@{}:{}#{}",
-            self.endpoint.username, self.endpoint.host, self.endpoint.port, self.host_id.0
+            "{}@{}:{}#{}{}",
+            self.endpoint.username, self.endpoint.host, self.endpoint.port, self.host_id.0, via
         )
     }
 }
@@ -48,35 +72,57 @@ mod tests {
     use dbhx_model::{Endpoint, HostId};
 
     fn key(host: &str, port: Option<u16>, user: &str, secs: u16) -> TransportKey {
-        let endpoint = Endpoint { host: host.into(), port, username: user.into() };
+        let endpoint = Endpoint {
+            host: host.into(),
+            port,
+            username: user.into(),
+        };
         TransportKey::new(
             HostId("h1".into()),
             LiveEndpoint::from_endpoint(&endpoint),
-            AuthRef::Host { host_id: "h1".into() },
+            AuthRef::Host {
+                host_id: "h1".into(),
+            },
             secs,
+            Vec::new(),
         )
     }
 
     #[test]
     fn same_target_same_key() {
-        assert_eq!(key("db1", Some(22), "root", 30), key("db1", Some(22), "root", 30));
+        assert_eq!(
+            key("db1", Some(22), "root", 30),
+            key("db1", Some(22), "root", 30)
+        );
     }
 
     #[test]
     fn port_and_username_are_part_of_the_identity() {
-        assert_ne!(key("db1", Some(22), "root", 30), key("db1", Some(2222), "root", 30));
-        assert_ne!(key("db1", Some(22), "root", 30), key("db1", Some(22), "app", 30));
+        assert_ne!(
+            key("db1", Some(22), "root", 30),
+            key("db1", Some(2222), "root", 30)
+        );
+        assert_ne!(
+            key("db1", Some(22), "root", 30),
+            key("db1", Some(22), "app", 30)
+        );
     }
 
     #[test]
     fn missing_port_normalizes_to_22_instead_of_becoming_its_own_identity() {
         // 判等必须建立在归一化后的 LiveEndpoint 上，否则 None 与 Some(22) 会各开一条连接
-        assert_eq!(key("db1", None, "root", 30), key("db1", Some(22), "root", 30));
+        assert_eq!(
+            key("db1", None, "root", 30),
+            key("db1", Some(22), "root", 30)
+        );
     }
 
     #[test]
     fn different_keepalive_is_a_different_transport_config() {
-        assert_ne!(key("db1", Some(22), "root", 30), key("db1", Some(22), "root", 0));
+        assert_ne!(
+            key("db1", Some(22), "root", 30),
+            key("db1", Some(22), "root", 0)
+        );
     }
 
     #[test]

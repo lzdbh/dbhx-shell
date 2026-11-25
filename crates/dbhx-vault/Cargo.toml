@@ -15,6 +15,9 @@ aes-gcm.workspace = true
 argon2.workspace = true
 rand.workspace = true
 tracing.workspace = true
+# v1 兼容层 + 各平台原生 store（Windows 凭据管理器 / macOS Keychain / Secret Service）。
+# 钥匙串不可用时由 `Vault::open_default` 回退到文件，见 crypto.rs。
+keyring.workspace = true
 
 [lints]
 workspace = true

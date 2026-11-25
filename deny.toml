@@ -1,0 +1,14 @@
+# 只跑 advisories / bans / sources 三项；licenses 需要先定仓库的许可证策略
+# （公开仓库目前没有 LICENSE，GPL 参考资料与 MIT 的关系还没结论），不在本轮引入。
+
+[advisories]
+# 确实需要忽略的条目必须写清原因与解除条件，禁止空泛的「先放过」。
+ignore = []
+
+[bans]
+# 多版本共存只提示不拦：交叉编译矩阵对这个很敏感，先观察一轮。
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

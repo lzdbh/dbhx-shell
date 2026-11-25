@@ -53,7 +53,11 @@ pub struct IpcError {
 
 impl IpcError {
     pub fn new(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
-        Self { code, message: message.into(), retryable }
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+        }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
@@ -84,7 +88,10 @@ mod tests {
 
     #[test]
     fn error_code_serializes_to_snake_case_string() {
-        assert_eq!(serde_json::to_string(&ErrorCode::HostKeyChanged).unwrap(), "\"host_key_changed\"");
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::HostKeyChanged).unwrap(),
+            "\"host_key_changed\""
+        );
     }
 
     #[test]

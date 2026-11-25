@@ -33,7 +33,10 @@ pub(crate) fn token_from_file() -> zeroize::Zeroizing<String> {
     let path = std::env::var("DBHX_TOKEN_FILE").expect("设 DBHX_TOKEN_FILE 指向令牌文件");
     let raw = std::fs::read(&path).expect("读不到令牌文件");
     let token = zeroize::Zeroizing::new(
-        String::from_utf8(raw).expect("令牌文件不是 UTF-8").trim().to_string(),
+        String::from_utf8(raw)
+            .expect("令牌文件不是 UTF-8")
+            .trim()
+            .to_string(),
     );
     assert!(!token.is_empty(), "令牌文件是空的");
     token

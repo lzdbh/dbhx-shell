@@ -1,11 +1,10 @@
 import { commands } from './bindings'
 import type {
+  ConflictPolicy,
   ConnectSpec,
-  ErrorCode,
   HostDraft,
   HostId,
   IdentityId,
-  Pong,
   ProviderKind,
   PtySize,
   SessionId,
@@ -36,7 +35,7 @@ async function unwrap<T>(result: Promise<SpectaResult<T>>): Promise<T> {
 
 /** 契约上没有「明文口令」这种返回值，所以入参方向上允许出现明文。 */
 export const sessionApi = {
-  openRemote: (hostId: HostId, pty: PtySize) => unwrap(commands.sessionOpenRemote(hostId, pty)),
+  openRemote: (hostId: HostId, pty: PtySize, term: string | null) => unwrap(commands.sessionOpenRemote(hostId, pty, term)),
   openLocal: (spec: ConnectSpec, label: string) => unwrap(commands.sessionOpenLocal(spec, label)),
   /** 键盘输入走 `number[]`：每次只有几个字节，不值得为它做 base64。 */
   write: (session: SessionId, bytes: number[]) => unwrap(commands.sessionWrite(session, bytes)),
@@ -67,6 +66,10 @@ export const vaultApi = {
   addIdentity: (label: string, privateKey: string, passphrase: string | null) =>
     unwrap(commands.vaultAddIdentity(label, privateKey, passphrase)),
   removeIdentity: (identityId: IdentityId) => unwrap(commands.vaultRemoveIdentity(identityId)),
+  /** 离线备份：整个库（含私钥）用口令加密到绝对路径。 */
+  exportOffline: (path: string, passphrase: string) => unwrap(commands.vaultExportOffline(path, passphrase)),
+  /** 离线导入：同 id 以备份为准，被覆盖的本地内容另存副本。 */
+  importOffline: (path: string, passphrase: string) => unwrap(commands.vaultImportOffline(path, passphrase)),
 }
 
 /**
@@ -139,9 +142,9 @@ export const sftpApi = {
   setFollowing: (connection: number, following: boolean) => unwrap(commands.sftpSetFollowing(connection, following)),
   setEditing: (connection: number, editing: boolean) => unwrap(commands.sftpSetEditing(connection, editing)),
   download: (connection: number, targets: string[], localDir: string) =>
-    unwrap(commands.sftpDownload(connection, targets, localDir)),
+    unwrap(commands.sftpDownload(connection, targets, localDir, null)),
   upload: (connection: number, localPaths: string[], remoteDir: string | null) =>
-    unwrap(commands.sftpUpload(connection, localPaths, remoteDir)),
+    unwrap(commands.sftpUpload(connection, localPaths, remoteDir, null)),
 }
 
 export const transferApi = {
@@ -201,17 +204,11 @@ export const requestApi = {
   replyCancelled: (request: number) => reply(request, { kind: 'cancelled' }),
   /** 口令只在这一个方向上跨界，后端拿到后立刻封进 Zeroizing。 */
   replySecret: (request: number, text: string) => reply(request, { kind: 'secret', text }),
+  /** 传输冲突：选择对整批生效。 */
+  replyConflict: (request: number, policy: ConflictPolicy) => reply(request, { kind: 'conflict', policy }),
 }
 
 function reply(request: number, answer: UserReply) {
   return unwrap(commands.requestReply(request, answer))
 }
 
-/** D1 专用：让 Rust 侧按指定 code 返回错误，用来验证错误通道与文案映射。 */
-export function pingFailure(code: ErrorCode, message: string): Promise<Pong> {
-  return unwrap(commands.pingFailure(code, message))
-}
-
-export function ping(seq: number, echo: string): Promise<Pong> {
-  return unwrap(commands.ping(seq, echo))
-}

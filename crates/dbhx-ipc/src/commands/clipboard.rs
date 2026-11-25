@@ -19,7 +19,9 @@ use dbhx_model::{ErrorCode, IpcError};
 fn clipboard_err(e: ClipError) -> IpcError {
     tracing::debug!(%e, "剪贴板操作失败");
     let msg = match e {
-        ClipError::ClipboardNotSupported | ClipError::ClipboardOccupied => "剪贴板暂时不可用，请稍后再试",
+        ClipError::ClipboardNotSupported | ClipError::ClipboardOccupied => {
+            "剪贴板暂时不可用，请稍后再试"
+        }
         ClipError::ConversionFailure => "剪贴板里的内容不是文本",
         // arboard 的枚举是 `#[non_exhaustive]`，兜底分支必须留着：上游加变体时
         // 这里应该继续编得过，而不是让整个 crate 挂掉。
@@ -75,10 +77,16 @@ mod tests {
         let occupied = clipboard_err(ClipError::ClipboardOccupied);
         assert_eq!(occupied.message, "剪贴板暂时不可用，请稍后再试");
 
-        let unknown = clipboard_err(ClipError::Unknown { description: "OpenClipboard failed".into() });
+        let unknown = clipboard_err(ClipError::Unknown {
+            description: "OpenClipboard failed".into(),
+        });
         assert_eq!(unknown.message, "剪贴板操作失败");
         for err in [occupied, unknown] {
-            assert!(!err.message.contains("clipboard"), "英文原文绝不能跟着 IPC 出去：{}", err.message);
+            assert!(
+                !err.message.contains("clipboard"),
+                "英文原文绝不能跟着 IPC 出去：{}",
+                err.message
+            );
             assert!(!err.retryable, "剪贴板失败不是重试能解决的");
         }
     }
@@ -86,7 +94,11 @@ mod tests {
     #[test]
     fn empty_clipboard_reads_as_an_empty_string() {
         assert_eq!(text_or_empty(Ok("pwd\r\n".into())).unwrap(), "pwd\r\n");
-        assert_eq!(text_or_empty(Err(ClipError::ContentNotAvailable)).unwrap(), "", "空剪贴板不是错误");
+        assert_eq!(
+            text_or_empty(Err(ClipError::ContentNotAvailable)).unwrap(),
+            "",
+            "空剪贴板不是错误"
+        );
         let err = text_or_empty(Err(ClipError::ConversionFailure)).unwrap_err();
         assert_eq!(err.message, "剪贴板里的内容不是文本");
     }

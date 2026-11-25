@@ -45,7 +45,8 @@ pub const HOST_KEY_PEM: &str = concat!(
 );
 
 /// [`HOST_KEY_PEM`] 对应的公钥 base64（`ssh-ed25519` 的线格式 blob）。
-pub const HOST_KEY_B64: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIKqMuJW6DFqvS3HGLHeM3TGZPLocMXGtufPyEMjjwiPu";
+pub const HOST_KEY_B64: &str =
+    "AAAAC3NzaC1lZDI1NTE5AAAAIKqMuJW6DFqvS3HGLHeM3TGZPLocMXGtufPyEMjjwiPu";
 
 /// 主机密钥算法名，`KnownHost.algorithm` 用。
 pub const HOST_KEY_ALGO: &str = "ssh-ed25519";
@@ -58,8 +59,8 @@ pub fn sample_fs() -> Vfs {
     fs.add_dir("/home");
     fs.add_dir("/home/app");
     fs.add_dir("/home/app/logs");
-    fs.add_file("/home/app/readme.md", b"hello sftp\n".to_vec());
-    fs.add_file("/home/app/logs/app.log", b"line-1\nline-2\n".to_vec());
+    fs.add_file("/home/app/readme.md", b"hello sftp\n");
+    fs.add_file("/home/app/logs/app.log", b"line-1\nline-2\n");
     fs.add_file("/home/app/big.bin", vec![7u8; 4096]);
     fs.add_symlink("/home/app/latest", "/home/app/logs");
     fs.add_symlink("/home/app/readme.link", "readme.md");

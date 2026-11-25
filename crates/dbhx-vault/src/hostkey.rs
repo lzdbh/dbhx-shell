@@ -43,9 +43,9 @@ impl KnownHosts {
 
     /// 查一台主机当前存的密钥。返回第一条匹配（OpenSSH 允许同一 host 多条不同算法）。
     pub fn find(&self, host: &str, port: u16, algorithm: &str) -> Option<&KnownHost> {
-        self.entries.iter().find(|e| {
-            e.algorithm == algorithm && pattern_matches(&e.pattern, host, port)
-        })
+        self.entries
+            .iter()
+            .find(|e| e.algorithm == algorithm && pattern_matches(&e.pattern, host, port))
     }
 
     /// 校验 presented，产出 UI 能直接分支的结论。
@@ -69,9 +69,8 @@ impl KnownHosts {
     /// 写入/替换一条信任。同 (pattern, algorithm) 的旧记录被覆盖——
     /// 用户明知密钥变了仍然确认时，旧密钥必须消失，否则下次还是 Changed。
     pub fn trust(&mut self, host: KnownHost) {
-        self.entries.retain(|e| {
-            !(e.pattern == host.pattern && e.algorithm == host.algorithm)
-        });
+        self.entries
+            .retain(|e| !(e.pattern == host.pattern && e.algorithm == host.algorithm));
         self.entries.push(host);
     }
 
@@ -121,9 +120,10 @@ impl KnownHosts {
         let imported = parse_lines(&raw, KnownHostSource::Imported, &mut skipped);
         let mut added = 0usize;
         for entry in imported {
-            let exists = self.entries.iter().any(|e| {
-                e.pattern == entry.pattern && e.algorithm == entry.algorithm
-            });
+            let exists = self
+                .entries
+                .iter()
+                .any(|e| e.pattern == entry.pattern && e.algorithm == entry.algorithm);
             if !exists {
                 self.entries.push(entry);
                 added += 1;
@@ -158,9 +158,7 @@ fn pattern_matches(pattern_list: &str, host: &str, port: u16) -> bool {
     } else {
         format!("[{host}]:{port}")
     };
-    pattern_list
-        .split(',')
-        .any(|p| glob_match(p.trim(), &want))
+    pattern_list.split(',').any(|p| glob_match(p.trim(), &want))
 }
 
 /// 只要 `*` / `?` 两种通配（与 OpenSSH 的 pattern 语义一致），
@@ -249,8 +247,16 @@ mod tests {
     fn default_port_matches_bare_host_and_other_port_needs_brackets() {
         assert!(pattern_matches("db1.example.com", "db1.example.com", 22));
         assert!(!pattern_matches("db1.example.com", "db1.example.com", 2222));
-        assert!(pattern_matches("[db1.example.com]:2222", "db1.example.com", 2222));
-        assert!(pattern_matches("*.example.com,[short]:2200", "x.example.com", 22));
+        assert!(pattern_matches(
+            "[db1.example.com]:2222",
+            "db1.example.com",
+            2222
+        ));
+        assert!(pattern_matches(
+            "*.example.com,[short]:2200",
+            "x.example.com",
+            22
+        ));
         assert!(pattern_matches("*.example.com,[short]:2200", "short", 2200));
     }
 
@@ -266,7 +272,10 @@ mod tests {
             HostKeyDecision::Changed { .. }
         ));
         let other = entry("db2", "ssh-ed25519", "AAA");
-        assert!(matches!(kh.validate(&other), HostKeyDecision::Unknown { .. }));
+        assert!(matches!(
+            kh.validate(&other),
+            HostKeyDecision::Unknown { .. }
+        ));
         let same = entry("db1", "ssh-ed25519", "AAAOld");
         assert_eq!(kh.validate(&same), HostKeyDecision::Trusted);
         // 算法不同 -> 该算法下仍是 Unknown，而不是拿 ed25519 的记录去比 rsa
@@ -280,7 +289,10 @@ mod tests {
     fn trust_replaces_the_same_pattern_and_algorithm_only() {
         let mut kh = KnownHosts {
             path: PathBuf::from("x"),
-            entries: vec![entry("db1", "ssh-ed25519", "old"), entry("db1", "ssh-rsa", "keep")],
+            entries: vec![
+                entry("db1", "ssh-ed25519", "old"),
+                entry("db1", "ssh-rsa", "keep"),
+            ],
         };
         kh.trust(entry("db1", "ssh-ed25519", "new"));
         assert_eq!(kh.entries().len(), 2, "换了密钥不该把别的算法一起清掉");
@@ -345,7 +357,13 @@ mod tests {
         let reloaded = KnownHosts::load(&d).unwrap();
         assert_eq!(reloaded.entries().len(), 1);
         assert_eq!(reloaded.entries()[0].pattern, "[db1]:2222");
-        assert_eq!(reloaded.find("db1", 2222, "ssh-ed25519").unwrap().base64_key, "AAA");
+        assert_eq!(
+            reloaded
+                .find("db1", 2222, "ssh-ed25519")
+                .unwrap()
+                .base64_key,
+            "AAA"
+        );
     }
 
     #[test]
@@ -360,7 +378,10 @@ mod tests {
         };
         assert_eq!(kh.forget("db1", 2222, "ssh-ed25519"), 1);
         assert_eq!(kh.entries().len(), 2);
-        assert!(kh.find("db1", 22, "ssh-ed25519").is_some(), "22 端口的记录不该被 2222 的删除波及");
+        assert!(
+            kh.find("db1", 22, "ssh-ed25519").is_some(),
+            "22 端口的记录不该被 2222 的删除波及"
+        );
     }
 
     #[test]

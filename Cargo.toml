@@ -8,6 +8,7 @@ members = [
   "crates/dbhx-pty",
   "crates/dbhx-session",
   "crates/dbhx-sftp",
+  "crates/dbhx-forward",
   "crates/dbhx-sync",
   "crates/dbhx-ipc",
   "crates/dbhx-testsrv",
@@ -15,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 
@@ -108,6 +109,7 @@ dbhx-telnet = { path = "crates/dbhx-telnet" }
 dbhx-pty = { path = "crates/dbhx-pty" }
 dbhx-session = { path = "crates/dbhx-session" }
 dbhx-sftp = { path = "crates/dbhx-sftp" }
+dbhx-forward = { path = "crates/dbhx-forward" }
 dbhx-sync = { path = "crates/dbhx-sync" }
 dbhx-ipc = { path = "crates/dbhx-ipc" }
 # 只给 dev-dependencies 用：SSH/SFTP 协议路径需要真服务器才能跑到

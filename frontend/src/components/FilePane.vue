@@ -77,6 +77,11 @@ const emit = defineEmits<{
 type SortKey = 'name' | 'mtime' | 'type' | 'size'
 
 const sort = reactive<{ key: SortKey, dir: 1 | -1 }>({ key: 'name', dir: 1 })
+/** 名称过滤。换目录就清空，免得进了新目录还是一片空白。 */
+const filter = ref('')
+watch(() => props.path, () => {
+  filter.value = ''
+})
 
 function toggleSort(key: SortKey): void {
   if (sort.key === key) sort.dir = sort.dir === 1 ? -1 : 1
@@ -90,7 +95,8 @@ function toggleSort(key: SortKey): void {
 /** 目录恒在前面，和 Windows 默认一致；组内再按当前列排。 */
 const rows = computed(() => {
   const rank = (e: FileEntry) => (e.kind === 'dir' ? 0 : 1)
-  const list = [...props.entries]
+  const needle = filter.value.trim().toLowerCase()
+  const list = props.entries.filter(e => !needle || e.name.toLowerCase().includes(needle))
   list.sort((a, b) => {
     const grouped = rank(a) - rank(b)
     if (grouped !== 0) return grouped
@@ -467,6 +473,15 @@ function onRemoveCancel(): void {
     </div>
 
     <a-input
+      v-if="enabled"
+      v-model:value="filter"
+      class="filter"
+      size="small"
+      allow-clear
+      placeholder="按名称过滤"
+    />
+
+    <a-input
       v-if="creating !== null"
       v-model:value="draftName"
       size="small"
@@ -515,7 +530,7 @@ function onRemoveCancel(): void {
         <span class="c size" />
       </div>
 
-      <div v-if="rows.length === 0" class="empty">{{ loading ? '载入中…' : '此文件夹为空' }}</div>
+      <div v-if="rows.length === 0" class="empty">{{ loading ? '载入中…' : (filter ? '没有匹配的项' : '此文件夹为空') }}</div>
       <div
         v-for="(entry, index) in rows"
         :key="entry.path"

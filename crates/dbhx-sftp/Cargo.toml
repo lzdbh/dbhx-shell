@@ -10,6 +10,8 @@ dbhx-model.workspace = true
 dbhx-ssh.workspace = true
 tokio.workspace = true
 russh-sftp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

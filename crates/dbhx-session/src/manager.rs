@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dbhx_model::{HostId, LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo, SessionStatus, TerminalEncoding};
+use dbhx_model::{
+    HostId, LiveEndpoint, Protocol, PtySize, SessionId, SessionInfo, SessionStatus,
+    TerminalEncoding,
+};
 use dbhx_pty::{LocalHandle, LocalSession, LocalSpec, PtyEvent};
 use dbhx_telnet::{TelnetEvent, TelnetHandle};
 use tokio::sync::mpsc;
@@ -49,6 +52,8 @@ pub struct SessionRecord {
     /// 本地终端为 `None`。文件面板要靠它向池要**同一条** transport——
     /// 用 vault 记录重算一遍键会拿到「编辑过的旧 endpoint」，正好违反判等规则。
     pub transport: Option<TransportKey>,
+    /// 登录横幅（SSH 才有），由连接层在认证时捕获。
+    pub banner: Option<String>,
 }
 
 impl SessionRecord {
@@ -67,6 +72,7 @@ impl SessionRecord {
             live_endpoint: self.live_endpoint.clone(),
             pty: self.pty.clone(),
             encoding: self.encoding,
+            banner: self.banner.clone(),
         }
     }
 
@@ -128,11 +134,20 @@ impl SessionManager {
 
     /// 取走事件接收端。只能成功一次——终端字节流有两个读者就会随机丢一半。
     pub fn take_events(&self) -> Option<mpsc::Receiver<SessionEvent>> {
-        self.inner.hub_rx.lock().unwrap_or_else(|p| p.into_inner()).take()
+        self.inner
+            .hub_rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 
     /// 本地终端。必须在 tokio 运行时上下文中调用（`LocalSession::spawn` 内部起任务）。
-    pub fn open_local(&self, spec: &LocalSpec, label: String, encoding: TerminalEncoding) -> Result<SessionRecord, SessionError> {
+    pub fn open_local(
+        &self,
+        spec: &LocalSpec,
+        label: String,
+        encoding: TerminalEncoding,
+    ) -> Result<SessionRecord, SessionError> {
         let session = LocalSession::spawn(spec)?;
         let id = self.inner.alloc_id();
         let (handle, mut events) = session.split();
@@ -146,6 +161,7 @@ impl SessionManager {
             cwd: None,
             host_id: None,
             transport: None,
+            banner: None,
         };
         self.inner.insert(record.clone(), Handle::Local(handle));
 
@@ -157,11 +173,23 @@ impl SessionManager {
             loop {
                 match events.recv().await {
                     Some(PtyEvent::Data(bytes)) => {
-                        if tx.send(SessionEvent::Data { id, bytes: Arc::from(bytes) }).await.is_err() {
+                        if tx
+                            .send(SessionEvent::Data {
+                                id,
+                                bytes: Arc::from(bytes),
+                            })
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
-                    Some(PtyEvent::Exited(info)) => exit = ExitInfo { exit_status: info.code, signal: info.signal },
+                    Some(PtyEvent::Exited(info)) => {
+                        exit = ExitInfo {
+                            exit_status: info.code,
+                            signal: info.signal,
+                        }
+                    }
                     // 两个发送端都 drop 了：子进程没了，输出也读完了
                     None => break,
                 }
@@ -173,8 +201,21 @@ impl SessionManager {
     }
 
     /// 远端 shell：先向池要 lease（命中就不碰凭据），再在这条连接上开一条通道。
-    pub async fn open_remote(&self, key: TransportKey, term: String, pty: PtySize, encoding: TerminalEncoding, label: String) -> Result<SessionRecord, SessionError> {
-        let lease = self.inner.pool.acquire(key.clone(), LeaseKind::Shell).await?;
+    pub async fn open_remote(
+        &self,
+        key: TransportKey,
+        term: String,
+        pty: PtySize,
+        encoding: TerminalEncoding,
+        label: String,
+    ) -> Result<SessionRecord, SessionError> {
+        let lease = self
+            .inner
+            .pool
+            .acquire(key.clone(), LeaseKind::Shell)
+            .await?;
+        // 认证阶段已经结束，横幅若存在此时一定已经落在 transport 上
+        let banner = lease.connection().auth_banner();
         let id = self.inner.alloc_id();
         // start 失败时 lease 随参数一起被 drop，租约当场归还——不会留下「有人在用」的幽灵连接
         let session = Arc::new(ShellSession::start(id, lease, term, pty.clone()).await?);
@@ -188,8 +229,10 @@ impl SessionManager {
             cwd: None,
             host_id: Some(key.host_id.clone()),
             transport: Some(key),
+            banner,
         };
-        self.inner.insert(record.clone(), Handle::Remote(Arc::clone(&session)));
+        self.inner
+            .insert(record.clone(), Handle::Remote(Arc::clone(&session)));
 
         let weak = Arc::downgrade(&self.inner);
         let tx = self.inner.hub_tx.clone();
@@ -224,19 +267,32 @@ impl SessionManager {
     ///
     /// 与本地终端同形——拨号即连接，登录发生在流里，所以这一层连「凭据」都不需要，
     /// 天然满足「明文不跨 IPC」。收尾仍走同一条路径：转发任务看到通道结束才摘条目。
-    pub async fn open_telnet(&self, host: String, port: u16, pty: PtySize, encoding: TerminalEncoding, label: String, host_id: HostId) -> Result<SessionRecord, SessionError> {
+    pub async fn open_telnet(
+        &self,
+        host: String,
+        port: u16,
+        pty: PtySize,
+        encoding: TerminalEncoding,
+        label: String,
+        host_id: HostId,
+    ) -> Result<SessionRecord, SessionError> {
         let (handle, mut events) = dbhx_telnet::connect(&host, port, &pty).await?;
         let id = self.inner.alloc_id();
         let record = SessionRecord {
             id,
             label,
             protocol: Protocol::Telnet,
-            live_endpoint: Some(LiveEndpoint { host, port, username: String::new() }),
+            live_endpoint: Some(LiveEndpoint {
+                host,
+                port,
+                username: String::new(),
+            }),
             pty,
             encoding,
             cwd: None,
             host_id: Some(host_id),
             transport: None,
+            banner: None,
         };
         self.inner.insert(record.clone(), Handle::Telnet(handle));
 
@@ -248,7 +304,12 @@ impl SessionManager {
                     TelnetEvent::Data(bytes) => SessionEvent::Data { id, bytes },
                     // telnet 没有退出码概念：流结束就是一次干净的 Ended
                     TelnetEvent::Closed => {
-                        let _ = tx.send(SessionEvent::Ended { id, info: ExitInfo::default() }).await;
+                        let _ = tx
+                            .send(SessionEvent::Ended {
+                                id,
+                                info: ExitInfo::default(),
+                            })
+                            .await;
                         break;
                     }
                 };
@@ -280,7 +341,9 @@ impl SessionManager {
             Handle::Remote(session) => session.resize(pty).await,
             Handle::Local(local) => local.resize(pty).map_err(SessionError::Pty),
             // TelnetHandle 的入参是 (cols, rows)，与 `PtySize { rows, cols }` 反着来，别写顺
-            Handle::Telnet(telnet) => telnet.resize(pty.cols, pty.rows).map_err(SessionError::Telnet),
+            Handle::Telnet(telnet) => telnet
+                .resize(pty.cols, pty.rows)
+                .map_err(SessionError::Telnet),
         };
         if result.is_ok() {
             self.inner.set_pty(id, pty);
@@ -337,7 +400,9 @@ impl Inner {
 
     /// 锁中毒时继续用：注册表的最差结果只是某个 tab 的信息旧了一格，不值得 panic。
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Entry>> {
-        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn insert(&self, record: SessionRecord, handle: Handle) {
@@ -388,6 +453,8 @@ fn reap(weak: &Weak<Inner>, id: SessionId) {
 impl std::fmt::Debug for SessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let map = self.inner.entries();
-        f.debug_struct("SessionManager").field("sessions", &map.keys().collect::<Vec<_>>()).finish()
+        f.debug_struct("SessionManager")
+            .field("sessions", &map.keys().collect::<Vec<_>>())
+            .finish()
     }
 }

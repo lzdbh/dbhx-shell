@@ -62,6 +62,10 @@ function readRule(value: unknown): HighlightRule | null {
 export const useSettingsStore = defineStore('settings', () => {
   /** 下载落地目录。空表示还没配——此时下载按钮会给出明确提示而不是弹系统对话框。 */
   const downloadDir = ref('')
+  /** 终端类型。留空/非法值由后端回落 xterm-256color。 */
+  const term = ref('xterm-256color')
+  /** 离线备份文件路径。只记路径，口令永不落盘。 */
+  const backupPath = ref('')
   const fontSize = ref(DEFAULT_FONT_SIZE)
   /** 面板宽度（px）。拖过一次就记住，省得每次开应用重新调。 */
   const panelWidth = ref(360)
@@ -118,8 +122,10 @@ export const useSettingsStore = defineStore('settings', () => {
     const raw = localStorage.getItem(KEY)
     if (!raw) return
     try {
-      const saved = JSON.parse(raw) as Partial<{ downloadDir: string, logDir: string, fontSize: number, panelWidth: number, highlightRules: unknown }>
+      const saved = JSON.parse(raw) as Partial<{ downloadDir: string, term: string, backupPath: string, logDir: string, fontSize: number, panelWidth: number, highlightRules: unknown }>
       if (typeof saved.downloadDir === 'string') downloadDir.value = saved.downloadDir
+      if (typeof saved.term === 'string') term.value = saved.term
+      if (typeof saved.backupPath === 'string') backupPath.value = saved.backupPath
       if (typeof saved.logDir === 'string') logDir.value = saved.logDir.trim()
       // 字号夹回区间：手工改过的 localStorage 不该让终端一开屏就是 200px
       if (typeof saved.fontSize === 'number') {
@@ -135,9 +141,11 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   load()
-  watch([downloadDir, logDir, fontSize, panelWidth, highlightRules], () => {
+  watch([downloadDir, term, backupPath, logDir, fontSize, panelWidth, highlightRules], () => {
     localStorage.setItem(KEY, JSON.stringify({
       downloadDir: downloadDir.value,
+      term: term.value,
+      backupPath: backupPath.value,
       logDir: logDir.value,
       fontSize: fontSize.value,
       panelWidth: panelWidth.value,
@@ -145,5 +153,5 @@ export const useSettingsStore = defineStore('settings', () => {
     }))
   }, { deep: true })
 
-  return { downloadDir, logDir, fontSize, panelWidth, highlightRules, addHighlightRule, removeHighlightRule, zoom, resetZoom, zoomPercent }
+  return { downloadDir, term, backupPath, logDir, fontSize, panelWidth, highlightRules, addHighlightRule, removeHighlightRule, zoom, resetZoom, zoomPercent }
 })

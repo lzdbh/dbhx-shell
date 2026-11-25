@@ -201,7 +201,10 @@ impl Versioned for HostRecord {
         self.label = label;
     }
     fn secret_ids(&self) -> Vec<String> {
-        self.password_secret_id.iter().map(|s| s.0.clone()).collect()
+        self.password_secret_id
+            .iter()
+            .map(|s| s.0.clone())
+            .collect()
     }
     fn write_into(&self, plan: &mut MergePlan) {
         plan.hosts_upsert.push(self.clone());
@@ -260,7 +263,11 @@ struct Merged<T> {
     copies: Vec<T>,
 }
 
-fn tombstone_of<'a>(marks: &'a [DeletionMark], id: &str, kind: DeletionKind) -> Option<&'a DeletionMark> {
+fn tombstone_of<'a>(
+    marks: &'a [DeletionMark],
+    id: &str,
+    kind: DeletionKind,
+) -> Option<&'a DeletionMark> {
     marks.iter().find(|t| t.kind == kind && t.id == id)
 }
 
@@ -369,10 +376,30 @@ pub fn plan_merge(input: &MergeInput, new_id: impl Fn() -> String) -> MergePlan 
     let base_identities = input.base.map(|s| &s.identities[..]).unwrap_or(&[]);
     // 先合身份再合主机：主机的悬空身份判定要看到身份的结果。
     // 反过来（先主机）会让「远端同时带来一把新钥匙和引用它的主机」被误报成缺身份。
-    collect(input.local_identities, &input.remote.identities, base_identities, DeletionKind::Identity, input, &new_id, &mut plan);
-    collect(input.local_hosts, &input.remote.hosts, base_hosts, DeletionKind::Host, input, &new_id, &mut plan);
+    collect(
+        input.local_identities,
+        &input.remote.identities,
+        base_identities,
+        DeletionKind::Identity,
+        input,
+        &new_id,
+        &mut plan,
+    );
+    collect(
+        input.local_hosts,
+        &input.remote.hosts,
+        base_hosts,
+        DeletionKind::Host,
+        input,
+        &new_id,
+        &mut plan,
+    );
     // 删除标记：两边并集，同 id 取更早的
-    for mark in input.local_tombstones.iter().chain(input.remote.tombstones.iter()) {
+    for mark in input
+        .local_tombstones
+        .iter()
+        .chain(input.remote.tombstones.iter())
+    {
         let picked = mark.clone();
         match plan
             .tombstones
@@ -402,7 +429,7 @@ pub fn plan_merge(input: &MergeInput, new_id: impl Fn() -> String) -> MergePlan 
         }
         // 口令密文在两边都找不到：这条主机同步过来也连不上，必须重设口令
         for sid in host.secret_ids() {
-            if !input.local_secret_ids.iter().any(|l| *l == sid) && input.remote.secret(&sid).is_none() {
+            if !input.local_secret_ids.contains(&sid) && input.remote.secret(&sid).is_none() {
                 plan.missing_credentials.push(host.label.clone());
             }
         }
@@ -441,7 +468,15 @@ fn collect<T: Versioned>(
             (None, Some(c)) => Some(c),
             (None, None) => None,
         };
-        let merged = merge_one(l, r, b, tomb, input.policy, input.local_device_id, &input.remote.device_id);
+        let merged = merge_one(
+            l,
+            r,
+            b,
+            tomb,
+            input.policy,
+            input.local_device_id,
+            &input.remote.device_id,
+        );
         // 结论与本地现状不一致才要写；本地已经没有的（远端新增）也走这条
         match (&merged.keep, l) {
             (Some(want), Some(have)) if want.same_content(have) => {}
@@ -470,7 +505,7 @@ fn collect<T: Versioned>(
 /// 由调用方按 `missing_*` 清单交代给用户。
 fn need_secrets<T: Versioned>(record: &T, input: &MergeInput, plan: &mut MergePlan) {
     for sid in record.secret_ids() {
-        if input.local_secret_ids.iter().any(|l| *l == sid) {
+        if input.local_secret_ids.contains(&sid) {
             continue;
         }
         if plan.secrets_import.iter().any(|(k, _)| *k == sid) {
@@ -508,6 +543,8 @@ mod tests {
             encoding: TerminalEncoding::Utf8,
             created_at_ms: 1,
             updated_at_ms: updated,
+            jump: vec![],
+            tunnels: vec![],
         }
     }
 
@@ -553,7 +590,11 @@ mod tests {
             .local
             .iter()
             .flat_map(|h| h.secret_ids())
-            .chain(case.local.iter().flat_map(|h| h.password_secret_id.iter().map(|s| s.0.clone())))
+            .chain(
+                case.local
+                    .iter()
+                    .flat_map(|h| h.password_secret_id.iter().map(|s| s.0.clone())),
+            )
             .collect();
         let input = MergeInput {
             local_hosts: &case.local,
@@ -578,7 +619,11 @@ mod tests {
             policy: MergePolicy::ThreeWay,
         });
         assert_eq!(plan.hosts_upsert.len(), 1);
-        assert_eq!(plan.secrets_import.len(), 1, "导入主机必须连带把它的口令密文搬进来");
+        assert_eq!(
+            plan.secrets_import.len(),
+            1,
+            "导入主机必须连带把它的口令密文搬进来"
+        );
         assert!(plan.conflicts.is_empty());
     }
 
@@ -639,7 +684,10 @@ mod tests {
         assert_eq!(plan.hosts_upsert.len(), 2, "胜方 + 一份冲突副本");
         assert_eq!(plan.hosts_upsert[0].label, "远端改的");
         assert_eq!(plan.hosts_upsert[1].label, "本地改的（冲突副本）");
-        assert_ne!(plan.hosts_upsert[0].id, plan.hosts_upsert[1].id, "副本必须换新 id，否则下一轮又互相覆盖");
+        assert_ne!(
+            plan.hosts_upsert[0].id, plan.hosts_upsert[1].id,
+            "副本必须换新 id，否则下一轮又互相覆盖"
+        );
         assert_eq!(plan.conflicts, vec!["本地改的（冲突副本）".to_string()]);
     }
 
@@ -706,7 +754,10 @@ mod tests {
             policy: MergePolicy::ThreeWay,
         });
         assert_eq!(plan.hosts_remove, vec![HostId("h1".into())]);
-        assert!(plan.conflicts.is_empty(), "没动过的旧状态不值得占一个副本位");
+        assert!(
+            plan.conflicts.is_empty(),
+            "没动过的旧状态不值得占一个副本位"
+        );
 
         // 本地在它之后真的编辑过 ⇒ 删除仍然胜出，但编辑要留副本
         let edited = HostRecord {
@@ -737,7 +788,10 @@ mod tests {
             local_tombstones: vec![],
             policy: MergePolicy::LocalWins,
         });
-        assert!(plan.is_empty(), "以本地为准 = 什么都不改，随后拿本地去覆盖云端");
+        assert!(
+            plan.is_empty(),
+            "以本地为准 = 什么都不改，随后拿本地去覆盖云端"
+        );
     }
 
     #[test]
@@ -775,7 +829,10 @@ mod tests {
         let plan = run(Case {
             local: vec![],
             remote: SyncSnapshot {
-                tombstones: vec![mark("h5", DeletionKind::Host, 40, "BBB"), mark("h1", DeletionKind::Host, 15, "BBB")],
+                tombstones: vec![
+                    mark("h5", DeletionKind::Host, 40, "BBB"),
+                    mark("h1", DeletionKind::Host, 15, "BBB"),
+                ],
                 ..snapshot("BBB", vec![])
             },
             base: None,
@@ -784,7 +841,10 @@ mod tests {
         });
         assert_eq!(plan.tombstones.len(), 2);
         let h1 = plan.tombstones.iter().find(|t| t.id == "h1").unwrap();
-        assert_eq!(h1.deleted_at_ms, 8, "同一条删除要取更早的那次，否则删除时刻会被重复操作推后");
+        assert_eq!(
+            h1.deleted_at_ms, 8,
+            "同一条删除要取更早的那次，否则删除时刻会被重复操作推后"
+        );
         assert_eq!(h1.device_id, "AAA");
     }
 
@@ -828,7 +888,10 @@ mod tests {
     fn version_newer_than_this_app_is_refused_rather_than_guessed() {
         let mut snap = snapshot("BBB", vec![]);
         snap.version = SNAPSHOT_VERSION + 1;
-        assert!(snap.check_version().is_err(), "新格式必须硬拒绝：解错了会报成「同步串不对」");
+        assert!(
+            snap.check_version().is_err(),
+            "新格式必须硬拒绝：解错了会报成「同步串不对」"
+        );
         snap.version = SNAPSHOT_VERSION;
         assert!(snap.check_version().is_ok());
     }

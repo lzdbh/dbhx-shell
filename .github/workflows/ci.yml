@@ -157,3 +157,49 @@ jobs:
       # 用 --filter 走 tauri.conf.json beforeBuildCommand 的同一条命令，别让它先在 CI 里烂掉。
       - name: Typecheck + build
         run: pnpm --filter frontend build
+      - name: Unit tests
+        run: pnpm --filter frontend test
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  audit:
+    name: cargo deny (${{ matrix.checks }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans sources
+    # 新公告不该凭空白掉 CI：advisories 仍会显示成失败，但不阻塞合并。
+    # 真被命中时看那条 job 的日志，再决定升级依赖还是写 ignore。
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}

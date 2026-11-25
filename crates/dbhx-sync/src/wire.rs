@@ -70,7 +70,11 @@ impl std::fmt::Debug for Request {
 /// 而日志脱敏只能遮今天已知的形状。
 fn url_host(url: &str) -> String {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    after_scheme.split(['/', '?', '#']).next().unwrap_or("").to_string()
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// 读回来的响应。`json` 已经解析过，非 JSON 的响应直接算 `BadBody`；
@@ -114,9 +118,7 @@ impl WireError {
         match self {
             WireError::Connect { retryable, .. } => *retryable,
             WireError::TimedOut { .. } | WireError::RateLimited | WireError::Status { .. } => true,
-            WireError::Unauthorized
-            | WireError::NotFound
-            | WireError::BadBody => false,
+            WireError::Unauthorized | WireError::NotFound | WireError::BadBody => false,
         }
     }
 
@@ -202,7 +204,12 @@ impl Transport for HttpTransport {
 /// 从 trait 方法里拆出来，是为了让 `Request` 的所有权移动写在一个普通 async fn 里，
 /// 而不是塞进 `Box::pin(async move { ... })` 的大块头里。
 async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, WireError> {
-    let Request { method, url, token, body } = req;
+    let Request {
+        method,
+        url,
+        token,
+        body,
+    } = req;
     // 当场验证「令牌不进 URL」。今天两家都不需要 query 鉴权，
     // 而一旦有人为了省事把令牌拼进 URL，日志脱敏只能遮住日志，遮不住对端。
     if url.contains(token.as_str()) {
@@ -228,13 +235,21 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, W
     }
     let sent = tokio::time::timeout(REQUEST_TIMEOUT, call.send()).await;
     let resp = match sent {
-        Err(_) => return Err(WireError::TimedOut { secs: REQUEST_TIMEOUT.as_secs() }),
+        Err(_) => {
+            return Err(WireError::TimedOut {
+                secs: REQUEST_TIMEOUT.as_secs(),
+            })
+        }
         Ok(Err(e)) => return Err(classify(&e)),
         Ok(Ok(r)) => r,
     };
     let status = resp.status().as_u16();
     let text = match tokio::time::timeout(REQUEST_TIMEOUT, resp.text()).await {
-        Err(_) => return Err(WireError::TimedOut { secs: REQUEST_TIMEOUT.as_secs() }),
+        Err(_) => {
+            return Err(WireError::TimedOut {
+                secs: REQUEST_TIMEOUT.as_secs(),
+            })
+        }
         Ok(Err(e)) => return Err(classify(&e)),
         Ok(Ok(t)) => t,
     };
@@ -281,10 +296,15 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, W
 /// 它的 Display 里带完整 URL，而错误文案会一路走到日志和 IPC 返回值。
 fn classify(e: &reqwest::Error) -> WireError {
     if e.is_timeout() {
-        return WireError::TimedOut { secs: REQUEST_TIMEOUT.as_secs() };
+        return WireError::TimedOut {
+            secs: REQUEST_TIMEOUT.as_secs(),
+        };
     }
     if e.is_builder() {
-        return WireError::Connect { reason: "请求地址不合法".into(), retryable: false };
+        return WireError::Connect {
+            reason: "请求地址不合法".into(),
+            retryable: false,
+        };
     }
     if e.is_connect() {
         // 证书被拒是这一类里最常见的一种：本机装了 SSL 拦截类软件时必然走到这里
@@ -297,9 +317,15 @@ fn classify(e: &reqwest::Error) -> WireError {
         return WireError::BadBody;
     }
     if e.is_body() || e.is_request() {
-        return WireError::Connect { reason: "请求没能发出去".into(), retryable: true };
+        return WireError::Connect {
+            reason: "请求没能发出去".into(),
+            retryable: true,
+        };
     }
-    WireError::Connect { reason: "传输失败".into(), retryable: true }
+    WireError::Connect {
+        reason: "传输失败".into(),
+        retryable: true,
+    }
 }
 
 #[cfg(test)]
@@ -314,7 +340,10 @@ mod tests {
             (WireError::NotFound, ErrorCode::NotFound),
             (WireError::BadBody, ErrorCode::Internal),
             (
-                WireError::Connect { reason: "x".into(), retryable: true },
+                WireError::Connect {
+                    reason: "x".into(),
+                    retryable: true,
+                },
                 ErrorCode::Unreachable,
             ),
             (WireError::TimedOut { secs: 30 }, ErrorCode::Timeout),
@@ -332,20 +361,30 @@ mod tests {
     fn a_rejected_token_is_not_the_same_failure_as_an_undecryptable_cloud_copy() {
         let token: IpcError = WireError::Unauthorized.into();
         let sealed: IpcError = dbhx_vault::VaultError::Crypto.into();
-        assert_ne!(token.code, sealed.code, "{:?} 与 {:?} 撞了", token.code, sealed.code);
+        assert_ne!(
+            token.code, sealed.code,
+            "{:?} 与 {:?} 撞了",
+            token.code, sealed.code
+        );
     }
 
     /// 错误文案是给用户看的，也是唯一可能被写进日志的东西：一次都不能带出令牌。
     #[test]
     fn no_error_message_can_carry_a_token_or_a_url() {
         let errs = [
-            WireError::Connect { reason: "连不上 api.github.com".into(), retryable: true },
+            WireError::Connect {
+                reason: "连不上 api.github.com".into(),
+                retryable: true,
+            },
             WireError::TimedOut { secs: 30 },
             WireError::Unauthorized,
             WireError::RateLimited,
             WireError::NotFound,
             WireError::BadBody,
-            WireError::Status { status: 502, retryable: true },
+            WireError::Status {
+                status: 502,
+                retryable: true,
+            },
         ];
         for e in errs {
             let text = e.to_string();
@@ -368,14 +407,26 @@ mod tests {
         };
         let rendered = format!("{req:?}");
         assert!(!rendered.contains(token), "Debug 泄露了令牌: {rendered}");
-        assert!(!rendered.contains("api.github.com/gists?"), "Debug 泄露了完整地址: {rendered}");
-        assert!(rendered.contains("api.github.com"), "Debug 该留下主机名才好排障: {rendered}");
+        assert!(
+            !rendered.contains("api.github.com/gists?"),
+            "Debug 泄露了完整地址: {rendered}"
+        );
+        assert!(
+            rendered.contains("api.github.com"),
+            "Debug 该留下主机名才好排障: {rendered}"
+        );
     }
 
     #[test]
     fn host_extraction_stops_at_path_query_and_missing_scheme() {
-        assert_eq!(url_host("https://api.github.com/gists/abc"), "api.github.com");
-        assert_eq!(url_host("https://api.github.com/gists?x=1"), "api.github.com");
+        assert_eq!(
+            url_host("https://api.github.com/gists/abc"),
+            "api.github.com"
+        );
+        assert_eq!(
+            url_host("https://api.github.com/gists?x=1"),
+            "api.github.com"
+        );
         assert_eq!(url_host("https://api.github.com#frag"), "api.github.com");
         assert_eq!(url_host("api.github.com/gists"), "api.github.com");
     }
@@ -384,7 +435,10 @@ mod tests {
     fn only_the_recoverable_kinds_are_worth_a_retry() {
         assert!(WireError::TimedOut { secs: 30 }.retryable());
         assert!(WireError::RateLimited.retryable());
-        assert!(!WireError::Unauthorized.retryable(), "令牌错重试一百次还是错");
+        assert!(
+            !WireError::Unauthorized.retryable(),
+            "令牌错重试一百次还是错"
+        );
         assert!(!WireError::BadBody.retryable());
     }
 }

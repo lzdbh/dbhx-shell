@@ -55,6 +55,25 @@ beforeEach(() => {
 })
 
 describe('sessions store', () => {
+  it('reorders tabs by drag and ignores out-of-range moves', async () => {
+    mock.openRemote
+      .mockResolvedValueOnce(info(1))
+      .mockResolvedValueOnce(info(2))
+      .mockResolvedValueOnce(info(3))
+    const sessions = useSessionsStore()
+    await sessions.openRemote('h1')
+    await sessions.openRemote('h2')
+    await sessions.openRemote('h3')
+
+    sessions.moveTab(2, 0)
+    expect(sessions.tabs.map(t => t.id)).toEqual([3, 1, 2])
+    sessions.moveTab(0, 2)
+    expect(sessions.tabs.map(t => t.id)).toEqual([1, 2, 3])
+    sessions.moveTab(0, 99)
+    sessions.moveTab(-1, 0)
+    expect(sessions.tabs.map(t => t.id)).toEqual([1, 2, 3])
+  })
+
   it('opens a remote tab and makes it active', async () => {
     mock.openRemote.mockResolvedValueOnce(info(1))
     const sessions = useSessionsStore()

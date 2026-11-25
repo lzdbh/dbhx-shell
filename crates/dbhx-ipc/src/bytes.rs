@@ -39,15 +39,23 @@ fn encode(input: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
 
 fn decode(input: &str) -> Result<Vec<u8>, String> {
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("base64 length must be a multiple of 4".into());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -147,7 +155,13 @@ mod tests {
 
     #[test]
     fn matches_the_rfc_4648_reference_vectors() {
-        for (plain, expected) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg==")] {
+        for (plain, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+        ] {
             assert_eq!(encode(plain.as_bytes()), expected);
             assert_eq!(decode(expected).unwrap(), plain.as_bytes());
         }

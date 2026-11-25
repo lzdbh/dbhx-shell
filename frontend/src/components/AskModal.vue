@@ -13,6 +13,7 @@ const hostkeys = useHostkeysStore()
 const keyAsk = computed(() => { const a = hostkeys.current; return a?.kind === 'host_key' ? a : null })
 const conflictAsk = computed(() => { const a = hostkeys.current; return a?.kind === 'conflict' ? a : null })
 const passphraseAsk = computed(() => { const a = hostkeys.current; return a?.kind === 'passphrase' ? a : null })
+const transferAsk = computed(() => { const a = hostkeys.current; return a?.kind === 'transfer' ? a : null })
 
 const presentedFp = ref('')
 const storedFp = ref('')
@@ -23,7 +24,7 @@ watch(() => hostkeys.current, async (next: Ask | null) => {
   presentedFp.value = ''
   storedFp.value = ''
   passphrase.value = ''
-  if (!next || next.kind === 'passphrase') return
+  if (!next || next.kind === 'passphrase' || next.kind === 'transfer') return
   presentedFp.value = await sshFingerprint(next.presented.base64_key)
   if (next.kind === 'conflict') storedFp.value = await sshFingerprint(next.stored.base64_key)
 }, { immediate: true })
@@ -101,6 +102,44 @@ async function skipPassphrase(): Promise<void> {
     </a-descriptions>
   </a-modal>
 
+  <!-- 传输冲突：选择对整批生效 -->
+  <a-modal
+    v-else-if="transferAsk"
+    :open="true"
+    title="目标位置有同名文件"
+    :mask-closable="false"
+    @cancel="void hostkeys.cancelTransferConflict()"
+  >
+    <a-alert
+      :message="`${transferAsk.count} 个文件已存在`"
+      description="选一种处理方式，对整批生效；重命名会在扩展名前加 (1)、(2)…"
+      type="warning"
+      show-icon
+    />
+    <ul class="samples">
+      <li v-for="item in transferAsk.samples" :key="item" class="mono">
+        {{ item }}
+      </li>
+      <li v-if="transferAsk.count > transferAsk.samples.length" class="tip">
+        ……还有 {{ transferAsk.count - transferAsk.samples.length }} 个
+      </li>
+    </ul>
+    <template #footer>
+      <a-button @click="void hostkeys.cancelTransferConflict()">
+        取消传输
+      </a-button>
+      <a-button @click="void hostkeys.answerTransferConflict('skip')">
+        全部跳过
+      </a-button>
+      <a-button @click="void hostkeys.answerTransferConflict('rename')">
+        全部重命名
+      </a-button>
+      <a-button type="primary" danger @click="void hostkeys.answerTransferConflict('overwrite')">
+        全部覆盖
+      </a-button>
+    </template>
+  </a-modal>
+
   <!-- 私钥口令 -->
   <a-modal
     v-else-if="passphraseAsk"
@@ -132,5 +171,12 @@ async function skipPassphrase(): Promise<void> {
   margin: 8px 0 0;
   font-size: 12px;
   color: var(--text-2);
+}
+
+.samples {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  max-height: 180px;
+  overflow: auto;
 }
 </style>

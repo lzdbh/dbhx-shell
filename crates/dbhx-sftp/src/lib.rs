@@ -20,7 +20,8 @@
 //! 5. **进度事件按时间节流**（[`transfer::PROGRESS_INTERVAL`]）。每个分块都发一条的话，
 //!    webview 会被消息淹没；但终态事件一定发出去，否则条目永远挂在「传输中」。
 //!
-//! 本期没有做的：断点续传（需要先解决「远端文件在期间被改过」的指纹问题）。
+//! 本期没有做的：远端目录遍历之外的协议面（端口转发归 dbhx-ssh）。
+//! 断点续传的状态只记在本机（[`resume`]），换设备不可续，但远端不会多出任何文件。
 //! 所有需要真服务的通路（russh channel ↔ `SftpSession` 的握手与报文往返）
 //! 留给进程内测试服务器（任务 #17）覆盖；本 crate 的单测只碰纯逻辑。
 
@@ -29,12 +30,14 @@ pub mod error;
 pub mod follow;
 pub mod path;
 pub mod plan;
+pub mod resume;
 pub mod transfer;
 
-pub use client::{SftpClient, SftpOptions, sort_entries};
+pub use client::{sort_entries, SftpClient, SftpOptions};
 pub use error::SftpError;
 pub use follow::{Blacklist, CwdSource, Decision, FollowGate, Hold};
-pub use plan::{Lister, Plan, Task, expand_local, expand_remote, expand_remote_paths};
+pub use plan::{expand_local, expand_remote, expand_remote_paths, Lister, Plan, Task};
+pub use resume::{ResumeJournal, ResumeTarget};
 pub use transfer::{
     Batch, BatchReport, Cancel, Copier, Engine, ProgressMeter, SftpCopier, TransferOptions,
 };

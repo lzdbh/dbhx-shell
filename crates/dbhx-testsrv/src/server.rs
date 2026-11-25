@@ -100,6 +100,8 @@ pub struct Observed {
     /// 只看一头都抓不住 bug——只查命令串会漏掉「口令根本没送出去」，只查收没收到会
     /// 漏掉「口令被拼进 argv、进了远端进程表」。
     pub sudo_passwords: Vec<String>,
+    /// 每次 `direct-tcpip` 请求的目标 `(host, port)`。跳板链测试用它证明数据真的经过了跳板。
+    pub tunnels: Vec<(String, u32)>,
 }
 
 #[derive(Clone)]
@@ -122,6 +124,10 @@ pub struct TestSession {
     subsystems: HashSet<ChannelId>,
     /// 正在等提权口令的通道。
     elevating: HashMap<ChannelId, Elevating>,
+    /// `direct-tcpip` 通道：字节由专门的管道任务搬，`data` 里必须原样放过。
+    tunnels: HashSet<ChannelId>,
+    /// 每条远端转发的 accept 循环一个取消端；会话 drop 时一起关。
+    forward_stops: Vec<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct ChannelState {
@@ -138,11 +144,23 @@ struct Elevating {
 
 impl TestSession {
     fn new(shared: Shared) -> Self {
-        Self { shared, channels: HashMap::new(), pending: HashMap::new(), subsystems: HashSet::new(), elevating: HashMap::new() }
+        Self {
+            shared,
+            channels: HashMap::new(),
+            pending: HashMap::new(),
+            subsystems: HashSet::new(),
+            elevating: HashMap::new(),
+            tunnels: HashSet::new(),
+            forward_stops: Vec::new(),
+        }
     }
 
     fn note<T>(&self, field: impl FnOnce(&mut Observed) -> T) {
-        let mut observed = self.shared.observed.lock().unwrap_or_else(|p| p.into_inner());
+        let mut observed = self
+            .shared
+            .observed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         field(&mut observed);
     }
 
@@ -161,13 +179,18 @@ impl TestSession {
         data: &[u8],
         session: &mut ServerSession,
     ) -> Result<(), russh::Error> {
-        let mut state = self.elevating.remove(&channel).expect("调用方刚确认过这张表里有这条通道");
+        let mut state = self
+            .elevating
+            .remove(&channel)
+            .expect("调用方刚确认过这张表里有这条通道");
         state.pending.extend_from_slice(data);
         let Some(newline) = state.pending.iter().position(|b| *b == b'\n') else {
             self.elevating.insert(channel, state);
             return Ok(());
         };
-        let password = String::from_utf8_lossy(&state.pending[..newline]).trim_end_matches('\r').to_string();
+        let password = String::from_utf8_lossy(&state.pending[..newline])
+            .trim_end_matches('\r')
+            .to_string();
         self.note(|o| o.sudo_passwords.push(password.clone()));
 
         let (right_password, allowed, user) = (
@@ -204,7 +227,10 @@ impl TestSession {
         // 它看到的第一个「报文头」是一行口令，症状是 SFTP 握手永远等不到应答。
         drain_password(&mut raw, newline + 1).await;
         self.subsystems.insert(channel);
-        let handler = SftpHandler::new(Arc::clone(&self.shared.spec.fs), self.shared.spec.home.clone());
+        let handler = SftpHandler::new(
+            Arc::clone(&self.shared.spec.fs),
+            self.shared.spec.home.clone(),
+        );
         russh_sftp::server::run(raw.into_stream(), handler).await;
         Ok(())
     }
@@ -232,7 +258,8 @@ fn prompt(cwd: &str) -> Vec<u8> {
 }
 
 /// 假 os-release。命令层的系统探测（`dbhx-ipc::osdetect`）要有稳定的远端答案可断言。
-const OS_RELEASE: &str = "NAME=\"Ubuntu\"\nVERSION=\"24.04.1 LTS (Noble Numbat)\"\nID=ubuntu\nID_LIKE=debian\n";
+const OS_RELEASE: &str =
+    "NAME=\"Ubuntu\"\nVERSION=\"24.04.1 LTS (Noble Numbat)\"\nID=ubuntu\nID_LIKE=debian\n";
 
 /// `dbhx-ssh` 提权脚本的指纹。测试服务器不解析 shell，只认这条自己人发的命令。
 ///
@@ -268,6 +295,14 @@ async fn drain_password(channel: &mut Channel<Msg>, want: usize) {
     }
 }
 
+impl Drop for TestSession {
+    fn drop(&mut self) {
+        for stop in self.forward_stops.drain(..) {
+            let _ = stop.send(());
+        }
+    }
+}
+
 impl russh::server::Handler for TestSession {
     type Error = russh::Error;
 
@@ -278,12 +313,86 @@ impl russh::server::Handler for TestSession {
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         let ok = user == self.shared.spec.username && password == self.shared.spec.password;
         self.note(|o| o.auth_attempts.push((user.to_string(), ok)));
-        Ok(if ok { Auth::Accept } else { Auth::Reject { proceed_with_methods: None, partial_success: false } })
+        Ok(if ok {
+            Auth::Accept
+        } else {
+            Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            }
+        })
     }
 
-    async fn auth_publickey(&mut self, user: &str, _key: &russh::keys::PublicKey) -> Result<Auth, Self::Error> {
-        self.note(|o| o.auth_attempts.push((user.to_string(), self.shared.spec.accept_publickey)));
-        Ok(if self.shared.spec.accept_publickey { Auth::Accept } else { Auth::Reject { proceed_with_methods: None, partial_success: false } })
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        _key: &russh::keys::PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        self.note(|o| {
+            o.auth_attempts
+                .push((user.to_string(), self.shared.spec.accept_publickey))
+        });
+        Ok(if self.shared.spec.accept_publickey {
+            Auth::Accept
+        } else {
+            Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            }
+        })
+    }
+
+    /// 远端转发的监听端：服务器在 `address:port` 上接到的连接会开成 `forwarded-tcpip`
+    /// 通道交给客户端。只放行回环。
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut ServerSession,
+    ) -> Result<bool, Self::Error> {
+        let loopback = matches!(address, "127.0.0.1" | "localhost" | "::1");
+        if !loopback {
+            return Ok(false);
+        }
+        let bind_port = u16::try_from(*port).unwrap_or(0);
+        let Ok(listener) = TcpListener::bind((address, bind_port)).await else {
+            return Ok(false);
+        };
+        let Ok(bound) = listener.local_addr() else {
+            return Ok(false);
+        };
+        *port = u32::from(bound.port());
+        let connected = address.to_string();
+        let connected_port = *port;
+        let handle = session.handle();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        self.forward_stops.push(stop_tx);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, peer)) = accepted else { break; };
+                        // Handle 直接给我们一条到客户端的通道；接上本机的 TCP 连接即可
+                        let Ok(channel) = handle
+                            .channel_open_forwarded_tcpip(
+                                &connected,
+                                connected_port,
+                                &peer.ip().to_string(),
+                                u32::from(peer.port()),
+                            )
+                            .await
+                        else { continue; };
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let mut tunnel = channel.into_stream();
+                            let _ = tokio::io::copy_bidirectional(&mut tunnel, &mut stream).await;
+                        });
+                    }
+                }
+            }
+        });
+        Ok(true)
     }
 
     async fn channel_open_session(
@@ -292,9 +401,51 @@ impl russh::server::Handler for TestSession {
         reply: russh::server::ChannelOpenHandle,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        self.channels.insert(channel.id(), ChannelState { cwd: self.shared.spec.home.clone() });
+        self.channels.insert(
+            channel.id(),
+            ChannelState {
+                cwd: self.shared.spec.home.clone(),
+            },
+        );
         self.pending.insert(channel.id(), channel);
         reply.accept().await;
+        Ok(())
+    }
+
+    /// 只给本地转发/跳板测试用：只放行回环地址，把通道接到目标 TCP 上。
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        let loopback = matches!(host_to_connect, "127.0.0.1" | "localhost" | "::1");
+        self.note(|o| {
+            o.tunnels
+                .push((host_to_connect.to_string(), port_to_connect))
+        });
+        if !loopback || port_to_connect > u32::from(u16::MAX) {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+        let Ok(mut upstream) =
+            tokio::net::TcpStream::connect((host_to_connect, port_to_connect as u16)).await
+        else {
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        reply.accept().await;
+        self.tunnels.insert(channel.id());
+        let mut stream = channel.into_stream();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+        });
         Ok(())
     }
 
@@ -326,8 +477,16 @@ impl russh::server::Handler for TestSession {
         session.channel_success(channel)
     }
 
-    async fn shell_request(&mut self, channel: ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
-        let cwd = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_else(|| self.shared.spec.home.clone());
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        let cwd = self
+            .channels
+            .get(&channel)
+            .map(|c| c.cwd.clone())
+            .unwrap_or_else(|| self.shared.spec.home.clone());
         // 真 sshd 也是这个顺序：横幅先落 pty，再交给 shell 打提示符
         if self.shared.spec.banner_before_success {
             // 抢在确认前面，复刻真服务器上「fork 子进程」与「发 Success」并行赛跑的那种时序
@@ -353,11 +512,20 @@ impl russh::server::Handler for TestSession {
         // sudo 后来认不认这次口令**与这条确认无关**。照抄这个形状，客户端才会
         // 在「等 Success」上写出真机上会犯的错，也就才测得出就绪标记是不是必要的。
         if command.contains(SUDO_FINGERPRINT) {
-            self.elevating.insert(channel, Elevating { pending: Vec::new() });
+            self.elevating.insert(
+                channel,
+                Elevating {
+                    pending: Vec::new(),
+                },
+            );
             return session.channel_success(channel);
         }
         session.channel_success(channel)?;
-        let cwd = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_else(|| self.shared.spec.home.clone());
+        let cwd = self
+            .channels
+            .get(&channel)
+            .map(|c| c.cwd.clone())
+            .unwrap_or_else(|| self.shared.spec.home.clone());
         // 只实现目录跟随探针与系统探测可能用到的那几条，其余命令一律空输出 + 退出码 0
         let output = if command.starts_with("pwd") {
             format!("{cwd}\n")
@@ -392,16 +560,29 @@ impl russh::server::Handler for TestSession {
         };
         session.channel_success(channel_id)?;
         self.subsystems.insert(channel_id);
-        let handler = SftpHandler::new(Arc::clone(&self.shared.spec.fs), self.shared.spec.home.clone());
+        let handler = SftpHandler::new(
+            Arc::clone(&self.shared.spec.fs),
+            self.shared.spec.home.clone(),
+        );
         russh_sftp::server::run(channel.into_stream(), handler).await;
         Ok(())
     }
 
-    async fn data(&mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession) -> Result<(), Self::Error> {
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
         // subsystem 通道的字节是 SFTP 报文，已经由 `russh_sftp::server::run` 在读了。
         // 这里必须一个字都不碰：行回显会把报文塞回通道，客户端的报文解析器
         // 于是看到一堆「长度字段为 1」的垃圾，症状是握手永远等不到应答。
         if self.subsystems.contains(&channel) {
+            return Ok(());
+        }
+        // direct-tcpip 的字节已经交给管道任务了，这里再回显一遍就会把客户端自己的
+        // 写入当成「服务器发来的数据」送回去（嵌套 SSH 的握手因此看到两个 banner）。
+        if self.tunnels.contains(&channel) {
             return Ok(());
         }
         // 提权通道的字节是「用户的 sudo 口令」，不是终端输入：回显它等于把口令写进
@@ -417,7 +598,11 @@ impl russh::server::Handler for TestSession {
             return Ok(());
         }
         let line = text.trim_end_matches(['\r', '\n']).to_string();
-        let cwd = self.channels.get_mut(&channel).map(|c| c.cwd.clone()).unwrap_or_else(|| self.shared.spec.home.clone());
+        let cwd = self
+            .channels
+            .get_mut(&channel)
+            .map(|c| c.cwd.clone())
+            .unwrap_or_else(|| self.shared.spec.home.clone());
         if line == "exit" {
             self.channels.remove(&channel);
             session.eof(channel)?;
@@ -427,9 +612,18 @@ impl russh::server::Handler for TestSession {
         if let Some(target) = line.strip_prefix("cd ") {
             let target = target.trim();
             let next = {
-                let fs = self.shared.spec.fs.lock().unwrap_or_else(|p| p.into_inner());
+                let fs = self
+                    .shared
+                    .spec
+                    .fs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 // `cd` 不带参数回家目录，这条 POSIX 规矩会影响 OSC 7 报出来的路径
-                let target = if target.is_empty() { self.shared.spec.home.as_str() } else { target };
+                let target = if target.is_empty() {
+                    self.shared.spec.home.as_str()
+                } else {
+                    target
+                };
                 let resolved = fs.resolve(target, &cwd).ok();
                 match resolved {
                     Some(path) if fs.is_dir(&path) => Some(path),
@@ -441,12 +635,19 @@ impl russh::server::Handler for TestSession {
                     if let Some(state) = self.channels.get_mut(&channel) {
                         state.cwd = path;
                     }
-                    let shown = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_default();
+                    let shown = self
+                        .channels
+                        .get(&channel)
+                        .map(|c| c.cwd.clone())
+                        .unwrap_or_default();
                     session.data(channel, prompt(&shown))?;
                     return Ok(());
                 }
                 None => {
-                    session.data(channel, format!("-bash: cd: {target}: No such file or directory\r\n").into_bytes())?;
+                    session.data(
+                        channel,
+                        format!("-bash: cd: {target}: No such file or directory\r\n").into_bytes(),
+                    )?;
                     session.data(channel, prompt(&cwd))?;
                     return Ok(());
                 }
@@ -454,21 +655,34 @@ impl russh::server::Handler for TestSession {
         }
         // 普通命令：回显一行「ran: <cmd>」再给新提示符，够测试断言「输出确实到了」
         session.data(channel, format!("ran: {line}\r\n").into_bytes())?;
-        let shown = self.channels.get(&channel).map(|c| c.cwd.clone()).unwrap_or_default();
+        let shown = self
+            .channels
+            .get(&channel)
+            .map(|c| c.cwd.clone())
+            .unwrap_or_default();
         session.data(channel, prompt(&shown))?;
         Ok(())
     }
 
-    async fn channel_eof(&mut self, channel: ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
         session.close(channel)?;
         Ok(())
     }
 
-    async fn channel_close(&mut self, channel: ChannelId, _session: &mut ServerSession) -> Result<(), Self::Error> {
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
         self.channels.remove(&channel);
         self.pending.remove(&channel);
         self.subsystems.remove(&channel);
         self.elevating.remove(&channel);
+        self.tunnels.remove(&channel);
         Ok(())
     }
 }
@@ -510,7 +724,10 @@ impl TestServer {
         let listener = TcpListener::bind(bind).await?;
         let addr = listener.local_addr()?;
         let observed = Arc::new(Mutex::new(Observed::default()));
-        let shared = Shared { spec: spec.clone(), observed: Arc::clone(&observed) };
+        let shared = Shared {
+            spec: spec.clone(),
+            observed: Arc::clone(&observed),
+        };
 
         let host_key = russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM)
             .expect("内置测试主机密钥必须能解析");
@@ -531,8 +748,16 @@ impl TestServer {
                 tracing::debug!(?e, "测试服务器已退出");
             }
         });
-        let shutdown = rx.await.map_err(|_| std::io::Error::other("测试服务器启动失败"))?;
-        Ok(Self { addr, spec, observed, shutdown, join })
+        let shutdown = rx
+            .await
+            .map_err(|_| std::io::Error::other("测试服务器启动失败"))?;
+        Ok(Self {
+            addr,
+            spec,
+            observed,
+            shutdown,
+            join,
+        })
     }
 
     /// 服务器地址，`"127.0.0.1:port"` 形式，直接塞进 `LiveEndpoint`。
@@ -546,7 +771,10 @@ impl TestServer {
 
     /// 观测记录快照。
     pub fn observed(&self) -> Observed {
-        self.observed.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.observed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// 停掉 accept 循环并等任务收尾。

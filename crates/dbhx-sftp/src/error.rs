@@ -103,7 +103,10 @@ impl SftpError {
 
     /// 本地 IO 错误的统一入口：只保留路径与 OS 给的短说明。
     pub fn local_io(path: &str, err: &std::io::Error) -> Self {
-        Self::LocalIo { path: path.to_string(), reason: io_kind_of(err) }
+        Self::LocalIo {
+            path: path.to_string(),
+            reason: io_kind_of(err),
+        }
     }
 }
 
@@ -126,32 +129,54 @@ fn io_kind_of(err: &std::io::Error) -> String {
 impl From<SftpError> for IpcError {
     fn from(e: SftpError) -> Self {
         match e {
-            SftpError::NotFound(path) => IpcError::new(ErrorCode::NotFound, format!("路径不存在：{path}"), false),
-            SftpError::PermissionDenied(path) => {
-                IpcError::new(ErrorCode::PermissionDenied, format!("没有权限执行该操作：{path}"), false)
+            SftpError::NotFound(path) => {
+                IpcError::new(ErrorCode::NotFound, format!("路径不存在：{path}"), false)
             }
-            SftpError::AlreadyExists(path) => {
-                IpcError::new(ErrorCode::AlreadyExists, format!("目标已存在：{path}"), false)
-            }
-            SftpError::BadPath(path) => {
-                IpcError::new(ErrorCode::InvalidInput, format!("路径不合法：{path}"), false)
-            }
-            SftpError::Closed => IpcError::new(ErrorCode::ChannelClosed, "文件通道已关闭，请重新打开面板", true),
+            SftpError::PermissionDenied(path) => IpcError::new(
+                ErrorCode::PermissionDenied,
+                format!("没有权限执行该操作：{path}"),
+                false,
+            ),
+            SftpError::AlreadyExists(path) => IpcError::new(
+                ErrorCode::AlreadyExists,
+                format!("目标已存在：{path}"),
+                false,
+            ),
+            SftpError::BadPath(path) => IpcError::new(
+                ErrorCode::InvalidInput,
+                format!("路径不合法：{path}"),
+                false,
+            ),
+            SftpError::Closed => IpcError::new(
+                ErrorCode::ChannelClosed,
+                "文件通道已关闭，请重新打开面板",
+                true,
+            ),
             SftpError::Timeout => IpcError::new(ErrorCode::Timeout, "操作超时，可重试", true),
-            SftpError::Io(where_) => IpcError::new(ErrorCode::Io, format!("数据传输失败：{where_}"), true),
-            SftpError::Unsupported(where_) => {
-                IpcError::new(ErrorCode::Io, format!("服务端不支持该操作：{where_}"), false)
+            SftpError::Io(where_) => {
+                IpcError::new(ErrorCode::Io, format!("数据传输失败：{where_}"), true)
             }
-            SftpError::LocalIo { path, reason } => {
-                IpcError::new(ErrorCode::Io, format!("本地文件错误（{path}）：{reason}"), false)
-            }
+            SftpError::Unsupported(where_) => IpcError::new(
+                ErrorCode::Io,
+                format!("服务端不支持该操作：{where_}"),
+                false,
+            ),
+            SftpError::LocalIo { path, reason } => IpcError::new(
+                ErrorCode::Io,
+                format!("本地文件错误（{path}）：{reason}"),
+                false,
+            ),
             SftpError::Cancelled => IpcError::cancelled(),
-            SftpError::ResumeMismatch => {
-                IpcError::new(ErrorCode::ResumeMismatch, "远端文件已变化，需重新传输", false)
-            }
-            SftpError::Quota(where_) => {
-                IpcError::new(ErrorCode::QuotaExceeded, format!("超出传输并发预算：{where_}"), true)
-            }
+            SftpError::ResumeMismatch => IpcError::new(
+                ErrorCode::ResumeMismatch,
+                "远端文件已变化，需重新传输",
+                false,
+            ),
+            SftpError::Quota(where_) => IpcError::new(
+                ErrorCode::QuotaExceeded,
+                format!("超出传输并发预算：{where_}"),
+                true,
+            ),
             // Internal 的原文可能带用户名/路径片段，只留类别
             SftpError::Internal(_) => IpcError::internal("SFTP 内部错误"),
         }
@@ -188,12 +213,16 @@ mod tests {
 
     #[test]
     fn lost_channel_is_retryable_but_denied_is_not() {
-        let closed: IpcError = SftpError::classify(status(StatusCode::ConnectionLost, "Connection lost"), "/x").into();
+        let closed: IpcError =
+            SftpError::classify(status(StatusCode::ConnectionLost, "Connection lost"), "/x").into();
         assert_eq!(closed.code, ErrorCode::ChannelClosed);
         assert!(closed.retryable, "重开面板就能再连");
 
-        let denied: IpcError =
-            SftpError::classify(status(StatusCode::PermissionDenied, "Permission denied"), "/etc/shadow").into();
+        let denied: IpcError = SftpError::classify(
+            status(StatusCode::PermissionDenied, "Permission denied"),
+            "/etc/shadow",
+        )
+        .into();
         assert_eq!(denied.code, ErrorCode::PermissionDenied);
         assert!(!denied.retryable, "重试不会变出权限");
         assert!(denied.message.contains("/etc/shadow"));
@@ -201,11 +230,19 @@ mod tests {
 
     #[test]
     fn timeout_and_io_are_told_apart() {
-        assert!(matches!(SftpError::classify(ProtocolError::Timeout, "/x"), SftpError::Timeout));
-        let io: IpcError = SftpError::classify(ProtocolError::IO("disk full".into()), "/data/big.bin").into();
+        assert!(matches!(
+            SftpError::classify(ProtocolError::Timeout, "/x"),
+            SftpError::Timeout
+        ));
+        let io: IpcError =
+            SftpError::classify(ProtocolError::IO("disk full".into()), "/data/big.bin").into();
         assert_eq!(io.code, ErrorCode::Io);
         assert!(io.retryable);
-        assert!(!io.message.contains("disk full"), "russh 拼的英文不该出现在出口：{}", io.message);
+        assert!(
+            !io.message.contains("disk full"),
+            "russh 拼的英文不该出现在出口：{}",
+            io.message
+        );
 
         let timeout: IpcError = SftpError::Timeout.into();
         assert_eq!(timeout.code, ErrorCode::Timeout);
@@ -214,8 +251,11 @@ mod tests {
 
     #[test]
     fn protocol_violations_are_not_reported_as_network_faults() {
-        let e: IpcError =
-            SftpError::classify(ProtocolError::UnexpectedBehavior("bad name packet".into()), "/x").into();
+        let e: IpcError = SftpError::classify(
+            ProtocolError::UnexpectedBehavior("bad name packet".into()),
+            "/x",
+        )
+        .into();
         assert_eq!(e.code, ErrorCode::Io);
         assert!(!e.retryable, "服务端行为不合协议，重试只是再错一次");
         assert!(!e.message.contains("bad name packet"), "{}", e.message);
@@ -223,7 +263,9 @@ mod tests {
 
     #[test]
     fn limits_extension_quota_maps_to_quota_exceeded() {
-        let e: IpcError = SftpError::classify(ProtocolError::Limited("Packet too large".into()), "big.bin").into();
+        let e: IpcError =
+            SftpError::classify(ProtocolError::Limited("Packet too large".into()), "big.bin")
+                .into();
         assert_eq!(e.code, ErrorCode::QuotaExceeded);
         assert!(!e.message.contains("Packet too large"), "{}", e.message);
     }
@@ -232,11 +274,19 @@ mod tests {
     fn unexpected_behavior_message_is_the_one_text_we_never_forward() {
         // 这一条是整份分类逻辑的存在理由：russh-sftp 的 Display 会把服务端原文拼进来，
         // 而我们的出口只认 status code
-        let leaky = ProtocolError::UnexpectedBehavior("Permission denied by bastion policy".to_string());
-        assert!(format!("{leaky}").contains("bastion"), "上游的英文在这里，别弄丢前提");
+        let leaky =
+            ProtocolError::UnexpectedBehavior("Permission denied by bastion policy".to_string());
+        assert!(
+            format!("{leaky}").contains("bastion"),
+            "上游的英文在这里，别弄丢前提"
+        );
         let e: IpcError = SftpError::classify(leaky, "/var/log/app.log").into();
         assert!(!e.message.contains("bastion"), "{}", e.message);
-        assert!(e.message.contains("/var/log/app.log"), "路径是唯一允许转述的细节：{}", e.message);
+        assert!(
+            e.message.contains("/var/log/app.log"),
+            "路径是唯一允许转述的细节：{}",
+            e.message
+        );
     }
 
     #[test]
@@ -253,7 +303,11 @@ mod tests {
         let e = SftpError::local_io("C:/Downloads/a.bin", &err);
         let ipc: IpcError = e.into();
         assert_eq!(ipc.code, ErrorCode::Io);
-        assert!(ipc.message.contains("C:/Downloads/a.bin"), "{}", ipc.message);
+        assert!(
+            ipc.message.contains("C:/Downloads/a.bin"),
+            "{}",
+            ipc.message
+        );
         assert!(ipc.message.contains("权限不足"), "{}", ipc.message);
         assert!(!ipc.message.contains("os says nope"), "{}", ipc.message);
     }

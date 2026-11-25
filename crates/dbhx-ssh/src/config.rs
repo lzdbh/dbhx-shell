@@ -31,22 +31,28 @@ impl DialOptions {
     }
 
     pub fn with_keepalive(mut self, secs: u64) -> Self {
-        self.keepalive = if secs == 0 { None } else { Some(Duration::from_secs(secs)) };
+        self.keepalive = if secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(secs))
+        };
         self
     }
 
     pub(crate) fn config(&self) -> Arc<Config> {
-        let mut cfg = Config::default();
-        // 关掉 Nagle。终端里每个按键都是一个 1 字节包，攒着发会让远端肉眼可见地迟钝。
-        cfg.nodelay = true;
-        cfg.keepalive_interval = self.keepalive;
-        // 不做 inactivity_timeout：连接该活多久由会话层的 lease/idle park 决定，
-        // 而不是由 russh 偷偷把 transport 拆掉。
-        cfg.inactivity_timeout = None;
-        cfg.client_id = SshId::Standard(Cow::Owned(format!(
-            "SSH-2.0-dbhx-shell_{}",
-            env!("CARGO_PKG_VERSION")
-        )));
+        let cfg = Config {
+            // 关掉 Nagle。终端里每个按键都是一个 1 字节包，攒着发会让远端肉眼可见地迟钝。
+            nodelay: true,
+            keepalive_interval: self.keepalive,
+            // 不做 inactivity_timeout：连接该活多久由会话层的 lease/idle park 决定，
+            // 而不是由 russh 偷偷把 transport 拆掉。
+            inactivity_timeout: None,
+            client_id: SshId::Standard(Cow::Owned(format!(
+                "SSH-2.0-dbhx-shell_{}",
+                env!("CARGO_PKG_VERSION")
+            ))),
+            ..Default::default()
+        };
         Arc::new(cfg)
     }
 }

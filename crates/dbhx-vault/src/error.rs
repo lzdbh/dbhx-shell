@@ -22,6 +22,13 @@ pub enum VaultError {
     /// 还有别的记录引用这条密文时不允许删
     #[error("{what} is still referenced by {count} record(s)")]
     InUse { what: String, count: usize },
+    /// 平台没有可用的系统钥匙串（无桌面会话、CI 容器等）。调用方据此回退到文件源。
+    #[error("system keyring is unavailable")]
+    KeyringUnavailable,
+    /// 钥匙串本身报错，或写入后读回的字节对不上。**不回退**：这类失败可能意味着
+    /// 存进去的钥匙与库里那份不是同一把，悄悄退回文件只会把问题藏起来。
+    #[error("system keyring operation failed: {0}")]
+    Keyring(String),
 }
 
 impl From<VaultError> for IpcError {
@@ -33,6 +40,9 @@ impl From<VaultError> for IpcError {
             VaultError::Crypto => ErrorCode::PermissionDenied,
             VaultError::NotFound(_) => ErrorCode::NotFound,
             VaultError::InUse { .. } => ErrorCode::PermissionDenied,
+            // 钥匙串不可用是环境问题，不是用户操作错误
+            VaultError::KeyringUnavailable => ErrorCode::Io,
+            VaultError::Keyring(_) => ErrorCode::Internal,
         };
         IpcError::new(code, e.to_string(), false)
     }
